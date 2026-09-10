@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# App-generated data (regenerate with data_generator.py, or run main.py)
+data/*.db
+exports/
+
+# PyInstaller build output
+build/
+dist/
+*.spec
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
