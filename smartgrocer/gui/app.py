@@ -19,19 +19,20 @@ import customtkinter as ctk
 
 from .. import db
 from . import screens
+from . import theme
 
 ctk.set_appearance_mode("light")
-ctk.set_default_color_theme("green")
+ctk.set_default_color_theme("blue")  # base theme; brand colors are applied per-widget below
 
 NAV_ITEMS = [
-    ("Dashboard", "dashboard", screens.DashboardScreen),
-    ("POS / Checkout", "pos", screens.POSScreen),
-    ("Inventory", "inventory", screens.InventoryScreen),
-    ("Promotions & Expiry", "promotions", screens.PromotionsScreen),
-    ("Forecasting", "forecasting", screens.ForecastingScreen),
-    ("Bundle Recommendations", "bundles", screens.BundlesScreen),
-    ("Store Layout", "layout", screens.LayoutScreen),
-    ("Reports", "reports", screens.ReportsScreen),
+    ("📊  Dashboard", "dashboard", screens.DashboardScreen),
+    ("🛒  POS / Checkout", "pos", screens.POSScreen),
+    ("📦  Inventory", "inventory", screens.InventoryScreen),
+    ("⏰  Promotions & Expiry", "promotions", screens.PromotionsScreen),
+    ("📈  Forecasting", "forecasting", screens.ForecastingScreen),
+    ("🔗  Bundle Recommendations", "bundles", screens.BundlesScreen),
+    ("🗺️  Store Layout", "layout", screens.LayoutScreen),
+    ("📄  Reports", "reports", screens.ReportsScreen),
 ]
 
 
@@ -46,27 +47,50 @@ class SmartGrocerApp(ctk.CTk):
         db.init_db(self.conn)
         self.current_staff_id = 1  # default to Admin; POS screen lets you switch
 
+        theme.apply_global_style()
+        self.configure(fg_color=theme.BG_LIGHT)
+
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
-        self.sidebar = ctk.CTkFrame(self, width=220, corner_radius=0)
+        self.sidebar = ctk.CTkFrame(self, width=240, corner_radius=0, fg_color=theme.NAVY_DARK)
         self.sidebar.grid(row=0, column=0, sticky="nsw")
         self.sidebar.grid_propagate(False)
 
-        title = ctk.CTkLabel(self.sidebar, text="SmartGrocer", font=ctk.CTkFont(size=22, weight="bold"))
-        title.pack(pady=(24, 2), padx=20)
+        try:
+            from PIL import Image
+            logo_img = Image.open(theme.LOGO_PATH)
+            logo_ctk = ctk.CTkImage(light_image=logo_img, dark_image=logo_img, size=(72, 72))
+            ctk.CTkLabel(self.sidebar, image=logo_ctk, text="").pack(pady=(28, 6))
+        except Exception:
+            pass  # logo is decorative - never block app startup over a missing/unreadable asset
+
+        title = ctk.CTkLabel(self.sidebar, text="SmartGrocer", font=ctk.CTkFont(size=22, weight="bold"),
+                              text_color=theme.TEXT_ON_NAVY)
+        title.pack(pady=(0, 2), padx=20)
         subtitle = ctk.CTkLabel(self.sidebar, text="Decision Support System", font=ctk.CTkFont(size=12),
-                                 text_color="gray")
-        subtitle.pack(pady=(0, 20), padx=20)
+                                 text_color="#9FB0CC")
+        subtitle.pack(pady=(0, 4), padx=20)
+        brand = ctk.CTkLabel(self.sidebar, text="by Balasuriya Group", font=ctk.CTkFont(size=11, slant="italic"),
+                              text_color="#7A8CAD")
+        brand.pack(pady=(0, 22), padx=20)
+
+        divider = ctk.CTkFrame(self.sidebar, height=1, fg_color="#1E2D52")
+        divider.pack(fill="x", padx=16, pady=(0, 12))
 
         self.nav_buttons: dict[str, ctk.CTkButton] = {}
         for label, key, _cls in NAV_ITEMS:
-            btn = ctk.CTkButton(self.sidebar, text=label, anchor="w",
-                                 command=lambda k=key: self.show_frame(k))
-            btn.pack(fill="x", padx=16, pady=4)
+            btn = ctk.CTkButton(
+                self.sidebar, text=label, anchor="w", corner_radius=8, height=38,
+                font=ctk.CTkFont(size=13),
+                fg_color="transparent", text_color="#D6DEEC",
+                hover_color=theme.NAVY_DARKER,
+                command=lambda k=key: self.show_frame(k),
+            )
+            btn.pack(fill="x", padx=14, pady=3)
             self.nav_buttons[key] = btn
 
-        self.container = ctk.CTkFrame(self, corner_radius=0, fg_color="transparent")
+        self.container = ctk.CTkFrame(self, corner_radius=0, fg_color=theme.BG_LIGHT)
         self.container.grid(row=0, column=1, sticky="nsew")
         self.container.grid_rowconfigure(0, weight=1)
         self.container.grid_columnconfigure(0, weight=1)
@@ -83,7 +107,11 @@ class SmartGrocerApp(ctk.CTk):
         frame = self.frames[key]
         frame.tkraise()
         for k, btn in self.nav_buttons.items():
-            btn.configure(fg_color=("gray75", "gray25") if k == key else ("gray85", "gray20"))
+            is_active = k == key
+            btn.configure(
+                fg_color=theme.ACCENT_BLUE if is_active else "transparent",
+                text_color="#FFFFFF" if is_active else "#D6DEEC",
+            )
         if hasattr(frame, "on_show"):
             frame.on_show()
 

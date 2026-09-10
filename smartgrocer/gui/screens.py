@@ -13,6 +13,8 @@ import customtkinter as ctk
 
 from .. import association, forecasting, layout, pos, promotions, reports
 from .. import db as db_module
+from . import theme
+from .theme import tree_clear, tree_insert
 
 
 def make_treeview(parent, columns: list[str], widths: dict[str, int] | None = None) -> ttk.Treeview:
@@ -29,12 +31,30 @@ def make_treeview(parent, columns: list[str], widths: dict[str, int] | None = No
     frame.grid_rowconfigure(0, weight=1)
     frame.grid_columnconfigure(0, weight=1)
     tree.master_frame = frame  # convenience handle so callers can .pack()/.grid() `frame`
+    theme.configure_stripes(tree)
+    tree._row_counter = 0
     return tree
+
+
+PRIMARY_BTN = dict(fg_color=theme.ACCENT_BLUE, hover_color=theme.ACCENT_BLUE_HOVER,
+                    text_color="#FFFFFF", corner_radius=8)
+SUCCESS_BTN = dict(fg_color=theme.SUCCESS_GREEN, hover_color=theme.SUCCESS_GREEN_HOVER,
+                    text_color="#FFFFFF", corner_radius=8)
+DANGER_BTN = dict(fg_color=theme.DANGER_RED, hover_color=theme.DANGER_RED_HOVER,
+                   text_color="#FFFFFF", corner_radius=8)
+SECONDARY_BTN = dict(fg_color=theme.CARD_BG, hover_color=theme.CARD_BG_ALT, text_color=theme.NAVY_DARK,
+                      border_width=1, border_color=theme.BORDER, corner_radius=8)
+
+
+def styled_button(parent, text, command, kind="primary", **kwargs):
+    style = {"primary": PRIMARY_BTN, "success": SUCCESS_BTN, "danger": DANGER_BTN,
+             "secondary": SECONDARY_BTN}[kind]
+    return ctk.CTkButton(parent, text=text, command=command, **{**style, **kwargs})
 
 
 class BaseScreen(ctk.CTkFrame):
     def __init__(self, parent, app):
-        super().__init__(parent, fg_color="transparent")
+        super().__init__(parent, fg_color=theme.BG_LIGHT)
         self.app = app
 
     @property
@@ -45,8 +65,9 @@ class BaseScreen(ctk.CTkFrame):
         pass
 
     def header(self, text: str):
-        lbl = ctk.CTkLabel(self, text=text, font=ctk.CTkFont(size=20, weight="bold"))
-        lbl.pack(anchor="w", padx=24, pady=(20, 10))
+        lbl = ctk.CTkLabel(self, text=text, font=ctk.CTkFont(size=22, weight="bold"),
+                            text_color=theme.NAVY_DARK)
+        lbl.pack(anchor="w", padx=24, pady=(20, 12))
 
 
 # --------------------------------------------------------------------------- #
@@ -70,26 +91,29 @@ class DashboardScreen(BaseScreen):
             ("historical_waste_value_lkr", "Historical Waste (LKR)"),
         ]
         for i, (key, label) in enumerate(specs):
-            card = ctk.CTkFrame(self.cards_frame, corner_radius=10)
+            card = ctk.CTkFrame(self.cards_frame, corner_radius=10, fg_color=theme.CARD_BG,
+                                 border_width=1, border_color=theme.BORDER)
             card.grid(row=i // 3, column=i % 3, padx=10, pady=10, sticky="nsew")
             self.cards_frame.grid_columnconfigure(i % 3, weight=1)
-            ctk.CTkLabel(card, text=label, font=ctk.CTkFont(size=12), text_color="gray").pack(
+            ctk.CTkLabel(card, text=label, font=ctk.CTkFont(size=12), text_color=theme.TEXT_MUTED).pack(
                 anchor="w", padx=16, pady=(14, 0))
-            value_lbl = ctk.CTkLabel(card, text="-", font=ctk.CTkFont(size=26, weight="bold"))
+            value_lbl = ctk.CTkLabel(card, text="-", font=ctk.CTkFont(size=26, weight="bold"),
+                                      text_color=theme.NAVY_DARK)
             value_lbl.pack(anchor="w", padx=16, pady=(0, 14))
             self.card_labels[key] = value_lbl
 
-        top_seller_frame = ctk.CTkFrame(self, corner_radius=10)
+        top_seller_frame = ctk.CTkFrame(self, corner_radius=10, fg_color=theme.CARD_BG,
+                                         border_width=1, border_color=theme.BORDER)
         top_seller_frame.pack(fill="x", padx=24, pady=(0, 10))
         self.top_seller_label = ctk.CTkLabel(top_seller_frame, text="Top seller (30d): -",
-                                              font=ctk.CTkFont(size=14))
+                                              font=ctk.CTkFont(size=14), text_color=theme.TEXT_DARK)
         self.top_seller_label.pack(anchor="w", padx=16, pady=12)
 
         btn_row = ctk.CTkFrame(self, fg_color="transparent")
         btn_row.pack(fill="x", padx=24, pady=10)
-        ctk.CTkButton(btn_row, text="Refresh", command=self.refresh).pack(side="left", padx=(0, 10))
-        ctk.CTkButton(btn_row, text="Rebuild synthetic demo data", fg_color="#b23b3b",
-                      hover_color="#8a2c2c", command=self.rebuild_demo_data).pack(side="left")
+        styled_button(btn_row, "Refresh", self.refresh, kind="secondary").pack(side="left", padx=(0, 10))
+        styled_button(btn_row, "Rebuild synthetic demo data", self.rebuild_demo_data,
+                      kind="danger").pack(side="left")
 
     def on_show(self):
         self.refresh()
@@ -132,20 +156,21 @@ class POSScreen(BaseScreen):
         top = ctk.CTkFrame(self, fg_color="transparent")
         top.pack(fill="x", padx=24)
 
-        ctk.CTkLabel(top, text="Scan barcode or search item:").grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(top, text="Scan barcode or search item:", text_color=theme.TEXT_DARK).grid(
+            row=0, column=0, sticky="w")
         self.search_var = tk.StringVar()
         search_entry = ctk.CTkEntry(top, textvariable=self.search_var, width=280,
                                      placeholder_text="barcode / name (English or Sinhala)")
         search_entry.grid(row=1, column=0, padx=(0, 10), pady=6)
         search_entry.bind("<Return>", lambda e: self.do_search())
-        ctk.CTkButton(top, text="Search", width=90, command=self.do_search).grid(row=1, column=1)
+        styled_button(top, "Search", self.do_search, width=90).grid(row=1, column=1)
 
-        ctk.CTkLabel(top, text="Price tier:").grid(row=0, column=2, padx=(30, 0), sticky="w")
+        ctk.CTkLabel(top, text="Price tier:", text_color=theme.TEXT_DARK).grid(row=0, column=2, padx=(30, 0), sticky="w")
         self.tier_var = tk.StringVar(value="cash")
         ctk.CTkOptionMenu(top, values=["cash", "credit", "wholesale"], variable=self.tier_var).grid(
             row=1, column=2, padx=(30, 0))
 
-        ctk.CTkLabel(top, text="Staff:").grid(row=0, column=3, padx=(20, 0), sticky="w")
+        ctk.CTkLabel(top, text="Staff:", text_color=theme.TEXT_DARK).grid(row=0, column=3, padx=(20, 0), sticky="w")
         self.staff_var = tk.StringVar(value="Admin")
         staff_names = [r["name"] for r in self.conn.execute("SELECT name FROM staff").fetchall()] or ["Admin"]
         ctk.CTkOptionMenu(top, values=staff_names, variable=self.staff_var).grid(row=1, column=3, padx=(20, 0))
@@ -162,10 +187,10 @@ class POSScreen(BaseScreen):
 
         qty_row = ctk.CTkFrame(self, fg_color="transparent")
         qty_row.pack(fill="x", padx=24, pady=6)
-        ctk.CTkLabel(qty_row, text="Qty:").pack(side="left")
+        ctk.CTkLabel(qty_row, text="Qty:", text_color=theme.TEXT_DARK).pack(side="left")
         self.qty_var = tk.StringVar(value="1")
         ctk.CTkEntry(qty_row, textvariable=self.qty_var, width=70).pack(side="left", padx=8)
-        ctk.CTkButton(qty_row, text="Add to Cart", command=self.add_selected_to_cart).pack(side="left")
+        styled_button(qty_row, "Add to Cart", self.add_selected_to_cart).pack(side="left")
 
         cart_frame = ctk.CTkFrame(self, fg_color="transparent")
         cart_frame.pack(fill="both", expand=True, padx=24, pady=(6, 0))
@@ -177,12 +202,13 @@ class POSScreen(BaseScreen):
 
         bottom = ctk.CTkFrame(self, fg_color="transparent")
         bottom.pack(fill="x", padx=24, pady=12)
-        ctk.CTkButton(bottom, text="Remove Selected Line", command=self.remove_selected_line).pack(side="left")
-        ctk.CTkButton(bottom, text="Clear Cart", command=self.clear_cart).pack(side="left", padx=8)
-        self.total_label = ctk.CTkLabel(bottom, text="Net Total: LKR 0.00", font=ctk.CTkFont(size=16, weight="bold"))
+        styled_button(bottom, "Remove Selected Line", self.remove_selected_line, kind="secondary").pack(side="left")
+        styled_button(bottom, "Clear Cart", self.clear_cart, kind="secondary").pack(side="left", padx=8)
+        self.total_label = ctk.CTkLabel(bottom, text="Net Total: LKR 0.00", font=ctk.CTkFont(size=16, weight="bold"),
+                                         text_color=theme.NAVY_DARK)
         self.total_label.pack(side="left", padx=30)
-        ctk.CTkButton(bottom, text="Checkout", fg_color="#2e7d32", hover_color="#1b5e20",
-                      command=self.checkout).pack(side="right")
+        styled_button(bottom, "Checkout", self.checkout, kind="success", width=140,
+                      height=40).pack(side="right")
 
         self._search_results: list = []
 
@@ -191,11 +217,11 @@ class POSScreen(BaseScreen):
         if not query:
             return
         self._search_results = pos.search_products(self.conn, query)
-        self.results_tree.delete(*self.results_tree.get_children())
+        tree_clear(self.results_tree)
         for p in self._search_results:
             stock = pos.get_stock_on_hand(self.conn, p["id"])
-            self.results_tree.insert("", "end", iid=str(p["id"]),
-                                      values=(p["code"], p["name_en"], f"{p['cash_price']:.2f}", f"{stock:.0f}"))
+            tree_insert(self.results_tree, (p["code"], p["name_en"], f"{p['cash_price']:.2f}", f"{stock:.0f}"),
+                        iid=str(p["id"]))
 
     def add_selected_to_cart(self):
         sel = self.results_tree.selection()
@@ -214,13 +240,13 @@ class POSScreen(BaseScreen):
         self.refresh_cart()
 
     def refresh_cart(self):
-        self.cart_tree.delete(*self.cart_tree.get_children())
+        tree_clear(self.cart_tree)
         total = 0.0
         for i, line in enumerate(self.cart):
             line_total = line["qty"] * line["unit_price"]
             total += line_total
-            self.cart_tree.insert("", "end", iid=str(i),
-                                   values=(line["name"], line["qty"], f"{line['unit_price']:.2f}", f"{line_total:.2f}"))
+            tree_insert(self.cart_tree, (line["name"], line["qty"], f"{line['unit_price']:.2f}", f"{line_total:.2f}"),
+                        iid=str(i))
         self.total_label.configure(text=f"Net Total: LKR {total:,.2f}")
 
     def remove_selected_line(self):
@@ -250,7 +276,7 @@ class POSScreen(BaseScreen):
             return
         messagebox.showinfo("Sale complete", f"Invoice {result.invoice_no}\nNet total: LKR {result.net_total:,.2f}")
         self.clear_cart()
-        self.results_tree.delete(*self.results_tree.get_children())
+        tree_clear(self.results_tree)
 
 
 # --------------------------------------------------------------------------- #
@@ -264,9 +290,9 @@ class InventoryScreen(BaseScreen):
 
         btn_row = ctk.CTkFrame(self, fg_color="transparent")
         btn_row.pack(fill="x", padx=24)
-        ctk.CTkButton(btn_row, text="Refresh", command=self.refresh).pack(side="left")
-        ctk.CTkButton(btn_row, text="Export CSV", command=self.export).pack(side="left", padx=8)
-        ctk.CTkButton(btn_row, text="Receive Stock (GRN)", command=self.open_grn_dialog).pack(side="left", padx=8)
+        styled_button(btn_row, "Refresh", self.refresh, kind="secondary").pack(side="left")
+        styled_button(btn_row, "Export CSV", self.export, kind="secondary").pack(side="left", padx=8)
+        styled_button(btn_row, "Receive Stock (GRN)", self.open_grn_dialog, kind="primary").pack(side="left", padx=8)
 
         tree_frame = ctk.CTkFrame(self, fg_color="transparent")
         tree_frame.pack(fill="both", expand=True, padx=24, pady=10)
@@ -275,19 +301,17 @@ class InventoryScreen(BaseScreen):
             {"Code": 90, "Name": 260, "Category": 150, "On Hand": 90, "Reorder Level": 100, "Status": 100},
         )
         self.tree.master_frame.pack(fill="both", expand=True)
-        self.tree.tag_configure("low", background="#fde2e2")
 
     def on_show(self):
         self.refresh()
 
     def refresh(self):
         self._rows = reports.stock_summary(self.conn)
-        self.tree.delete(*self.tree.get_children())
+        tree_clear(self.tree)
         for r in self._rows:
-            tag = "low" if r["below_reorder"] else ""
-            self.tree.insert("", "end", values=(r["code"], r["name_en"], r["category"], f"{r['on_hand']:.0f}",
-                                                 r["reorder_level"], "LOW STOCK" if r["below_reorder"] else "OK"),
-                              tags=(tag,))
+            tag = "low" if r["below_reorder"] else None
+            tree_insert(self.tree, (r["code"], r["name_en"], r["category"], f"{r['on_hand']:.0f}",
+                                     r["reorder_level"], "LOW STOCK" if r["below_reorder"] else "OK"), tag=tag)
 
     def export(self):
         path = reports.export_csv(self._rows, db_module.ensure_output_dir() / "inventory_stock_summary.csv") \
@@ -298,7 +322,8 @@ class InventoryScreen(BaseScreen):
     def open_grn_dialog(self):
         dialog = ctk.CTkToplevel(self)
         dialog.title("Receive Stock (GRN)")
-        dialog.geometry("420x320")
+        dialog.geometry("420x340")
+        dialog.configure(fg_color=theme.BG_LIGHT)
 
         products = self.conn.execute("SELECT id, code, name_en FROM products WHERE active=1 ORDER BY name_en").fetchall()
         names = [f"{p['code']} - {p['name_en']}" for p in products]
@@ -341,7 +366,7 @@ class InventoryScreen(BaseScreen):
             except ValueError as e:
                 messagebox.showerror("Invalid input", str(e))
 
-        ctk.CTkButton(dialog, text="Save", command=save).pack(pady=18)
+        styled_button(dialog, "Save", save, kind="primary", width=140).pack(pady=18)
 
 
 # --------------------------------------------------------------------------- #
@@ -353,7 +378,18 @@ class PromotionsScreen(BaseScreen):
         super().__init__(parent, app)
         self.header("Promotions & Expiry (Urgency Ranking)")
 
-        ctk.CTkButton(self, text="Refresh", command=self.refresh).pack(anchor="w", padx=24)
+        top = ctk.CTkFrame(self, fg_color="transparent")
+        top.pack(fill="x", padx=24)
+        styled_button(top, "Refresh", self.refresh, kind="secondary").pack(side="left")
+        legend = ctk.CTkFrame(top, fg_color="transparent")
+        legend.pack(side="left", padx=20)
+        for label, color in [("Overdue", theme.ALERT_COLORS["overdue"]),
+                              ("≤ 3 days", theme.ALERT_COLORS["critical_3day"]),
+                              ("≤ 7 days", theme.ALERT_COLORS["warning_7day"])]:
+            swatch = ctk.CTkFrame(legend, width=14, height=14, fg_color=color, corner_radius=3)
+            swatch.pack(side="left", padx=(10, 4))
+            swatch.pack_propagate(False)
+            ctk.CTkLabel(legend, text=label, font=ctk.CTkFont(size=11), text_color=theme.TEXT_MUTED).pack(side="left")
 
         tree_frame = ctk.CTkFrame(self, fg_color="transparent")
         tree_frame.pack(fill="both", expand=True, padx=24, pady=10)
@@ -363,22 +399,19 @@ class PromotionsScreen(BaseScreen):
                   "Urgency": 80, "Discount %": 90, "Suggested Price": 110, "Est. Clearance": 110}
         self.tree = make_treeview(tree_frame, columns, widths)
         self.tree.master_frame.pack(fill="both", expand=True)
-        self.tree.tag_configure("overdue", background="#f4a6a6")
-        self.tree.tag_configure("critical_3day", background="#fbd3a2")
-        self.tree.tag_configure("warning_7day", background="#fbf3a2")
 
     def on_show(self):
         self.refresh()
 
     def refresh(self):
         rows = promotions.compute_promotions(self.conn)
-        self.tree.delete(*self.tree.get_children())
+        tree_clear(self.tree)
         for r in rows:
-            self.tree.insert("", "end", values=(
+            tree_insert(self.tree, (
                 r["name"], f"{r['qty_remaining']:.0f}", r["expiry_date"], r["days_to_expiry"],
                 r["alert_tier"] or "-", r["urgency"], f"{r['suggested_discount_pct']}%",
                 f"{r['suggested_price']:.2f}", r["projected_clearance_date"] or "-",
-            ), tags=(r["alert_tier"] or "",))
+            ), tag=r["alert_tier"])
 
 
 # --------------------------------------------------------------------------- #
@@ -392,17 +425,17 @@ class ForecastingScreen(BaseScreen):
 
         top = ctk.CTkFrame(self, fg_color="transparent")
         top.pack(fill="x", padx=24)
-        ctk.CTkLabel(top, text="Product:").pack(side="left")
+        ctk.CTkLabel(top, text="Product:", text_color=theme.TEXT_DARK).pack(side="left")
         products = self.conn.execute("SELECT id, name_en FROM products WHERE active=1 ORDER BY name_en").fetchall()
         self._products = products
         names = [p["name_en"] for p in products]
         self.product_var = tk.StringVar(value=names[0] if names else "")
         ctk.CTkOptionMenu(top, values=names, variable=self.product_var, width=280).pack(side="left", padx=8)
-        ctk.CTkButton(top, text="Run Forecast", command=self.run_forecast).pack(side="left", padx=8)
-        ctk.CTkButton(top, text="Generate Purchase List (all products)",
-                      command=self.run_purchase_list).pack(side="left", padx=20)
+        styled_button(top, "Run Forecast", self.run_forecast).pack(side="left", padx=8)
+        styled_button(top, "Generate Purchase List (all products)", self.run_purchase_list,
+                      kind="secondary").pack(side="left", padx=20)
 
-        self.status_label = ctk.CTkLabel(self, text="", text_color="gray")
+        self.status_label = ctk.CTkLabel(self, text="", text_color=theme.TEXT_MUTED)
         self.status_label.pack(anchor="w", padx=24, pady=(6, 0))
 
         self.chart_frame = ctk.CTkFrame(self, fg_color="transparent", height=280)
@@ -420,17 +453,17 @@ class ForecastingScreen(BaseScreen):
         self.update_idletasks()
         result = forecasting.select_best_model(self.conn, product["id"])
 
-        self.tree.delete(*self.tree.get_children())
+        tree_clear(self.tree)
         if not result["model_scores"] and result["forecast"] is None:
             self.status_label.configure(text="Not enough sales history for this product yet (need 30+ days).")
             return
 
         for name, score in sorted(result["model_scores"].items(), key=lambda kv: kv[1]):
             marker = "  <- selected" if name == result["best_model"] else ""
-            self.tree.insert("", "end", values=(f"nRMSE: {name}{marker}", f"{score:.3f}"))
+            tree_insert(self.tree, (f"nRMSE: {name}{marker}", f"{score:.3f}"))
         if result.get("future_dates") is not None:
             for d, v in zip(result["future_dates"], result["forecast"]):
-                self.tree.insert("", "end", values=(d.date().isoformat(), f"{v:.1f}"))
+                tree_insert(self.tree, (d.date().isoformat(), f"{v:.1f}"))
 
         self.status_label.configure(
             text=f"Best model: {result['best_model']}  |  anomalies excluded from training: {len(result['anomalies'])}"
@@ -463,13 +496,13 @@ class ForecastingScreen(BaseScreen):
         self.status_label.configure(text="Generating purchase list across all products (may take a few seconds)...")
         self.update_idletasks()
         rows = forecasting.generate_purchase_list(self.conn)
-        self.tree.delete(*self.tree.get_children())
+        tree_clear(self.tree)
         self.tree.configure(columns=["Product", "On Hand", "Forecast Demand", "Suggested Reorder", "Model"])
         for col in ["Product", "On Hand", "Forecast Demand", "Suggested Reorder", "Model"]:
             self.tree.heading(col, text=col)
         for r in rows:
-            self.tree.insert("", "end", values=(r["name"], r["on_hand"], r["forecast_demand_next_period"],
-                                                 r["suggested_reorder_qty"], r["best_model"]))
+            tree_insert(self.tree, (r["name"], r["on_hand"], r["forecast_demand_next_period"],
+                                     r["suggested_reorder_qty"], r["best_model"]))
         path = reports.export_csv(rows, db_module.ensure_output_dir() / "purchase_list.csv")
         self.status_label.configure(text=f"{len(rows)} products need reordering. Exported to {path}")
 
@@ -485,8 +518,9 @@ class BundlesScreen(BaseScreen):
 
         top = ctk.CTkFrame(self, fg_color="transparent")
         top.pack(fill="x", padx=24)
-        ctk.CTkButton(top, text="Compute Bundles", command=self.compute).pack(side="left")
-        self.status_label = ctk.CTkLabel(top, text="min support 2%, min confidence 30%, min lift 1.1", text_color="gray")
+        styled_button(top, "Compute Bundles", self.compute).pack(side="left")
+        self.status_label = ctk.CTkLabel(top, text="min support 2%, min confidence 30%, min lift 1.1",
+                                          text_color=theme.TEXT_MUTED)
         self.status_label.pack(side="left", padx=16)
 
         tree_frame = ctk.CTkFrame(self, fg_color="transparent")
@@ -499,12 +533,12 @@ class BundlesScreen(BaseScreen):
 
     def compute(self):
         rows = association.get_bundle_recommendations(self.conn)
-        self.tree.delete(*self.tree.get_children())
+        tree_clear(self.tree)
         for r in rows:
             bundle_name = " + ".join(r["antecedent"] + r["consequent"])
-            self.tree.insert("", "end", values=(bundle_name, r["support"], r["confidence"], r["lift"],
-                                                 f"{r['sum_price_lkr']:.2f}", f"{r['bundle_price_lkr']:.2f}",
-                                                 f"{r['savings_lkr']:.2f}"))
+            tree_insert(self.tree, (bundle_name, r["support"], r["confidence"], r["lift"],
+                                     f"{r['sum_price_lkr']:.2f}", f"{r['bundle_price_lkr']:.2f}",
+                                     f"{r['savings_lkr']:.2f}"))
         self.status_label.configure(text=f"{len(rows)} bundle recommendations")
 
 
@@ -519,12 +553,15 @@ class LayoutScreen(BaseScreen):
 
         top = ctk.CTkFrame(self, fg_color="transparent")
         top.pack(fill="x", padx=24)
-        ctk.CTkButton(top, text="Compute Layout", command=self.compute).pack(side="left")
-        self.status_label = ctk.CTkLabel(top, text="", text_color="gray")
+        styled_button(top, "Compute Layout", self.compute).pack(side="left")
+        self.status_label = ctk.CTkLabel(top, text="", text_color=theme.TEXT_MUTED)
         self.status_label.pack(side="left", padx=16)
 
-        self.image_label = ctk.CTkLabel(self, text="")
-        self.image_label.pack(padx=24, pady=10)
+        self.image_frame = ctk.CTkFrame(self, fg_color=theme.CARD_BG, border_width=1, border_color=theme.BORDER)
+        self.image_frame.pack(padx=24, pady=10, fill="both", expand=True)
+        self.image_label = ctk.CTkLabel(self.image_frame, text="Click \"Compute Layout\" to generate a planogram.",
+                                         text_color=theme.TEXT_MUTED)
+        self.image_label.pack(padx=16, pady=16)
 
     def compute(self):
         assignments = layout.compute_layout(self.conn)
@@ -548,7 +585,8 @@ class LayoutScreen(BaseScreen):
 # Reports
 # --------------------------------------------------------------------------- #
 
-REPORT_OPTIONS = ["Best Sellers (30d)", "Stock Summary", "Low Stock Alert", "Waste Summary"]
+REPORT_OPTIONS = ["Best Sellers (30d)", "Stock Summary", "Low Stock Alert",
+                   "Waste Summary", "Cashier Daily Statement"]
 
 
 class ReportsScreen(BaseScreen):
@@ -559,16 +597,38 @@ class ReportsScreen(BaseScreen):
         top = ctk.CTkFrame(self, fg_color="transparent")
         top.pack(fill="x", padx=24)
         self.report_var = tk.StringVar(value=REPORT_OPTIONS[0])
-        ctk.CTkOptionMenu(top, values=REPORT_OPTIONS, variable=self.report_var).pack(side="left")
-        ctk.CTkButton(top, text="Run Report", command=self.run_report).pack(side="left", padx=8)
-        ctk.CTkButton(top, text="Export CSV", command=self.export).pack(side="left", padx=8)
-        ctk.CTkButton(top, text="Backup Database", command=self.backup).pack(side="left", padx=20)
+        ctk.CTkOptionMenu(top, values=REPORT_OPTIONS, variable=self.report_var,
+                          command=self._on_report_change).pack(side="left")
+        styled_button(top, "Run Report", self.run_report).pack(side="left", padx=8)
+        styled_button(top, "Export CSV", self.export, kind="secondary").pack(side="left", padx=8)
+        styled_button(top, "Backup Database", self.backup, kind="secondary").pack(side="left", padx=20)
+
+        self.cashier_row = ctk.CTkFrame(self, fg_color="transparent")
+        ctk.CTkLabel(self.cashier_row, text="Staff:", text_color=theme.TEXT_DARK).pack(side="left", padx=(24, 4))
+        staff_names = [r["name"] for r in self.conn.execute("SELECT name FROM staff").fetchall()] or ["Admin"]
+        self.cashier_staff_var = tk.StringVar(value=staff_names[0])
+        ctk.CTkOptionMenu(self.cashier_row, values=staff_names, variable=self.cashier_staff_var).pack(side="left")
+        ctk.CTkLabel(self.cashier_row, text="Date (YYYY-MM-DD):", text_color=theme.TEXT_DARK).pack(
+            side="left", padx=(16, 4))
+        self.cashier_date_var = tk.StringVar(value=date.today().isoformat())
+        ctk.CTkEntry(self.cashier_row, textvariable=self.cashier_date_var, width=120).pack(side="left")
+        # hidden until "Cashier Daily Statement" is selected - see _on_report_change
+
+        self.summary_label = ctk.CTkLabel(self, text="", text_color=theme.NAVY_DARK,
+                                           font=ctk.CTkFont(size=14, weight="bold"))
+        self.summary_label.pack(anchor="w", padx=24, pady=(8, 0))
 
         tree_frame = ctk.CTkFrame(self, fg_color="transparent")
         tree_frame.pack(fill="both", expand=True, padx=24, pady=10)
         self.tree = make_treeview(tree_frame, ["A", "B", "C", "D"], {})
         self.tree.master_frame.pack(fill="both", expand=True)
         self._rows: list[dict] = []
+
+    def _on_report_change(self, choice: str):
+        if choice == "Cashier Daily Statement":
+            self.cashier_row.pack(fill="x", pady=(6, 0), before=self.summary_label)
+        else:
+            self.cashier_row.pack_forget()
 
     def _set_columns(self, columns: list[str]):
         self.tree.configure(columns=columns)
@@ -578,7 +638,9 @@ class ReportsScreen(BaseScreen):
 
     def run_report(self):
         choice = self.report_var.get()
-        self.tree.delete(*self.tree.get_children())
+        tree_clear(self.tree)
+        self.summary_label.configure(text="")
+
         if choice == "Best Sellers (30d)":
             rows = [dict(r) for r in reports.best_sellers(self.conn)]
             self._set_columns(["name_en", "category", "qty", "revenue"])
@@ -588,13 +650,30 @@ class ReportsScreen(BaseScreen):
         elif choice == "Low Stock Alert":
             rows = reports.low_stock_alert(self.conn)
             self._set_columns(["code", "name_en", "on_hand", "reorder_level"])
+        elif choice == "Cashier Daily Statement":
+            staff_row = self.conn.execute(
+                "SELECT id FROM staff WHERE name=?", (self.cashier_staff_var.get(),)
+            ).fetchone()
+            try:
+                day = date.fromisoformat(self.cashier_date_var.get().strip())
+            except ValueError:
+                messagebox.showerror("Invalid date", "Use YYYY-MM-DD format.")
+                return
+            statement = reports.cashier_daily_statement(self.conn, staff_row["id"] if staff_row else 1, day)
+            rows = [{"payment_type": k, "count": v["count"], "total": v["total"]}
+                    for k, v in statement["by_payment_type"].items()]
+            self._set_columns(["payment_type", "count", "total"])
+            self.summary_label.configure(
+                text=f"{statement['staff_name']} — {statement['date']}: "
+                     f"{statement['invoice_count']} invoices, LKR {statement['grand_total']:,.2f} total"
+            )
         else:
             rows = reports.waste_summary(self.conn)
             self._set_columns(["name_en", "category", "events", "qty", "value_lost"])
 
         columns = self.tree["columns"]
         for r in rows:
-            self.tree.insert("", "end", values=[r.get(c, "") for c in columns])
+            tree_insert(self.tree, [r.get(c, "") for c in columns])
         self._rows = rows
 
     def export(self):
