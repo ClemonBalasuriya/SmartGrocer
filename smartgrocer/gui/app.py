@@ -28,6 +28,8 @@ NAV_ITEMS = [
     ("📊  Dashboard", "dashboard", screens.DashboardScreen),
     ("🛒  POS / Checkout", "pos", screens.POSScreen),
     ("📦  Inventory", "inventory", screens.InventoryScreen),
+    ("👥  Customers", "customers", screens.CustomersScreen),
+    ("🚚  Suppliers", "suppliers", screens.SuppliersScreen),
     ("⏰  Promotions & Expiry", "promotions", screens.PromotionsScreen),
     ("📈  Forecasting", "forecasting", screens.ForecastingScreen),
     ("🔗  Bundle Recommendations", "bundles", screens.BundlesScreen),

@@ -12,6 +12,8 @@ from tkinter import messagebox, ttk
 import customtkinter as ctk
 
 from .. import association, forecasting, layout, pos, promotions, reports
+from .. import customers as customers_module
+from .. import suppliers as suppliers_module
 from .. import db as db_module
 from . import theme
 from .theme import tree_clear, tree_insert
@@ -147,6 +149,57 @@ class DashboardScreen(BaseScreen):
 # POS / Checkout
 # --------------------------------------------------------------------------- #
 
+def prompt_split_payment(parent, total: float) -> list[tuple[str, float]] | None:
+    """Modal dialog for a mixed-tender sale (e.g. part cash, part card, part
+    credit) - matches the sample POS system's "Mix Payment" button. Returns
+    a list of (method, amount) tuples that sum to `total`, or None if the
+    cashier cancelled."""
+    result: dict = {"payments": None}
+    dialog = ctk.CTkToplevel(parent)
+    dialog.title("Split / Mixed Payment")
+    dialog.geometry("360x340")
+    dialog.configure(fg_color=theme.BG_LIGHT)
+    dialog.grab_set()
+
+    ctk.CTkLabel(dialog, text=f"Total to collect: LKR {total:,.2f}",
+                 font=ctk.CTkFont(size=14, weight="bold"), text_color=theme.NAVY_DARK).pack(pady=(16, 10))
+
+    method_vars: dict[str, tk.StringVar] = {}
+    for method in ["cash", "card", "cheque", "credit"]:
+        row = ctk.CTkFrame(dialog, fg_color="transparent")
+        row.pack(fill="x", padx=24, pady=4)
+        ctk.CTkLabel(row, text=method.capitalize() + ":", width=70, anchor="w",
+                     text_color=theme.TEXT_DARK).pack(side="left")
+        v = tk.StringVar(value="0")
+        ctk.CTkEntry(row, textvariable=v, width=140).pack(side="left")
+        method_vars[method] = v
+
+    def submit():
+        try:
+            payments = [(m, float(v.get())) for m, v in method_vars.items() if float(v.get() or 0) > 0]
+        except ValueError:
+            messagebox.showerror("Invalid amount", "Enter numbers only.")
+            return
+        if not payments:
+            messagebox.showerror("Nothing entered", "Enter at least one payment amount.")
+            return
+        paid_sum = round(sum(a for _, a in payments), 2)
+        if abs(paid_sum - total) > 0.01:
+            messagebox.showerror("Amount mismatch",
+                                  f"Payments total LKR {paid_sum:,.2f}, expected LKR {total:,.2f}.")
+            return
+        result["payments"] = payments
+        dialog.destroy()
+
+    btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
+    btn_row.pack(pady=20)
+    styled_button(btn_row, "Confirm", submit, kind="success").pack(side="left", padx=6)
+    styled_button(btn_row, "Cancel", dialog.destroy, kind="secondary").pack(side="left", padx=6)
+
+    dialog.wait_window()
+    return result["payments"]
+
+
 class POSScreen(BaseScreen):
     def __init__(self, parent, app):
         super().__init__(parent, app)
@@ -159,21 +212,31 @@ class POSScreen(BaseScreen):
         ctk.CTkLabel(top, text="Scan barcode or search item:", text_color=theme.TEXT_DARK).grid(
             row=0, column=0, sticky="w")
         self.search_var = tk.StringVar()
-        search_entry = ctk.CTkEntry(top, textvariable=self.search_var, width=280,
+        search_entry = ctk.CTkEntry(top, textvariable=self.search_var, width=260,
                                      placeholder_text="barcode / name (English or Sinhala)")
         search_entry.grid(row=1, column=0, padx=(0, 10), pady=6)
         search_entry.bind("<Return>", lambda e: self.do_search())
         styled_button(top, "Search", self.do_search, width=90).grid(row=1, column=1)
 
-        ctk.CTkLabel(top, text="Price tier:", text_color=theme.TEXT_DARK).grid(row=0, column=2, padx=(30, 0), sticky="w")
+        ctk.CTkLabel(top, text="Price tier:", text_color=theme.TEXT_DARK).grid(row=0, column=2, padx=(20, 0), sticky="w")
         self.tier_var = tk.StringVar(value="cash")
         ctk.CTkOptionMenu(top, values=["cash", "credit", "wholesale"], variable=self.tier_var).grid(
-            row=1, column=2, padx=(30, 0))
+            row=1, column=2, padx=(20, 0))
 
-        ctk.CTkLabel(top, text="Staff:", text_color=theme.TEXT_DARK).grid(row=0, column=3, padx=(20, 0), sticky="w")
+        ctk.CTkLabel(top, text="Payment:", text_color=theme.TEXT_DARK).grid(row=0, column=3, padx=(16, 0), sticky="w")
+        self.payment_var = tk.StringVar(value="cash")
+        ctk.CTkOptionMenu(top, values=["cash", "card", "cheque", "credit", "split"],
+                           variable=self.payment_var).grid(row=1, column=3, padx=(16, 0))
+
+        ctk.CTkLabel(top, text="Customer:", text_color=theme.TEXT_DARK).grid(row=0, column=4, padx=(16, 0), sticky="w")
+        self.customer_var = tk.StringVar(value="Walk-in")
+        self.customer_menu = ctk.CTkOptionMenu(top, values=["Walk-in"], variable=self.customer_var, width=160)
+        self.customer_menu.grid(row=1, column=4, padx=(16, 0))
+
+        ctk.CTkLabel(top, text="Staff:", text_color=theme.TEXT_DARK).grid(row=0, column=5, padx=(16, 0), sticky="w")
         self.staff_var = tk.StringVar(value="Admin")
         staff_names = [r["name"] for r in self.conn.execute("SELECT name FROM staff").fetchall()] or ["Admin"]
-        ctk.CTkOptionMenu(top, values=staff_names, variable=self.staff_var).grid(row=1, column=3, padx=(20, 0))
+        ctk.CTkOptionMenu(top, values=staff_names, variable=self.staff_var).grid(row=1, column=5, padx=(16, 0))
 
         results_frame = ctk.CTkFrame(self, fg_color="transparent")
         results_frame.pack(fill="x", padx=24, pady=(6, 0))
@@ -201,7 +264,7 @@ class POSScreen(BaseScreen):
         self.cart_tree.master_frame.pack(fill="both", expand=True)
 
         bottom = ctk.CTkFrame(self, fg_color="transparent")
-        bottom.pack(fill="x", padx=24, pady=12)
+        bottom.pack(fill="x", padx=24, pady=(4, 0))
         styled_button(bottom, "Remove Selected Line", self.remove_selected_line, kind="secondary").pack(side="left")
         styled_button(bottom, "Clear Cart", self.clear_cart, kind="secondary").pack(side="left", padx=8)
         self.total_label = ctk.CTkLabel(bottom, text="Net Total: LKR 0.00", font=ctk.CTkFont(size=16, weight="bold"),
@@ -210,7 +273,26 @@ class POSScreen(BaseScreen):
         styled_button(bottom, "Checkout", self.checkout, kind="success", width=140,
                       height=40).pack(side="right")
 
+        bottom2 = ctk.CTkFrame(self, fg_color="transparent")
+        bottom2.pack(fill="x", padx=24, pady=(8, 12))
+        styled_button(bottom2, "Hold Invoice", self.hold_invoice, kind="secondary").pack(side="left")
+        styled_button(bottom2, "Resume Held", self.resume_invoice, kind="secondary").pack(side="left", padx=8)
+        styled_button(bottom2, "Return / Refund", self.open_return_dialog, kind="danger").pack(side="left", padx=8)
+
         self._search_results: list = []
+
+    def on_show(self):
+        names = [r["name"] for r in customers_module.list_customers(self.conn)] or ["Walk-in"]
+        if "Walk-in" not in names:
+            names = ["Walk-in"] + names
+        self.customer_menu.configure(values=names)
+        if self.customer_var.get() not in names:
+            self.customer_var.set("Walk-in")
+
+    def _selected_customer_row(self):
+        name = self.customer_var.get()
+        row = self.conn.execute("SELECT * FROM customers WHERE name=?", (name,)).fetchone()
+        return row
 
     def do_search(self):
         query = self.search_var.get().strip()
@@ -267,16 +349,173 @@ class POSScreen(BaseScreen):
             return
         staff_row = self.conn.execute("SELECT id FROM staff WHERE name=?", (self.staff_var.get(),)).fetchone()
         staff_id = staff_row["id"] if staff_row else self.app.current_staff_id
+        customer_row = self._selected_customer_row()
         cart_lines = [pos.CartLine(product_id=c["product_id"], qty=c["qty"]) for c in self.cart]
+        net_total = sum(c["qty"] * c["unit_price"] for c in self.cart)
+
+        payment_choice = self.payment_var.get()
+        payments = None
+        payment_type = payment_choice
+        cash_paid = None
+        if payment_choice == "split":
+            payments = prompt_split_payment(self, round(net_total, 2))
+            if payments is None:
+                return  # cashier cancelled the split-payment dialog
+        elif payment_choice == "credit":
+            cash_paid = 0.0
+
         try:
-            result = pos.create_invoice(self.conn, staff_id=staff_id, cart=cart_lines,
-                                         price_tier=self.tier_var.get())
+            result = pos.create_invoice(
+                self.conn, staff_id=staff_id, cart=cart_lines, price_tier=self.tier_var.get(),
+                payment_type=payment_type, customer_name=customer_row["name"] if customer_row else "Walk-in",
+                customer_id=customer_row["id"] if customer_row else None, cash_paid=cash_paid, payments=payments,
+            )
         except pos.InsufficientStockError as e:
             messagebox.showerror("Insufficient stock", str(e))
             return
+        except customers_module.CreditLimitExceededError as e:
+            messagebox.showerror("Credit limit exceeded", str(e))
+            return
+        except ValueError as e:
+            messagebox.showerror("Cannot complete sale", str(e))
+            return
+
         messagebox.showinfo("Sale complete", f"Invoice {result.invoice_no}\nNet total: LKR {result.net_total:,.2f}")
         self.clear_cart()
         tree_clear(self.results_tree)
+
+    def hold_invoice(self):
+        if not self.cart:
+            messagebox.showwarning("Empty cart", "Nothing to hold.")
+            return
+        staff_row = self.conn.execute("SELECT id FROM staff WHERE name=?", (self.staff_var.get(),)).fetchone()
+        staff_id = staff_row["id"] if staff_row else self.app.current_staff_id
+        customer_row = self._selected_customer_row()
+        cart_lines = [pos.CartLine(product_id=c["product_id"], qty=c["qty"]) for c in self.cart]
+        pos.hold_cart(self.conn, staff_id=staff_id, cart=cart_lines, price_tier=self.tier_var.get(),
+                       customer_id=customer_row["id"] if customer_row else None)
+        messagebox.showinfo("Held", "Cart held. Use 'Resume Held' to bring it back later.")
+        self.clear_cart()
+
+    def resume_invoice(self):
+        held = pos.list_held_invoices(self.conn)
+        if not held:
+            messagebox.showinfo("No held invoices", "There are no held invoices right now.")
+            return
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Resume Held Invoice")
+        dialog.geometry("460x320")
+        dialog.configure(fg_color=theme.BG_LIGHT)
+        dialog.grab_set()
+
+        tree = make_treeview(dialog, ["Held At", "Customer", "Note"],
+                              {"Held At": 150, "Customer": 140, "Note": 140})
+        tree.master_frame.pack(fill="both", expand=True, padx=12, pady=12)
+        for h in held:
+            tree_insert(tree, (h["held_at"], h["customer_name"], h["note"] or ""), iid=str(h["id"]))
+
+        def do_resume():
+            sel = tree.selection()
+            if not sel:
+                return
+            held_id = int(sel[0])
+            cart_lines, tier, customer_id = pos.resume_held_invoice(self.conn, held_id)
+            new_cart = []
+            tier_field = {"cash": "cash_price", "credit": "credit_price", "wholesale": "wholesale_price"}[tier]
+            for line in cart_lines:
+                p = self.conn.execute("SELECT * FROM products WHERE id=?", (line.product_id,)).fetchone()
+                if p is None:
+                    continue
+                new_cart.append({"product_id": line.product_id, "name": p["name_en"], "qty": line.qty,
+                                  "unit_price": p[tier_field]})
+            self.cart = new_cart
+            self.tier_var.set(tier)
+            if customer_id:
+                crow = customers_module.get_customer(self.conn, customer_id)
+                if crow:
+                    self.on_show()
+                    self.customer_var.set(crow["name"])
+            pos.delete_held_invoice(self.conn, held_id)
+            self.refresh_cart()
+            dialog.destroy()
+
+        styled_button(dialog, "Resume Selected", do_resume, kind="primary").pack(pady=10)
+
+    def open_return_dialog(self):
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Return / Refund")
+        dialog.geometry("500x460")
+        dialog.configure(fg_color=theme.BG_LIGHT)
+        dialog.grab_set()
+
+        ctk.CTkLabel(dialog, text="Invoice No:", text_color=theme.TEXT_DARK).pack(anchor="w", padx=16, pady=(16, 0))
+        inv_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        inv_row.pack(fill="x", padx=16)
+        inv_var = tk.StringVar()
+        ctk.CTkEntry(inv_row, textvariable=inv_var, width=200).pack(side="left")
+
+        tree = make_treeview(dialog, ["Item", "Returnable Qty", "Unit Price"],
+                              {"Item": 230, "Returnable Qty": 120, "Unit Price": 100})
+        tree.master_frame.pack(fill="both", expand=True, padx=16, pady=10)
+
+        state = {"invoice_id": None, "items": []}
+
+        def load():
+            inv = self.conn.execute(
+                "SELECT id FROM invoices WHERE invoice_no=? AND voided=0", (inv_var.get().strip(),)
+            ).fetchone()
+            if not inv:
+                messagebox.showerror("Not found", "No such invoice (or it was voided).")
+                return
+            state["invoice_id"] = inv["id"]
+            state["items"] = pos.returnable_items(self.conn, inv["id"])
+            tree_clear(tree)
+            for it in state["items"]:
+                tree_insert(tree, (it["name_en"], f"{it['returnable_qty']:.2f}", f"{it['unit_price']:.2f}"),
+                            iid=str(it["invoice_item_id"]))
+            if not state["items"]:
+                messagebox.showinfo("Nothing left to return", "Every line on this invoice is already fully returned.")
+
+        styled_button(inv_row, "Load Invoice", load, kind="secondary").pack(side="left", padx=8)
+
+        qty_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        qty_row.pack(fill="x", padx=16, pady=6)
+        ctk.CTkLabel(qty_row, text="Return qty (selected line):", text_color=theme.TEXT_DARK).pack(side="left")
+        return_qty_var = tk.StringVar(value="1")
+        ctk.CTkEntry(qty_row, textvariable=return_qty_var, width=80).pack(side="left", padx=8)
+
+        reason_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        reason_row.pack(fill="x", padx=16, pady=4)
+        ctk.CTkLabel(reason_row, text="Reason:", text_color=theme.TEXT_DARK).pack(side="left")
+        reason_var = tk.StringVar()
+        ctk.CTkEntry(reason_row, textvariable=reason_var, width=260).pack(side="left", padx=8)
+
+        def do_return():
+            sel = tree.selection()
+            if not sel or state["invoice_id"] is None:
+                messagebox.showwarning("Select a line", "Load an invoice and select a line to return.")
+                return
+            item_id = int(sel[0])
+            item = next((it for it in state["items"] if it["invoice_item_id"] == item_id), None)
+            if item is None:
+                return
+            try:
+                qty = float(return_qty_var.get())
+            except ValueError:
+                messagebox.showerror("Invalid quantity", "Enter a number.")
+                return
+            if qty <= 0 or qty > item["returnable_qty"] + 1e-6:
+                messagebox.showerror("Invalid quantity", f"Max returnable is {item['returnable_qty']:.2f}.")
+                return
+            refund = pos.return_items(
+                self.conn, state["invoice_id"], [(item["product_id"], item["batch_id"], qty)],
+                reason=reason_var.get().strip(),
+            )
+            messagebox.showinfo("Returned", f"Refunded LKR {refund:,.2f}")
+            load()
+
+        styled_button(dialog, "Process Return", do_return, kind="danger").pack(pady=14)
 
 
 # --------------------------------------------------------------------------- #
@@ -332,6 +571,12 @@ class InventoryScreen(BaseScreen):
         product_var = tk.StringVar(value=names[0] if names else "")
         ctk.CTkOptionMenu(dialog, values=names, variable=product_var, width=360).pack(padx=16)
 
+        suppliers_list = suppliers_module.list_suppliers(self.conn)
+        supplier_names = ["(none)"] + [s["name"] for s in suppliers_list]
+        ctk.CTkLabel(dialog, text="Supplier:").pack(anchor="w", padx=16, pady=(12, 0))
+        supplier_var = tk.StringVar(value=supplier_names[0])
+        ctk.CTkOptionMenu(dialog, values=supplier_names, variable=supplier_var, width=360).pack(padx=16)
+
         ctk.CTkLabel(dialog, text="Quantity received:").pack(anchor="w", padx=16, pady=(12, 0))
         qty_var = tk.StringVar(value="10")
         ctk.CTkEntry(dialog, textvariable=qty_var).pack(fill="x", padx=16)
@@ -354,11 +599,15 @@ class InventoryScreen(BaseScreen):
                 expiry = expiry_var.get().strip() or None
                 if expiry:
                     date.fromisoformat(expiry)  # validates format
+                supplier_id = None
+                if supplier_var.get() != "(none)":
+                    match = next((s for s in suppliers_list if s["name"] == supplier_var.get()), None)
+                    supplier_id = match["id"] if match else None
                 self.conn.execute(
                     """INSERT INTO stock_batches (product_id,batch_no,qty_received,qty_remaining,
-                       received_date,expiry_date,cost_price) VALUES (?,?,?,?,?,?,?)""",
+                       received_date,expiry_date,cost_price,supplier_id) VALUES (?,?,?,?,?,?,?,?)""",
                     (product["id"], f"GRN-MANUAL-{date.today().isoformat()}", qty, qty,
-                     date.today().isoformat(), expiry, cost),
+                     date.today().isoformat(), expiry, cost, supplier_id),
                 )
                 self.conn.commit()
                 dialog.destroy()
@@ -586,7 +835,8 @@ class LayoutScreen(BaseScreen):
 # --------------------------------------------------------------------------- #
 
 REPORT_OPTIONS = ["Best Sellers (30d)", "Stock Summary", "Low Stock Alert",
-                   "Waste Summary", "Cashier Daily Statement"]
+                   "Waste Summary", "Cashier Daily Statement", "Credit Outstanding",
+                   "Returns Summary (30d)", "Supplier Summary"]
 
 
 class ReportsScreen(BaseScreen):
@@ -667,6 +917,15 @@ class ReportsScreen(BaseScreen):
                 text=f"{statement['staff_name']} — {statement['date']}: "
                      f"{statement['invoice_count']} invoices, LKR {statement['grand_total']:,.2f} total"
             )
+        elif choice == "Credit Outstanding":
+            rows = reports.credit_outstanding_summary(self.conn)
+            self._set_columns(["name", "phone", "credit_limit", "credit_balance", "available_credit"])
+        elif choice == "Returns Summary (30d)":
+            rows = reports.returns_summary(self.conn)
+            self._set_columns(["name_en", "category", "events", "qty", "refunded"])
+        elif choice == "Supplier Summary":
+            rows = suppliers_module.supplier_summary(self.conn)
+            self._set_columns(["name", "batches_received", "qty_received", "value_received"])
         else:
             rows = reports.waste_summary(self.conn)
             self._set_columns(["name_en", "category", "events", "qty", "value_lost"])
@@ -686,3 +945,200 @@ class ReportsScreen(BaseScreen):
     def backup(self):
         path = reports.backup_database(db_module.DEFAULT_DB_PATH, db_module.ensure_output_dir() / "backups")
         messagebox.showinfo("Backup complete", f"Saved to {path}")
+
+
+# --------------------------------------------------------------------------- #
+# Customers (credit accounts)
+# --------------------------------------------------------------------------- #
+
+class CustomersScreen(BaseScreen):
+    def __init__(self, parent, app):
+        super().__init__(parent, app)
+        self.header("Customers & Credit Accounts")
+
+        top = ctk.CTkFrame(self, fg_color="transparent")
+        top.pack(fill="x", padx=24)
+        styled_button(top, "Refresh", self.refresh, kind="secondary").pack(side="left")
+        styled_button(top, "Add Customer", self.open_add_dialog, kind="primary").pack(side="left", padx=8)
+        styled_button(top, "Settle Credit", self.open_settle_dialog, kind="success").pack(side="left", padx=8)
+        styled_button(top, "View Statement", self.open_statement_dialog, kind="secondary").pack(side="left", padx=8)
+
+        tree_frame = ctk.CTkFrame(self, fg_color="transparent")
+        tree_frame.pack(fill="both", expand=True, padx=24, pady=10)
+        self.tree = make_treeview(
+            tree_frame, ["Name", "Phone", "Credit Limit", "Balance Owed", "Available Credit"],
+            {"Name": 220, "Phone": 130, "Credit Limit": 110, "Balance Owed": 110, "Available Credit": 130},
+        )
+        self.tree.master_frame.pack(fill="both", expand=True)
+
+    def on_show(self):
+        self.refresh()
+
+    def refresh(self):
+        tree_clear(self.tree)
+        for c in customers_module.list_customers(self.conn):
+            available = round(c["credit_limit"] - c["credit_balance"], 2)
+            tag = "overdue" if c["credit_limit"] > 0 and c["credit_balance"] >= c["credit_limit"] else None
+            tree_insert(
+                self.tree,
+                (c["name"], c["phone"] or "", f"{c['credit_limit']:,.2f}", f"{c['credit_balance']:,.2f}",
+                 f"{available:,.2f}"),
+                tag=tag, iid=str(c["id"]),
+            )
+
+    def _selected_customer_id(self):
+        sel = self.tree.selection()
+        return int(sel[0]) if sel else None
+
+    def open_add_dialog(self):
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Add Customer")
+        dialog.geometry("380x340")
+        dialog.configure(fg_color=theme.BG_LIGHT)
+        dialog.grab_set()
+
+        fields = {}
+        for label, key, default in [("Name:", "name", ""), ("Phone:", "phone", ""),
+                                     ("Address:", "address", ""), ("Credit Limit:", "credit_limit", "0")]:
+            ctk.CTkLabel(dialog, text=label).pack(anchor="w", padx=16, pady=(12, 0))
+            v = tk.StringVar(value=default)
+            ctk.CTkEntry(dialog, textvariable=v, width=320).pack(padx=16)
+            fields[key] = v
+
+        def save():
+            name = fields["name"].get().strip()
+            if not name:
+                messagebox.showerror("Missing name", "Customer name is required.")
+                return
+            try:
+                limit = float(fields["credit_limit"].get() or 0)
+            except ValueError:
+                messagebox.showerror("Invalid credit limit", "Enter a number.")
+                return
+            customers_module.add_customer(
+                self.conn, name, fields["phone"].get(), fields["address"].get(), limit
+            )
+            dialog.destroy()
+            self.refresh()
+
+        styled_button(dialog, "Save", save, kind="primary", width=140).pack(pady=18)
+
+    def open_settle_dialog(self):
+        customer_id = self._selected_customer_id()
+        if customer_id is None:
+            messagebox.showwarning("Select a customer", "Select a customer in the list first.")
+            return
+        c = customers_module.get_customer(self.conn, customer_id)
+        if c is None or c["credit_balance"] <= 0:
+            messagebox.showinfo("Nothing owed", f"{c['name'] if c else 'This customer'} has no outstanding balance.")
+            return
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Settle Credit")
+        dialog.geometry("360x260")
+        dialog.configure(fg_color=theme.BG_LIGHT)
+        dialog.grab_set()
+
+        ctk.CTkLabel(dialog, text=f"{c['name']} owes LKR {c['credit_balance']:,.2f}",
+                     font=ctk.CTkFont(size=14, weight="bold"), text_color=theme.NAVY_DARK).pack(pady=(16, 10))
+
+        ctk.CTkLabel(dialog, text="Amount received:").pack(anchor="w", padx=20)
+        amount_var = tk.StringVar(value=f"{c['credit_balance']:.2f}")
+        ctk.CTkEntry(dialog, textvariable=amount_var, width=300).pack(padx=20)
+
+        ctk.CTkLabel(dialog, text="Method:").pack(anchor="w", padx=20, pady=(10, 0))
+        method_var = tk.StringVar(value="cash")
+        ctk.CTkOptionMenu(dialog, values=["cash", "card", "cheque"], variable=method_var, width=300).pack(padx=20)
+
+        def save():
+            try:
+                amount = float(amount_var.get())
+            except ValueError:
+                messagebox.showerror("Invalid amount", "Enter a number.")
+                return
+            if amount <= 0 or amount > c["credit_balance"] + 0.01:
+                messagebox.showerror("Invalid amount", f"Enter an amount up to LKR {c['credit_balance']:,.2f}.")
+                return
+            customers_module.settle_credit(self.conn, customer_id, amount, method_var.get())
+            dialog.destroy()
+            self.refresh()
+
+        styled_button(dialog, "Record Payment", save, kind="success", width=160).pack(pady=18)
+
+    def open_statement_dialog(self):
+        customer_id = self._selected_customer_id()
+        if customer_id is None:
+            messagebox.showwarning("Select a customer", "Select a customer in the list first.")
+            return
+        c = customers_module.get_customer(self.conn, customer_id)
+        rows = customers_module.credit_statement(self.conn, customer_id)
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title(f"Credit Statement — {c['name'] if c else ''}")
+        dialog.geometry("560x420")
+        dialog.configure(fg_color=theme.BG_LIGHT)
+        dialog.grab_set()
+
+        stmt_tree = make_treeview(dialog, ["Date", "Description", "Charge", "Payment", "Balance"],
+                                   {"Date": 130, "Description": 160, "Charge": 80, "Payment": 80, "Balance": 90})
+        stmt_tree.master_frame.pack(fill="both", expand=True, padx=16, pady=16)
+        for r in rows:
+            tree_insert(stmt_tree, (r["ts"], r["description"], f"{r['charge']:.2f}" if r["charge"] else "",
+                                     f"{r['payment']:.2f}" if r["payment"] else "", f"{r['balance']:.2f}"))
+        if not rows:
+            ctk.CTkLabel(dialog, text="No credit activity yet.", text_color=theme.TEXT_MUTED).pack(pady=10)
+
+
+# --------------------------------------------------------------------------- #
+# Suppliers
+# --------------------------------------------------------------------------- #
+
+class SuppliersScreen(BaseScreen):
+    def __init__(self, parent, app):
+        super().__init__(parent, app)
+        self.header("Suppliers")
+
+        top = ctk.CTkFrame(self, fg_color="transparent")
+        top.pack(fill="x", padx=24)
+        styled_button(top, "Refresh", self.refresh, kind="secondary").pack(side="left")
+        styled_button(top, "Add Supplier", self.open_add_dialog, kind="primary").pack(side="left", padx=8)
+
+        tree_frame = ctk.CTkFrame(self, fg_color="transparent")
+        tree_frame.pack(fill="both", expand=True, padx=24, pady=10)
+        self.tree = make_treeview(
+            tree_frame, ["Name", "Phone", "Address"], {"Name": 220, "Phone": 140, "Address": 260},
+        )
+        self.tree.master_frame.pack(fill="both", expand=True)
+
+    def on_show(self):
+        self.refresh()
+
+    def refresh(self):
+        tree_clear(self.tree)
+        for s in suppliers_module.list_suppliers(self.conn):
+            tree_insert(self.tree, (s["name"], s["phone"] or "", s["address"] or ""), iid=str(s["id"]))
+
+    def open_add_dialog(self):
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Add Supplier")
+        dialog.geometry("380x280")
+        dialog.configure(fg_color=theme.BG_LIGHT)
+        dialog.grab_set()
+
+        fields = {}
+        for label, key in [("Name:", "name"), ("Phone:", "phone"), ("Address:", "address")]:
+            ctk.CTkLabel(dialog, text=label).pack(anchor="w", padx=16, pady=(12, 0))
+            v = tk.StringVar(value="")
+            ctk.CTkEntry(dialog, textvariable=v, width=320).pack(padx=16)
+            fields[key] = v
+
+        def save():
+            name = fields["name"].get().strip()
+            if not name:
+                messagebox.showerror("Missing name", "Supplier name is required.")
+                return
+            suppliers_module.add_supplier(self.conn, name, fields["phone"].get(), fields["address"].get())
+            dialog.destroy()
+            self.refresh()
+
+        styled_button(dialog, "Save", save, kind="primary", width=140).pack(pady=18)

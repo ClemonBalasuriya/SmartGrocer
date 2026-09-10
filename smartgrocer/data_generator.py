@@ -291,11 +291,95 @@ def generate_history(
     conn.commit()
 
 
+DEMO_CUSTOMERS = [
+    ("Nimal Perera", "0771234567", 20000.0),
+    ("Kamala Silva", "0779876543", 12000.0),
+    ("Sunil Fernando Stores", "0712223344", 35000.0),
+    ("Ruwani Jayasuriya", "0765554433", 10000.0),
+]
+
+DEMO_SUPPLIERS = [
+    ("Ceylon Grocery Distributors", "0112345678", "Colombo"),
+    ("Southern Wholesale Traders", "0912233445", "Matara"),
+    ("Ruhuna Fresh Produce", "0413344556", "Galle"),
+]
+
+
+def _seed_demo_customers_and_suppliers(conn: sqlite3.Connection, rng: random.Random) -> None:
+    """Attach a handful of realistic customer/supplier records to the
+    synthetic history, so the Customers/Suppliers screens and the credit
+    settlement report have something meaningful to show out of the box."""
+    customer_ids = []
+    for name, phone, limit in DEMO_CUSTOMERS:
+        cur = conn.execute(
+            "INSERT INTO customers (name, phone, credit_limit) VALUES (?,?,?)", (name, phone, limit)
+        )
+        customer_ids.append(cur.lastrowid)
+
+    supplier_ids = []
+    for name, phone, address in DEMO_SUPPLIERS:
+        cur = conn.execute(
+            "INSERT INTO suppliers (name, phone, address) VALUES (?,?,?)", (name, phone, address)
+        )
+        supplier_ids.append(cur.lastrowid)
+    conn.commit()
+
+    # Spread the existing supplier-less stock batches across the demo suppliers.
+    batch_ids = [r["id"] for r in conn.execute("SELECT id FROM stock_batches").fetchall()]
+    conn.executemany(
+        "UPDATE stock_batches SET supplier_id=? WHERE id=?",
+        [(supplier_ids[i % len(supplier_ids)], bid) for i, bid in enumerate(batch_ids)],
+    )
+
+    # Attach only a recent, bounded slice of the synthetic credit-tier
+    # invoices to demo customers (round-robin) - attaching all ~9 months of
+    # credit sales to just 4 accounts would run their balances into the
+    # hundreds of thousands against 5k-25k credit limits, which looks broken
+    # rather than like a real, currently-in-use credit account. Older credit
+    # invoices stay unlinked (customer_id NULL) - still real historical sales,
+    # just not attributed to a live account balance.
+    max_credit_invoices_per_customer = 4
+    credit_invoice_ids = [
+        r["id"] for r in conn.execute(
+            "SELECT id FROM invoices WHERE payment_type='credit' ORDER BY datetime DESC "
+            "LIMIT ?", (max_credit_invoices_per_customer * len(customer_ids),)
+        ).fetchall()
+    ]
+    conn.executemany(
+        "UPDATE invoices SET customer_id=? WHERE id=?",
+        [(customer_ids[i % len(customer_ids)], iid) for i, iid in enumerate(credit_invoice_ids)],
+    )
+    conn.commit()
+
+    for cid in customer_ids:
+        total = conn.execute(
+            "SELECT COALESCE(SUM(net_total),0) t FROM invoices WHERE customer_id=? AND payment_type='credit' AND voided=0",
+            (cid,),
+        ).fetchone()["t"]
+        conn.execute("UPDATE customers SET credit_balance=? WHERE id=?", (round(total, 2), cid))
+    conn.commit()
+
+    for cid in customer_ids[:2]:
+        balance = conn.execute("SELECT credit_balance FROM customers WHERE id=?", (cid,)).fetchone()[
+            "credit_balance"
+        ]
+        if balance > 0:
+            pay = round(balance * rng.uniform(0.3, 0.7), 2)
+            conn.execute(
+                "INSERT INTO credit_settlements (customer_id, amount, method, settled_at, note) "
+                "VALUES (?,?,?,?,?)",
+                (cid, pay, "cash", datetime.now().isoformat(timespec="seconds"), "Demo part-payment"),
+            )
+            conn.execute("UPDATE customers SET credit_balance = credit_balance - ? WHERE id=?", (pay, cid))
+    conn.commit()
+
+
 def build_demo_database(db_path=None) -> None:
     path = db_path or db.DEFAULT_DB_PATH
     conn = db.reset_db(path)
     code_to_id = insert_products(conn)
     generate_history(conn, code_to_id)
+    _seed_demo_customers_and_suppliers(conn, random.Random(42))
     conn.close()
 
 

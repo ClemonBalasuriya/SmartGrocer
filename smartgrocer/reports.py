@@ -123,6 +123,30 @@ def cashier_daily_statement(conn: sqlite3.Connection, staff_id: int, day: date) 
     }
 
 
+def credit_outstanding_summary(conn: sqlite3.Connection) -> list[dict]:
+    """One row per customer who currently owes money - the 'Credit Customer
+    Statement' / 'Avl. Credit Limit' style report from the sample POS system,
+    at a glance rather than per-customer."""
+    rows = conn.execute(
+        """SELECT name, phone, credit_limit, credit_balance,
+                  ROUND(credit_limit - credit_balance, 2) AS available_credit
+           FROM customers WHERE active=1 AND credit_balance > 0
+           ORDER BY credit_balance DESC"""
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def returns_summary(conn: sqlite3.Connection, days: int = 30) -> list[dict]:
+    rows = conn.execute(
+        """SELECT p.name_en, p.category, COUNT(*) events, SUM(r.qty) qty, SUM(r.refund_amount) refunded
+           FROM returns r JOIN products p ON p.id = r.product_id
+           WHERE date(r.returned_at) >= date('now', ?)
+           GROUP BY p.id ORDER BY refunded DESC""",
+        (f"-{days} day",),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def waste_summary(conn: sqlite3.Connection) -> list[dict]:
     rows = conn.execute(
         """SELECT p.name_en, p.category, COUNT(*) events, SUM(w.qty_wasted) qty,

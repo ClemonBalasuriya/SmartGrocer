@@ -15,7 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from smartgrocer import association, data_generator, db, forecasting, layout, pos, promotions, reports
+from smartgrocer import association, customers, data_generator, db, forecasting, layout, pos, promotions, reports, suppliers
 
 
 def _fresh_db():
@@ -114,6 +114,110 @@ def test_reports_kpis_do_not_crash():
     assert "today_sales_total" in kpis
     assert len(reports.best_sellers(conn)) > 0
     assert isinstance(reports.low_stock_alert(conn), list)
+
+
+def test_demo_database_seeds_customers_and_suppliers():
+    conn = _fresh_db()
+    data_generator._seed_demo_customers_and_suppliers(conn, __import__("random").Random(1))
+    assert len(customers.list_customers(conn)) >= len(data_generator.DEMO_CUSTOMERS)
+    assert len(suppliers.list_suppliers(conn)) >= len(data_generator.DEMO_SUPPLIERS)
+    batches_with_supplier = conn.execute(
+        "SELECT COUNT(*) c FROM stock_batches WHERE supplier_id IS NOT NULL"
+    ).fetchone()["c"]
+    assert batches_with_supplier > 0
+
+
+def test_credit_sale_and_settlement_track_customer_balance():
+    conn = _fresh_db()
+    p = conn.execute("SELECT * FROM products LIMIT 1").fetchone()
+    cid = customers.add_customer(conn, "Credit Test Customer", credit_limit=100000)
+    result = pos.create_invoice(
+        conn, staff_id=1, cart=[pos.CartLine(product_id=p["id"], qty=3)],
+        price_tier="credit", payment_type="credit", customer_id=cid, customer_name="Credit Test Customer",
+    )
+    balance = customers.get_customer(conn, cid)["credit_balance"]
+    assert abs(balance - result.net_total) < 0.01
+
+    customers.settle_credit(conn, cid, balance / 2, method="cash")
+    assert abs(customers.get_customer(conn, cid)["credit_balance"] - balance / 2) < 0.01
+
+    statement = customers.credit_statement(conn, cid)
+    assert len(statement) == 2  # one charge, one settlement
+    assert statement[-1]["balance"] >= 0
+
+
+def test_credit_limit_is_enforced():
+    conn = _fresh_db()
+    p = conn.execute("SELECT * FROM products LIMIT 1").fetchone()
+    cid = customers.add_customer(conn, "Low Limit Customer", credit_limit=1.0)
+    try:
+        pos.create_invoice(
+            conn, staff_id=1, cart=[pos.CartLine(product_id=p["id"], qty=50)],
+            price_tier="credit", payment_type="credit", customer_id=cid, customer_name="Low Limit Customer",
+        )
+        assert False, "should have raised CreditLimitExceededError"
+    except customers.CreditLimitExceededError:
+        pass
+
+
+def test_item_return_restocks_and_refunds():
+    conn = _fresh_db()
+    p = conn.execute("SELECT * FROM products LIMIT 1").fetchone()
+    before = pos.get_stock_on_hand(conn, p["id"])
+    result = pos.create_invoice(conn, staff_id=1, cart=[pos.CartLine(product_id=p["id"], qty=4)])
+    returnable = pos.returnable_items(conn, result.invoice_id)
+    assert returnable and returnable[0]["returnable_qty"] == 4
+    refund = pos.return_items(
+        conn, result.invoice_id, [(p["id"], returnable[0]["batch_id"], 2)], reason="test return"
+    )
+    assert refund > 0
+    assert pos.get_stock_on_hand(conn, p["id"]) == before - 2
+    still_returnable = pos.returnable_items(conn, result.invoice_id)
+    assert still_returnable[0]["returnable_qty"] == 2
+
+
+def test_hold_and_resume_cart_round_trips():
+    conn = _fresh_db()
+    p = conn.execute("SELECT * FROM products LIMIT 1").fetchone()
+    held_id = pos.hold_cart(conn, staff_id=1, cart=[pos.CartLine(product_id=p["id"], qty=5)], price_tier="cash")
+    assert len(pos.list_held_invoices(conn)) == 1
+    cart, tier, customer_id = pos.resume_held_invoice(conn, held_id)
+    assert tier == "cash"
+    assert cart[0].product_id == p["id"] and cart[0].qty == 5
+    pos.delete_held_invoice(conn, held_id)
+    assert len(pos.list_held_invoices(conn)) == 0
+
+
+def test_split_payment_sums_and_records_methods():
+    conn = _fresh_db()
+    p = conn.execute("SELECT * FROM products LIMIT 1").fetchone()
+    cid = customers.add_customer(conn, "Split Payer", credit_limit=1_000_000)
+    cart = [pos.CartLine(product_id=p["id"], qty=2)]
+    net_total = p["cash_price"] * 2
+    half = round(net_total / 2, 2)
+    result = pos.create_invoice(
+        conn, staff_id=1, cart=cart, price_tier="cash", customer_id=cid, customer_name="Split Payer",
+        payments=[("cash", half), ("credit", round(net_total - half, 2))],
+    )
+    rows = conn.execute("SELECT method, amount FROM invoice_payments WHERE invoice_id=?", (result.invoice_id,)).fetchall()
+    assert {r["method"] for r in rows} == {"cash", "credit"}
+    assert abs(sum(r["amount"] for r in rows) - result.net_total) < 0.01
+    assert customers.get_customer(conn, cid)["credit_balance"] > 0
+
+
+def test_supplier_summary_reflects_received_stock():
+    conn = _fresh_db()
+    sid = suppliers.add_supplier(conn, "Unit Test Supplier")
+    p = conn.execute("SELECT * FROM products LIMIT 1").fetchone()
+    conn.execute(
+        """INSERT INTO stock_batches (product_id,batch_no,qty_received,qty_remaining,received_date,cost_price,supplier_id)
+           VALUES (?,?,?,?,?,?,?)""",
+        (p["id"], "TESTBATCH", 20, 20, "2026-01-01", p["cost_price"], sid),
+    )
+    conn.commit()
+    summary = {s["name"]: s for s in suppliers.supplier_summary(conn)}
+    assert "Unit Test Supplier" in summary
+    assert summary["Unit Test Supplier"]["qty_received"] >= 20
 
 
 if __name__ == "__main__":

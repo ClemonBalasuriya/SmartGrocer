@@ -32,6 +32,12 @@ below) once you have one.
 - **Historical waste tracking** (`waste_events` table, `reports.waste_summary`) - batches that expire unsold are now logged with their cost value, giving you a concrete "before" baseline to argue the promotions engine reduces, rather than only a live near-expiry queue.
 - **Cashier daily statement**, **low-stock alerts**, **dashboard KPI cards**, **CSV export** on every report screen, and **one-click SQLite backup/restore** - the kind of things a real shop owner asks for on day one.
 - **Receive Stock (GRN)** dialog in the Inventory screen, matching the GRN feature visible in the sample POS system you photographed.
+- **Customer credit accounts** (`smartgrocer/customers.py`, Customers screen) - named customers with a credit limit and running balance, a credit sale is blocked once it would exceed their limit, and a "Settle Credit" / statement view records payments against the balance over time - matching the sample POS system's Customer / Credit Invoice / Credit Settlement screens.
+- **Supplier records** (`smartgrocer/suppliers.py`, Suppliers screen) - the Receive Stock (GRN) dialog now attributes each stock batch to a supplier, and a Supplier Summary report shows quantity/value received per supplier.
+- **Item return / refund** (`pos.return_items`, POS screen's "Return / Refund" button) - look up a past invoice by number, return part or all of a line, restock it, and refund it (or, for a credit sale, reduce the customer's balance instead of handing back cash).
+- **Hold / resume invoice** (`pos.hold_cart`/`resume_held_invoice`, POS screen's "Hold Invoice" / "Resume Held" buttons) - park an in-progress cart and bring it back later, matching the sample POS system's F9 Hold Invoice.
+- **Split / mixed payment** (POS screen's "Payment: split" option) - collect part cash, part card, part cheque and/or part credit on one sale, matching the sample POS system's Mix Payment screen.
+- **Balasuriya Group branding** - the whole GUI (sidebar, buttons, tables) now uses a navy/blue theme sampled from the company logo, shown in the sidebar, instead of CustomTkinter's stock look.
 
 ## Project layout
 
@@ -41,7 +47,10 @@ smartgrocer/
   catalog.py         static product catalogue + basket "affinity groups"
   calendar_sl.py      Sri Lankan festival calendar (SARIMAX exogenous variable)
   data_generator.py  synthetic ~9-month transaction history generator (demo data)
-  pos.py             checkout: search, cart, invoice, FIFO stock deduction, void
+  pos.py             checkout: search, cart, invoice, FIFO stock deduction, void,
+                     item return, hold/resume cart, split payment
+  customers.py       customer credit accounts: limit, balance, settlement, statement
+  suppliers.py       supplier master records + received-stock summary
   forecasting.py     SARIMA/SARIMAX/Holt-Winters/Seasonal Naive + model selection
   promotions.py      urgency scoring, tiered expiry alerts, discount suggestion
   association.py     Apriori from scratch, bundle recommendations
@@ -49,8 +58,9 @@ smartgrocer/
   reports.py         dashboard KPIs, reports, CSV export, backup/restore
   gui/
     app.py           main window, navigation
-    screens.py       Dashboard / POS / Inventory / Promotions / Forecasting /
-                      Bundles / Layout / Reports screens
+    theme.py         Balasuriya Group brand colors + ttk styling helpers
+    screens.py       Dashboard / POS / Inventory / Customers / Suppliers /
+                      Promotions / Forecasting / Bundles / Layout / Reports screens
 tests/
   test_pipeline.py   end-to-end smoke tests (no GUI/display needed)
 main.py              entry point

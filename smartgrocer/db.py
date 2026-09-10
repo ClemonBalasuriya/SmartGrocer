@@ -120,10 +120,66 @@ CREATE TABLE IF NOT EXISTS layout_assignments (
     computed_at  TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS customers (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT NOT NULL,
+    phone           TEXT,
+    address         TEXT,
+    credit_limit    REAL NOT NULL DEFAULT 0,   -- 0 = no credit sales allowed
+    credit_balance  REAL NOT NULL DEFAULT 0,   -- currently owed by this customer
+    active          INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS suppliers (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    name     TEXT NOT NULL,
+    phone    TEXT,
+    address  TEXT,
+    active   INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS credit_settlements (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    customer_id   INTEGER NOT NULL REFERENCES customers(id),
+    amount        REAL NOT NULL,
+    method        TEXT NOT NULL DEFAULT 'cash',
+    settled_at    TEXT NOT NULL,
+    note          TEXT
+);
+
+CREATE TABLE IF NOT EXISTS invoice_payments (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    invoice_id   INTEGER NOT NULL REFERENCES invoices(id),
+    method       TEXT NOT NULL,          -- cash | card | cheque | credit
+    amount       REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS held_invoices (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    held_at      TEXT NOT NULL,
+    staff_id     INTEGER REFERENCES staff(id),
+    customer_id  INTEGER REFERENCES customers(id),
+    price_tier   TEXT NOT NULL DEFAULT 'cash',
+    cart_json    TEXT NOT NULL,
+    note         TEXT
+);
+
+CREATE TABLE IF NOT EXISTS returns (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    invoice_id     INTEGER NOT NULL REFERENCES invoices(id),
+    product_id     INTEGER NOT NULL REFERENCES products(id),
+    batch_id       INTEGER REFERENCES stock_batches(id),
+    qty            REAL NOT NULL,
+    refund_amount  REAL NOT NULL,
+    returned_at    TEXT NOT NULL,
+    reason         TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_invitems_product ON invoice_items(product_id);
 CREATE INDEX IF NOT EXISTS idx_invoices_datetime ON invoices(datetime);
 CREATE INDEX IF NOT EXISTS idx_batches_product ON stock_batches(product_id);
 CREATE INDEX IF NOT EXISTS idx_batches_expiry ON stock_batches(expiry_date);
+CREATE INDEX IF NOT EXISTS idx_returns_invoice ON returns(invoice_id);
 """
 
 
@@ -136,14 +192,33 @@ def get_conn(db_path: Path | str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     return conn
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Add columns introduced after a database may already have been created,
+    so an existing shop's database (with real transaction history) upgrades
+    in place instead of needing to be deleted and rebuilt."""
+    inv_cols = {r["name"] for r in conn.execute("PRAGMA table_info(invoices)")}
+    if "customer_id" not in inv_cols:
+        conn.execute("ALTER TABLE invoices ADD COLUMN customer_id INTEGER REFERENCES customers(id)")
+    batch_cols = {r["name"] for r in conn.execute("PRAGMA table_info(stock_batches)")}
+    if "supplier_id" not in batch_cols:
+        conn.execute("ALTER TABLE stock_batches ADD COLUMN supplier_id INTEGER REFERENCES suppliers(id)")
+    conn.commit()
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    _migrate(conn)
     if conn.execute("SELECT COUNT(*) c FROM staff").fetchone()["c"] == 0:
         conn.execute(
             "INSERT INTO staff (name, role, pin) VALUES (?,?,?)", ("Admin", "admin", "1234")
         )
         conn.execute(
             "INSERT INTO staff (name, role, pin) VALUES (?,?,?)", ("Cashier", "cashier", "0000")
+        )
+    if conn.execute("SELECT COUNT(*) c FROM customers").fetchone()["c"] == 0:
+        conn.execute(
+            "INSERT INTO customers (name, phone, credit_limit) VALUES (?,?,?)",
+            ("Walk-in", "", 0),
         )
     conn.commit()
 
