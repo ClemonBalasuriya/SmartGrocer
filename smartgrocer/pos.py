@@ -201,11 +201,26 @@ def create_invoice(
            VALUES (?,?,?,?,?,?,?)""",
         [(invoice_id, *row) for row in item_rows],
     )
+    # invoice_payments is always populated (even for a plain, non-split sale)
+    # so cash-drawer reconciliation has one source of truth for how much of
+    # any given sale actually landed as cash vs card/cheque/credit. The
+    # amount recorded is what the shop RETAINS, not what was tendered -
+    # e.g. a cash sale where the customer handed over more and got change
+    # back records only net_total, since the change leaves the same drawer.
     if payments:
-        conn.executemany(
-            "INSERT INTO invoice_payments (invoice_id, method, amount) VALUES (?,?,?)",
-            [(invoice_id, m, a) for m, a in payments],
-        )
+        recorded_payments = payments
+    elif payment_type == "credit":
+        recorded_payments = []
+        if paid > 1e-6:
+            recorded_payments.append(("cash", round(paid, 2)))
+        if credit_amount > 1e-6:
+            recorded_payments.append(("credit", credit_amount))
+    else:
+        recorded_payments = [(payment_type, round(min(paid, net_total), 2))]
+    conn.executemany(
+        "INSERT INTO invoice_payments (invoice_id, method, amount) VALUES (?,?,?)",
+        [(invoice_id, m, a) for m, a in recorded_payments if a > 1e-6],
+    )
     if credit_amount > 1e-6:
         customers_module.record_credit_sale(conn, customer_id, credit_amount)
     conn.commit()

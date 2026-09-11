@@ -5,6 +5,7 @@ for the testing caveat on this GUI layer.
 
 from __future__ import annotations
 
+import threading
 import tkinter as tk
 from datetime import date
 from tkinter import messagebox, ttk
@@ -12,7 +13,9 @@ from tkinter import messagebox, ttk
 import customtkinter as ctk
 
 from .. import association, forecasting, layout, pos, promotions, reports
+from .. import cash_drawer as cash_drawer_module
 from .. import customers as customers_module
+from .. import receipts as receipts_module
 from .. import suppliers as suppliers_module
 from .. import db as db_module
 from . import theme
@@ -52,6 +55,29 @@ def styled_button(parent, text, command, kind="primary", **kwargs):
     style = {"primary": PRIMARY_BTN, "success": SUCCESS_BTN, "danger": DANGER_BTN,
              "secondary": SECONDARY_BTN}[kind]
     return ctk.CTkButton(parent, text=text, command=command, **{**style, **kwargs})
+
+
+def run_in_background(widget: ctk.CTkBaseClass, work_fn, on_done, on_error=None):
+    """Run a slow, DB-heavy computation (forecasting, association-rule
+    mining, layout optimisation - anything that can take seconds over a
+    real transaction history) off the Tkinter main thread, so the window
+    stays responsive instead of freezing mid-click.
+
+    `work_fn` takes no arguments and must open its OWN sqlite connection
+    (sqlite3 connections aren't safe to share across threads) - screens
+    pass a closure that does `db_module.get_conn(app.db_path)` and closes
+    it before returning. `on_done`/`on_error` run back on the main thread
+    via `widget.after(0, ...)`, so they can touch widgets safely."""
+
+    def worker():
+        try:
+            result = work_fn()
+        except Exception as e:  # noqa: BLE001 - surface any failure to the cashier, don't crash the thread silently
+            widget.after(0, lambda: (on_error or (lambda err: messagebox.showerror("Error", str(err))))(e))
+            return
+        widget.after(0, lambda: on_done(result))
+
+    threading.Thread(target=worker, daemon=True).start()
 
 
 class BaseScreen(ctk.CTkFrame):
@@ -212,10 +238,10 @@ class POSScreen(BaseScreen):
         ctk.CTkLabel(top, text="Scan barcode or search item:", text_color=theme.TEXT_DARK).grid(
             row=0, column=0, sticky="w")
         self.search_var = tk.StringVar()
-        search_entry = ctk.CTkEntry(top, textvariable=self.search_var, width=260,
-                                     placeholder_text="barcode / name (English or Sinhala)")
-        search_entry.grid(row=1, column=0, padx=(0, 10), pady=6)
-        search_entry.bind("<Return>", lambda e: self.do_search())
+        self.search_entry = ctk.CTkEntry(top, textvariable=self.search_var, width=260,
+                                          placeholder_text="barcode / name (English or Sinhala)")
+        self.search_entry.grid(row=1, column=0, padx=(0, 10), pady=6)
+        self.search_entry.bind("<Return>", lambda e: self.do_search())
         styled_button(top, "Search", self.do_search, width=90).grid(row=1, column=1)
 
         ctk.CTkLabel(top, text="Price tier:", text_color=theme.TEXT_DARK).grid(row=0, column=2, padx=(20, 0), sticky="w")
@@ -233,10 +259,10 @@ class POSScreen(BaseScreen):
         self.customer_menu = ctk.CTkOptionMenu(top, values=["Walk-in"], variable=self.customer_var, width=160)
         self.customer_menu.grid(row=1, column=4, padx=(16, 0))
 
-        ctk.CTkLabel(top, text="Staff:", text_color=theme.TEXT_DARK).grid(row=0, column=5, padx=(16, 0), sticky="w")
-        self.staff_var = tk.StringVar(value="Admin")
-        staff_names = [r["name"] for r in self.conn.execute("SELECT name FROM staff").fetchall()] or ["Admin"]
-        ctk.CTkOptionMenu(top, values=staff_names, variable=self.staff_var).grid(row=1, column=5, padx=(16, 0))
+        ctk.CTkLabel(top, text="Cashier:", text_color=theme.TEXT_DARK).grid(row=0, column=5, padx=(16, 0), sticky="w")
+        self.cashier_label = ctk.CTkLabel(top, text="Not logged in", font=ctk.CTkFont(weight="bold"),
+                                           text_color=theme.DANGER_RED)
+        self.cashier_label.grid(row=1, column=5, padx=(16, 0), sticky="w")
 
         results_frame = ctk.CTkFrame(self, fg_color="transparent")
         results_frame.pack(fill="x", padx=24, pady=(6, 0))
@@ -254,6 +280,12 @@ class POSScreen(BaseScreen):
         self.qty_var = tk.StringVar(value="1")
         ctk.CTkEntry(qty_row, textvariable=self.qty_var, width=70).pack(side="left", padx=8)
         styled_button(qty_row, "Add to Cart", self.add_selected_to_cart).pack(side="left")
+
+        ctk.CTkLabel(self, text="Quick Items (top sellers - tap to add):",
+                     text_color=theme.TEXT_MUTED, font=ctk.CTkFont(size=11)).pack(anchor="w", padx=24, pady=(4, 0))
+        self.quick_items_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.quick_items_frame.pack(fill="x", padx=24, pady=(2, 6))
+        self.tier_var.trace_add("write", lambda *a: self._refresh_quick_items())
 
         cart_frame = ctk.CTkFrame(self, fg_color="transparent")
         cart_frame.pack(fill="both", expand=True, padx=24, pady=(6, 0))
@@ -289,15 +321,72 @@ class POSScreen(BaseScreen):
         if self.customer_var.get() not in names:
             self.customer_var.set("Walk-in")
 
+        if self.app.logged_in:
+            staff = self.conn.execute("SELECT name FROM staff WHERE id=?", (self.app.current_staff_id,)).fetchone()
+            self.cashier_label.configure(text=staff["name"] if staff else "Unknown", text_color=theme.SUCCESS_GREEN)
+        else:
+            self.cashier_label.configure(text="Not logged in", text_color=theme.DANGER_RED)
+
+        self._refresh_quick_items()
+        # Most USB/Bluetooth barcode scanners are "keyboard wedge" devices -
+        # they just type the code + Enter into whatever field has focus, no
+        # driver needed. Focusing the search box here means a cashier can
+        # scan the moment this screen appears without clicking into it first.
+        self.search_entry.focus_set()
+
     def _selected_customer_row(self):
         name = self.customer_var.get()
         row = self.conn.execute("SELECT * FROM customers WHERE name=?", (name,)).fetchone()
         return row
 
+    def _refresh_quick_items(self):
+        for w in self.quick_items_frame.winfo_children():
+            w.destroy()
+        rows = reports.best_sellers(self.conn, days=30, top_n=12)
+        tier_field = {"cash": "cash_price", "credit": "credit_price", "wholesale": "wholesale_price"}[self.tier_var.get()]
+        cols = 4
+        for i, r in enumerate(rows):
+            product_id = r["product_id"]
+            p = self.conn.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone()
+            if p is None:
+                continue
+            price = p[tier_field]
+            btn = styled_button(
+                self.quick_items_frame, f"{p['name_en'][:16]}\nLKR {price:.2f}",
+                lambda pid=product_id: self._quick_add(pid), kind="secondary",
+                font=ctk.CTkFont(size=11), height=48,
+            )
+            btn.grid(row=i // cols, column=i % cols, padx=4, pady=4, sticky="nsew")
+        for c in range(cols):
+            self.quick_items_frame.grid_columnconfigure(c, weight=1)
+
+    def _quick_add(self, product_id: int):
+        p = self.conn.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone()
+        if p is None:
+            return
+        tier_field = {"cash": "cash_price", "credit": "credit_price", "wholesale": "wholesale_price"}[self.tier_var.get()]
+        self.cart.append({"product_id": product_id, "name": p["name_en"], "qty": 1.0, "unit_price": p[tier_field]})
+        self.refresh_cart()
+
     def do_search(self):
         query = self.search_var.get().strip()
         if not query:
             return
+
+        # Exact barcode match (what a scanner sends): skip straight to the
+        # cart instead of making the cashier click into the results list and
+        # double-click the row - this is the difference between "scan and
+        # it's in the cart" and "scan, then still do two clicks" for every
+        # single item, which is where a lot of the perceived slowness at the
+        # till comes from.
+        exact = pos.get_product_by_code(self.conn, query)
+        if exact is not None:
+            self._add_product_to_cart(exact["id"])
+            self.search_var.set("")
+            tree_clear(self.results_tree)
+            self.search_entry.focus_set()
+            return
+
         self._search_results = pos.search_products(self.conn, query)
         tree_clear(self.results_tree)
         for p in self._search_results:
@@ -310,13 +399,21 @@ class POSScreen(BaseScreen):
         if not sel:
             messagebox.showwarning("No item selected", "Search and select an item first.")
             return
-        product_id = int(sel[0])
+        self._add_product_to_cart(int(sel[0]))
+
+    def _add_product_to_cart(self, product_id: int):
+        """Shared by the manual 'select a result + Add to Cart' flow and an
+        exact-barcode scan - both add the same way, at the quantity in the
+        Qty box (so a scanner reading a multi-pack barcode still respects a
+        cashier-entered quantity if they typed one first)."""
         try:
             qty = float(self.qty_var.get())
         except ValueError:
             messagebox.showerror("Invalid quantity", "Quantity must be a number.")
             return
         p = self.conn.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone()
+        if p is None:
+            return
         tier_field = {"cash": "cash_price", "credit": "credit_price", "wholesale": "wholesale_price"}[self.tier_var.get()]
         self.cart.append({"product_id": product_id, "name": p["name_en"], "qty": qty, "unit_price": p[tier_field]})
         self.refresh_cart()
@@ -347,8 +444,12 @@ class POSScreen(BaseScreen):
         if not self.cart:
             messagebox.showwarning("Empty cart", "Add at least one item before checking out.")
             return
-        staff_row = self.conn.execute("SELECT id FROM staff WHERE name=?", (self.staff_var.get(),)).fetchone()
-        staff_id = staff_row["id"] if staff_row else self.app.current_staff_id
+        if not self.app.logged_in:
+            messagebox.showwarning(
+                "Not logged in", "Log in from the sidebar (Login / Open Day) before ringing up a sale."
+            )
+            return
+        staff_id = self.app.current_staff_id
         customer_row = self._selected_customer_row()
         cart_lines = [pos.CartLine(product_id=c["product_id"], qty=c["qty"]) for c in self.cart]
         net_total = sum(c["qty"] * c["unit_price"] for c in self.cart)
@@ -380,16 +481,31 @@ class POSScreen(BaseScreen):
             messagebox.showerror("Cannot complete sale", str(e))
             return
 
-        messagebox.showinfo("Sale complete", f"Invoice {result.invoice_no}\nNet total: LKR {result.net_total:,.2f}")
+        receipt_path = None
+        try:
+            receipt_path = receipts_module.save_receipt(self.conn, result.invoice_id)
+            receipts_module.open_for_printing(receipt_path)
+        except Exception:
+            pass  # the sale already went through - a receipt failure shouldn't block the cashier
+
+        msg = f"Invoice {result.invoice_no}\nNet total: LKR {result.net_total:,.2f}"
+        if result.balance > 0.01:
+            msg += f"\nChange due: LKR {result.balance:,.2f}"
+        if receipt_path:
+            msg += f"\nReceipt saved to {receipt_path}"
+        messagebox.showinfo("Sale complete", msg)
         self.clear_cart()
         tree_clear(self.results_tree)
+        self._refresh_quick_items()
 
     def hold_invoice(self):
         if not self.cart:
             messagebox.showwarning("Empty cart", "Nothing to hold.")
             return
-        staff_row = self.conn.execute("SELECT id FROM staff WHERE name=?", (self.staff_var.get(),)).fetchone()
-        staff_id = staff_row["id"] if staff_row else self.app.current_staff_id
+        if not self.app.logged_in:
+            messagebox.showwarning("Not logged in", "Log in from the sidebar before holding a cart.")
+            return
+        staff_id = self.app.current_staff_id
         customer_row = self._selected_customer_row()
         cart_lines = [pos.CartLine(product_id=c["product_id"], qty=c["qty"]) for c in self.cart]
         pos.hold_cart(self.conn, staff_id=staff_id, cart=cart_lines, price_tier=self.tier_var.get(),
@@ -680,9 +796,11 @@ class ForecastingScreen(BaseScreen):
         names = [p["name_en"] for p in products]
         self.product_var = tk.StringVar(value=names[0] if names else "")
         ctk.CTkOptionMenu(top, values=names, variable=self.product_var, width=280).pack(side="left", padx=8)
-        styled_button(top, "Run Forecast", self.run_forecast).pack(side="left", padx=8)
-        styled_button(top, "Generate Purchase List (all products)", self.run_purchase_list,
-                      kind="secondary").pack(side="left", padx=20)
+        self.run_forecast_btn = styled_button(top, "Run Forecast", self.run_forecast)
+        self.run_forecast_btn.pack(side="left", padx=8)
+        self.purchase_list_btn = styled_button(top, "Generate Purchase List (all products)", self.run_purchase_list,
+                                                kind="secondary")
+        self.purchase_list_btn.pack(side="left", padx=20)
 
         self.status_label = ctk.CTkLabel(self, text="", text_color=theme.TEXT_MUTED)
         self.status_label.pack(anchor="w", padx=24, pady=(6, 0))
@@ -698,10 +816,24 @@ class ForecastingScreen(BaseScreen):
     def run_forecast(self):
         idx = [p["name_en"] for p in self._products].index(self.product_var.get())
         product = self._products[idx]
-        self.status_label.configure(text="Running rolling-origin cross-validation...")
-        self.update_idletasks()
-        result = forecasting.select_best_model(self.conn, product["id"])
+        self.status_label.configure(text="Running rolling-origin cross-validation... (this can take a few seconds)")
+        self.run_forecast_btn.configure(state="disabled")
 
+        def work():
+            conn = db_module.get_conn(self.app.db_path)
+            try:
+                return forecasting.select_best_model(conn, product["id"])
+            finally:
+                conn.close()
+
+        run_in_background(self, work, self._on_forecast_done, self._on_forecast_error)
+
+    def _on_forecast_error(self, err):
+        self.run_forecast_btn.configure(state="normal")
+        messagebox.showerror("Forecast failed", str(err))
+
+    def _on_forecast_done(self, result):
+        self.run_forecast_btn.configure(state="normal")
         tree_clear(self.tree)
         if not result["model_scores"] and result["forecast"] is None:
             self.status_label.configure(text="Not enough sales history for this product yet (need 30+ days).")
@@ -742,9 +874,27 @@ class ForecastingScreen(BaseScreen):
         canvas.get_tk_widget().pack(fill="both", expand=True)
 
     def run_purchase_list(self):
-        self.status_label.configure(text="Generating purchase list across all products (may take a few seconds)...")
-        self.update_idletasks()
-        rows = forecasting.generate_purchase_list(self.conn)
+        self.status_label.configure(
+            text="Generating purchase list across all products - this runs a forecast per product "
+                 "and can take a while; the rest of the app stays usable meanwhile."
+        )
+        self.purchase_list_btn.configure(state="disabled")
+
+        def work():
+            conn = db_module.get_conn(self.app.db_path)
+            try:
+                return forecasting.generate_purchase_list(conn)
+            finally:
+                conn.close()
+
+        run_in_background(self, work, self._on_purchase_list_done, self._on_purchase_list_error)
+
+    def _on_purchase_list_error(self, err):
+        self.purchase_list_btn.configure(state="normal")
+        messagebox.showerror("Purchase list failed", str(err))
+
+    def _on_purchase_list_done(self, rows):
+        self.purchase_list_btn.configure(state="normal")
         tree_clear(self.tree)
         self.tree.configure(columns=["Product", "On Hand", "Forecast Demand", "Suggested Reorder", "Model"])
         for col in ["Product", "On Hand", "Forecast Demand", "Suggested Reorder", "Model"]:
@@ -767,7 +917,8 @@ class BundlesScreen(BaseScreen):
 
         top = ctk.CTkFrame(self, fg_color="transparent")
         top.pack(fill="x", padx=24)
-        styled_button(top, "Compute Bundles", self.compute).pack(side="left")
+        self.compute_btn = styled_button(top, "Compute Bundles", self.compute)
+        self.compute_btn.pack(side="left")
         self.status_label = ctk.CTkLabel(top, text="min support 2%, min confidence 30%, min lift 1.1",
                                           text_color=theme.TEXT_MUTED)
         self.status_label.pack(side="left", padx=16)
@@ -781,14 +932,31 @@ class BundlesScreen(BaseScreen):
         self.tree.master_frame.pack(fill="both", expand=True)
 
     def compute(self):
-        rows = association.get_bundle_recommendations(self.conn)
-        tree_clear(self.tree)
-        for r in rows:
-            bundle_name = " + ".join(r["antecedent"] + r["consequent"])
-            tree_insert(self.tree, (bundle_name, r["support"], r["confidence"], r["lift"],
-                                     f"{r['sum_price_lkr']:.2f}", f"{r['bundle_price_lkr']:.2f}",
-                                     f"{r['savings_lkr']:.2f}"))
-        self.status_label.configure(text=f"{len(rows)} bundle recommendations")
+        self.compute_btn.configure(state="disabled")
+        self.status_label.configure(text="Mining association rules over your sales history...")
+
+        def work():
+            conn = db_module.get_conn(self.app.db_path)
+            try:
+                return association.get_bundle_recommendations(conn)
+            finally:
+                conn.close()
+
+        def on_done(rows):
+            self.compute_btn.configure(state="normal")
+            tree_clear(self.tree)
+            for r in rows:
+                bundle_name = " + ".join(r["antecedent"] + r["consequent"])
+                tree_insert(self.tree, (bundle_name, r["support"], r["confidence"], r["lift"],
+                                         f"{r['sum_price_lkr']:.2f}", f"{r['bundle_price_lkr']:.2f}",
+                                         f"{r['savings_lkr']:.2f}"))
+            self.status_label.configure(text=f"{len(rows)} bundle recommendations")
+
+        def on_error(err):
+            self.compute_btn.configure(state="normal")
+            messagebox.showerror("Bundle computation failed", str(err))
+
+        run_in_background(self, work, on_done, on_error)
 
 
 # --------------------------------------------------------------------------- #
@@ -802,7 +970,8 @@ class LayoutScreen(BaseScreen):
 
         top = ctk.CTkFrame(self, fg_color="transparent")
         top.pack(fill="x", padx=24)
-        styled_button(top, "Compute Layout", self.compute).pack(side="left")
+        self.compute_btn = styled_button(top, "Compute Layout", self.compute)
+        self.compute_btn.pack(side="left")
         self.status_label = ctk.CTkLabel(top, text="", text_color=theme.TEXT_MUTED)
         self.status_label.pack(side="left", padx=16)
 
@@ -813,21 +982,40 @@ class LayoutScreen(BaseScreen):
         self.image_label.pack(padx=16, pady=16)
 
     def compute(self):
-        assignments = layout.compute_layout(self.conn)
-        layout.persist_layout(self.conn, assignments)
-        out_path = str(db_module.ensure_output_dir() / "planogram.png")
-        layout.render_planogram(assignments, out_path)
-        self.status_label.configure(text=f"Layout computed for {len(assignments)} products. Saved to {out_path}")
-        try:
-            from PIL import Image
-            img = Image.open(out_path)
-            w, h = img.size
-            scale = min(1.0, 900 / w)
-            ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=(int(w * scale), int(h * scale)))
-            self.image_label.configure(image=ctk_img, text="")
-            self.image_label.image = ctk_img
-        except ImportError:
-            self.image_label.configure(text=f"Planogram saved to {out_path} (install Pillow to preview it here).")
+        self.compute_btn.configure(state="disabled")
+        self.status_label.configure(text="Computing layout assignments...")
+
+        def work():
+            conn = db_module.get_conn(self.app.db_path)
+            try:
+                assignments = layout.compute_layout(conn)
+                layout.persist_layout(conn, assignments)
+            finally:
+                conn.close()
+            out_path = str(db_module.ensure_output_dir() / "planogram.png")
+            layout.render_planogram(assignments, out_path)
+            return assignments, out_path
+
+        def on_done(result):
+            assignments, out_path = result
+            self.compute_btn.configure(state="normal")
+            self.status_label.configure(text=f"Layout computed for {len(assignments)} products. Saved to {out_path}")
+            try:
+                from PIL import Image
+                img = Image.open(out_path)
+                w, h = img.size
+                scale = min(1.0, 900 / w)
+                ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=(int(w * scale), int(h * scale)))
+                self.image_label.configure(image=ctk_img, text="")
+                self.image_label.image = ctk_img
+            except ImportError:
+                self.image_label.configure(text=f"Planogram saved to {out_path} (install Pillow to preview it here).")
+
+        def on_error(err):
+            self.compute_btn.configure(state="normal")
+            messagebox.showerror("Layout computation failed", str(err))
+
+        run_in_background(self, work, on_done, on_error)
 
 
 # --------------------------------------------------------------------------- #
@@ -836,7 +1024,7 @@ class LayoutScreen(BaseScreen):
 
 REPORT_OPTIONS = ["Best Sellers (30d)", "Stock Summary", "Low Stock Alert",
                    "Waste Summary", "Cashier Daily Statement", "Credit Outstanding",
-                   "Returns Summary (30d)", "Supplier Summary"]
+                   "Returns Summary (30d)", "Supplier Summary", "Cash Sessions (Day Open/Close)"]
 
 
 class ReportsScreen(BaseScreen):
@@ -926,6 +1114,10 @@ class ReportsScreen(BaseScreen):
         elif choice == "Supplier Summary":
             rows = suppliers_module.supplier_summary(self.conn)
             self._set_columns(["name", "batches_received", "qty_received", "value_received"])
+        elif choice == "Cash Sessions (Day Open/Close)":
+            rows = [dict(r) for r in cash_drawer_module.session_history(self.conn)]
+            self._set_columns(["staff_name", "opened_at", "closed_at", "opening_float",
+                                "counted_cash", "expected_cash", "variance"])
         else:
             rows = reports.waste_summary(self.conn)
             self._set_columns(["name_en", "category", "events", "qty", "value_lost"])

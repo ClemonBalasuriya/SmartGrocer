@@ -164,6 +164,18 @@ CREATE TABLE IF NOT EXISTS held_invoices (
     note         TEXT
 );
 
+CREATE TABLE IF NOT EXISTS cash_sessions (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    staff_id       INTEGER REFERENCES staff(id),
+    opened_at      TEXT NOT NULL,
+    opening_float  REAL NOT NULL DEFAULT 0,
+    closed_at      TEXT,
+    counted_cash   REAL,
+    expected_cash  REAL,
+    variance       REAL,
+    note           TEXT
+);
+
 CREATE TABLE IF NOT EXISTS returns (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     invoice_id     INTEGER NOT NULL REFERENCES invoices(id),
@@ -176,10 +188,16 @@ CREATE TABLE IF NOT EXISTS returns (
 );
 
 CREATE INDEX IF NOT EXISTS idx_invitems_product ON invoice_items(product_id);
+CREATE INDEX IF NOT EXISTS idx_invitems_invoice ON invoice_items(invoice_id);
 CREATE INDEX IF NOT EXISTS idx_invoices_datetime ON invoices(datetime);
+CREATE INDEX IF NOT EXISTS idx_invoices_staff ON invoices(staff_id);
 CREATE INDEX IF NOT EXISTS idx_batches_product ON stock_batches(product_id);
 CREATE INDEX IF NOT EXISTS idx_batches_expiry ON stock_batches(expiry_date);
 CREATE INDEX IF NOT EXISTS idx_returns_invoice ON returns(invoice_id);
+CREATE INDEX IF NOT EXISTS idx_returns_date ON returns(returned_at);
+CREATE INDEX IF NOT EXISTS idx_invpayments_invoice ON invoice_payments(invoice_id);
+CREATE INDEX IF NOT EXISTS idx_creditsettlements_customer ON credit_settlements(customer_id);
+CREATE INDEX IF NOT EXISTS idx_creditsettlements_date ON credit_settlements(settled_at);
 """
 
 

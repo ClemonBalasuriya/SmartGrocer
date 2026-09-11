@@ -44,10 +44,11 @@ def _margin_scores(conn: sqlite3.Connection) -> dict[int, float]:
 
 def _velocity(conn: sqlite3.Connection, product_id: int, days: int, as_of: date) -> float:
     since = (as_of - timedelta(days=days)).isoformat()
+    until = (as_of + timedelta(days=1)).isoformat()  # exclusive upper bound, avoids wrapping the column in date()
     row = conn.execute(
         """SELECT COALESCE(SUM(ii.qty),0) q FROM invoice_items ii JOIN invoices i ON i.id=ii.invoice_id
-           WHERE ii.product_id=? AND i.voided=0 AND date(i.datetime) >= ? AND date(i.datetime) <= ?""",
-        (product_id, since, as_of.isoformat()),
+           WHERE ii.product_id=? AND i.voided=0 AND i.datetime >= ? AND i.datetime < ?""",
+        (product_id, since, until),
     ).fetchone()
     return row["q"] / days
 

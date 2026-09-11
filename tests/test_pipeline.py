@@ -15,7 +15,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from smartgrocer import association, customers, data_generator, db, forecasting, layout, pos, promotions, reports, suppliers
+from smartgrocer import (
+    association, cash_drawer, customers, data_generator, db, forecasting, layout, pos, promotions,
+    receipts, reports, suppliers,
+)
 
 
 def _fresh_db():
@@ -218,6 +221,53 @@ def test_supplier_summary_reflects_received_stock():
     summary = {s["name"]: s for s in suppliers.supplier_summary(conn)}
     assert "Unit Test Supplier" in summary
     assert summary["Unit Test Supplier"]["qty_received"] >= 20
+
+
+def test_cash_drawer_day_open_sell_close_matches():
+    conn = _fresh_db()
+    p = conn.execute("SELECT * FROM products LIMIT 1").fetchone()
+    session_id = cash_drawer.open_session(conn, staff_id=1, opening_float=1000.0)
+
+    result = pos.create_invoice(conn, staff_id=1, cart=[pos.CartLine(product_id=p["id"], qty=2)])
+    session = cash_drawer.get_open_session(conn)
+    assert session is not None and session["id"] == session_id
+    expected = cash_drawer.expected_cash(conn, session)
+    assert abs(expected - (1000.0 + result.net_total)) < 0.01
+
+    close_result = cash_drawer.close_session(conn, session_id, counted_cash=expected)
+    assert abs(close_result["variance"]) < 0.01
+    assert cash_drawer.get_open_session(conn) is None  # closed, so no open session remains
+
+    # a second session can be opened once the first is closed
+    session_id_2 = cash_drawer.open_session(conn, staff_id=1, opening_float=500.0)
+    assert session_id_2 != session_id
+
+
+def test_cash_drawer_refuses_double_open():
+    conn = _fresh_db()
+    cash_drawer.open_session(conn, staff_id=1, opening_float=1000.0)
+    try:
+        cash_drawer.open_session(conn, staff_id=1, opening_float=500.0)
+        assert False, "should have refused to open a second concurrent session"
+    except ValueError:
+        pass
+
+
+def test_cash_drawer_flags_variance():
+    conn = _fresh_db()
+    session_id = cash_drawer.open_session(conn, staff_id=1, opening_float=1000.0)
+    result = cash_drawer.close_session(conn, session_id, counted_cash=1000.0 - 50)  # LKR 50 short
+    assert abs(result["variance"] - (-50)) < 0.01
+
+
+def test_receipt_text_includes_key_fields():
+    conn = _fresh_db()
+    p = conn.execute("SELECT * FROM products LIMIT 1").fetchone()
+    result = pos.create_invoice(conn, staff_id=1, cart=[pos.CartLine(product_id=p["id"], qty=1)])
+    text = receipts.build_receipt_text(conn, result.invoice_id)
+    assert result.invoice_no in text
+    assert p["name_en"][:22] in text
+    assert f"{result.net_total:.2f}" in text
 
 
 if __name__ == "__main__":

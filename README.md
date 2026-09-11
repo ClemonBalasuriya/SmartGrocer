@@ -38,6 +38,12 @@ below) once you have one.
 - **Hold / resume invoice** (`pos.hold_cart`/`resume_held_invoice`, POS screen's "Hold Invoice" / "Resume Held" buttons) - park an in-progress cart and bring it back later, matching the sample POS system's F9 Hold Invoice.
 - **Split / mixed payment** (POS screen's "Payment: split" option) - collect part cash, part card, part cheque and/or part credit on one sale, matching the sample POS system's Mix Payment screen.
 - **Balasuriya Group branding** - the whole GUI (sidebar, buttons, tables) now uses a navy/blue theme sampled from the company logo, shown in the sidebar, instead of CustomTkinter's stock look.
+- **Cash drawer / day open-close** (`smartgrocer/cash_drawer.py`, sidebar "Login / Open Day" / "Close Day") - start the day with a counted opening float, and every cashier logs in with their staff PIN (ties every sale to who actually rang it up, not just whoever was picked from a list); closing the day counts the actual cash and shows the variance against what the system expects.
+- **Printed receipts** (`smartgrocer/receipts.py`) - every completed sale saves a printable receipt to `exports/receipts/` and opens it with your default text viewer so you can Ctrl+P it.
+- **Quick-item buttons** on the POS screen - your top ~12 best-selling items appear as one-tap buttons so the cashier doesn't have to search/type every single sale.
+- **Cash Sessions** report - the full history of day-open/day-close cycles with expected vs counted cash and variance.
+
+These last five (credit accounts through cash drawer/receipts/quick-items) were added because this system is meant for the shop's actual day-to-day operation, not only as a decision-support/analytics layer - the four analytics objectives from the proposal are still there underneath, but the POS itself now behaves like a till a cashier would use every day.
 
 ## Project layout
 
@@ -51,6 +57,8 @@ smartgrocer/
                      item return, hold/resume cart, split payment
   customers.py       customer credit accounts: limit, balance, settlement, statement
   suppliers.py       supplier master records + received-stock summary
+  cash_drawer.py     day open/close: opening float, expected vs counted cash, variance
+  receipts.py        printable per-sale receipt generation
   forecasting.py     SARIMA/SARIMAX/Holt-Winters/Seasonal Naive + model selection
   promotions.py      urgency scoring, tiered expiry alerts, discount suggestion
   association.py     Apriori from scratch, bundle recommendations

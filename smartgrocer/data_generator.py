@@ -359,6 +359,11 @@ def _seed_demo_customers_and_suppliers(conn: sqlite3.Connection, rng: random.Ran
         conn.execute("UPDATE customers SET credit_balance=? WHERE id=?", (round(total, 2), cid))
     conn.commit()
 
+    # Backdate these a few days into the past (not "now") - a settlement
+    # timestamped at the exact moment the demo data is generated would fall
+    # inside the very first cash-drawer session someone opens right after,
+    # wrongly counting as "cash collected during today's shift".
+    backdated_at = (datetime.now() - timedelta(days=3)).isoformat(timespec="seconds")
     for cid in customer_ids[:2]:
         balance = conn.execute("SELECT credit_balance FROM customers WHERE id=?", (cid,)).fetchone()[
             "credit_balance"
@@ -368,7 +373,7 @@ def _seed_demo_customers_and_suppliers(conn: sqlite3.Connection, rng: random.Ran
             conn.execute(
                 "INSERT INTO credit_settlements (customer_id, amount, method, settled_at, note) "
                 "VALUES (?,?,?,?,?)",
-                (cid, pay, "cash", datetime.now().isoformat(timespec="seconds"), "Demo part-payment"),
+                (cid, pay, "cash", backdated_at, "Demo part-payment"),
             )
             conn.execute("UPDATE customers SET credit_balance = credit_balance - ? WHERE id=?", (pay, cid))
     conn.commit()

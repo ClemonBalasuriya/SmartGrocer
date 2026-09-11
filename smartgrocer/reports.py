@@ -9,17 +9,29 @@ from __future__ import annotations
 import csv
 import shutil
 import sqlite3
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 
 def dashboard_kpis(conn: sqlite3.Connection, as_of: date | None = None) -> dict:
+    # NOTE ON PERFORMANCE: every comparison below is against the raw
+    # `datetime`/`expiry_date` columns (e.g. `datetime >= ? AND datetime < ?`)
+    # rather than wrapping the column in date(...). SQLite can only use
+    # idx_invoices_datetime / idx_batches_expiry when the column is compared
+    # directly - wrapping it in a function forces a full table scan on every
+    # dashboard load, which is the main reason the app felt sluggish once
+    # there were months of transaction history. Boundaries are computed once
+    # in Python instead.
     as_of = as_of or date.today()
     today = as_of.isoformat()
+    tomorrow = (as_of + timedelta(days=1)).isoformat()
+    seven_days_out = (as_of + timedelta(days=7)).isoformat()
+    thirty_days_ago = (as_of - timedelta(days=30)).isoformat()
 
     today_sales = conn.execute(
-        "SELECT COALESCE(SUM(net_total),0) v, COUNT(*) n FROM invoices WHERE date(datetime)=? AND voided=0",
-        (today,),
+        "SELECT COALESCE(SUM(net_total),0) v, COUNT(*) n FROM invoices "
+        "WHERE datetime >= ? AND datetime < ? AND voided=0",
+        (today, tomorrow),
     ).fetchone()
 
     margin_row = conn.execute(
@@ -28,8 +40,8 @@ def dashboard_kpis(conn: sqlite3.Connection, as_of: date | None = None) -> dict:
            FROM invoice_items ii JOIN invoices i ON i.id = ii.invoice_id
            JOIN products p ON p.id = ii.product_id
            LEFT JOIN stock_batches b ON b.id = ii.batch_id
-           WHERE date(i.datetime)=? AND i.voided=0""",
-        (today,),
+           WHERE i.datetime >= ? AND i.datetime < ? AND i.voided=0""",
+        (today, tomorrow),
     ).fetchone()
     gross_margin_pct = (
         round(100 * (margin_row["rev"] - margin_row["cost"]) / margin_row["rev"], 1)
@@ -45,17 +57,16 @@ def dashboard_kpis(conn: sqlite3.Connection, as_of: date | None = None) -> dict:
 
     expiring_7d = conn.execute(
         """SELECT COUNT(*) c FROM stock_batches
-           WHERE qty_remaining>0 AND expiry_date IS NOT NULL
-             AND date(expiry_date) <= date(?, '+7 day')""",
-        (today,),
+           WHERE qty_remaining>0 AND expiry_date IS NOT NULL AND expiry_date <= ?""",
+        (seven_days_out,),
     ).fetchone()["c"]
 
     top_seller = conn.execute(
         """SELECT p.name_en, SUM(ii.qty) q FROM invoice_items ii
            JOIN invoices i ON i.id = ii.invoice_id JOIN products p ON p.id = ii.product_id
-           WHERE i.voided=0 AND date(i.datetime) >= date(?, '-30 day')
+           WHERE i.voided=0 AND i.datetime >= ?
            GROUP BY p.id ORDER BY q DESC LIMIT 1""",
-        (today,),
+        (thirty_days_ago,),
     ).fetchone()
 
     total_waste_value = conn.execute("SELECT COALESCE(SUM(value_lost),0) v FROM waste_events").fetchone()["v"]
@@ -73,21 +84,23 @@ def dashboard_kpis(conn: sqlite3.Connection, as_of: date | None = None) -> dict:
 
 
 def daily_sales_summary(conn: sqlite3.Connection, day: date) -> list[sqlite3.Row]:
+    start, end = day.isoformat(), (day + timedelta(days=1)).isoformat()
     return conn.execute(
         """SELECT p.name_en, SUM(ii.qty) qty, SUM(ii.line_total) revenue
            FROM invoice_items ii JOIN invoices i ON i.id=ii.invoice_id JOIN products p ON p.id=ii.product_id
-           WHERE date(i.datetime)=? AND i.voided=0 GROUP BY p.id ORDER BY revenue DESC""",
-        (day.isoformat(),),
+           WHERE i.datetime >= ? AND i.datetime < ? AND i.voided=0 GROUP BY p.id ORDER BY revenue DESC""",
+        (start, end),
     ).fetchall()
 
 
 def best_sellers(conn: sqlite3.Connection, days: int = 30, top_n: int = 15) -> list[sqlite3.Row]:
+    cutoff = (date.today() - timedelta(days=days)).isoformat()
     return conn.execute(
-        """SELECT p.name_en, p.category, SUM(ii.qty) qty, SUM(ii.line_total) revenue
+        """SELECT p.id AS product_id, p.name_en, p.category, SUM(ii.qty) qty, SUM(ii.line_total) revenue
            FROM invoice_items ii JOIN invoices i ON i.id=ii.invoice_id JOIN products p ON p.id=ii.product_id
-           WHERE i.voided=0 AND date(i.datetime) >= date('now', ?)
+           WHERE i.voided=0 AND i.datetime >= ?
            GROUP BY p.id ORDER BY revenue DESC LIMIT ?""",
-        (f"-{days} day", top_n),
+        (cutoff, top_n),
     ).fetchall()
 
 
@@ -106,11 +119,12 @@ def low_stock_alert(conn: sqlite3.Connection) -> list[dict]:
 
 
 def cashier_daily_statement(conn: sqlite3.Connection, staff_id: int, day: date) -> dict:
+    start, end = day.isoformat(), (day + timedelta(days=1)).isoformat()
     rows = conn.execute(
         """SELECT payment_type, COUNT(*) n, COALESCE(SUM(net_total),0) total
-           FROM invoices WHERE staff_id=? AND date(datetime)=? AND voided=0
+           FROM invoices WHERE staff_id=? AND datetime >= ? AND datetime < ? AND voided=0
            GROUP BY payment_type""",
-        (staff_id, day.isoformat()),
+        (staff_id, start, end),
     ).fetchall()
     staff = conn.execute("SELECT name FROM staff WHERE id=?", (staff_id,)).fetchone()
     breakdown = {r["payment_type"]: {"count": r["n"], "total": r["total"]} for r in rows}
@@ -137,12 +151,13 @@ def credit_outstanding_summary(conn: sqlite3.Connection) -> list[dict]:
 
 
 def returns_summary(conn: sqlite3.Connection, days: int = 30) -> list[dict]:
+    cutoff = (date.today() - timedelta(days=days)).isoformat()
     rows = conn.execute(
         """SELECT p.name_en, p.category, COUNT(*) events, SUM(r.qty) qty, SUM(r.refund_amount) refunded
            FROM returns r JOIN products p ON p.id = r.product_id
-           WHERE date(r.returned_at) >= date('now', ?)
+           WHERE r.returned_at >= ?
            GROUP BY p.id ORDER BY refunded DESC""",
-        (f"-{days} day",),
+        (cutoff,),
     ).fetchall()
     return [dict(r) for r in rows]
 
