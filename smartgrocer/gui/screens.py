@@ -307,13 +307,22 @@ class POSScreen(BaseScreen):
         styled_button(bottom, "Checkout", self.checkout, kind="success", width=140,
                       height=40).pack(side="right")
 
+        # grid (not pack/side="left") so these shrink to fit a narrower window
+        # or a smaller/scaled-up-DPI screen instead of running off the edge -
+        # four buttons packed at their natural width stopped fitting once
+        # "Phone Scanner" was added here.
         bottom2 = ctk.CTkFrame(self, fg_color="transparent")
         bottom2.pack(fill="x", padx=24, pady=(8, 12))
-        styled_button(bottom2, "Hold Invoice", self.hold_invoice, kind="secondary").pack(side="left")
-        styled_button(bottom2, "Resume Held", self.resume_invoice, kind="secondary").pack(side="left", padx=8)
-        styled_button(bottom2, "Return / Refund", self.open_return_dialog, kind="danger").pack(side="left", padx=8)
-        styled_button(bottom2, "Phone Scanner", self.open_phone_scanner_dialog, kind="secondary").pack(
-            side="left", padx=8)
+        for col in range(4):
+            bottom2.grid_columnconfigure(col, weight=1, uniform="bottom2")
+        styled_button(bottom2, "Hold Invoice", self.hold_invoice, kind="secondary").grid(
+            row=0, column=0, sticky="ew", padx=(0, 4))
+        styled_button(bottom2, "Resume Held", self.resume_invoice, kind="secondary").grid(
+            row=0, column=1, sticky="ew", padx=4)
+        styled_button(bottom2, "Return / Refund", self.open_return_dialog, kind="danger").grid(
+            row=0, column=2, sticky="ew", padx=4)
+        styled_button(bottom2, "Phone Scanner", self.open_phone_scanner_dialog, kind="secondary").grid(
+            row=0, column=3, sticky="ew", padx=(4, 0))
 
         self._search_results: list = []
 
@@ -1436,15 +1445,21 @@ class StaffScreen(BaseScreen):
         )
         self.hint.pack(anchor="w", padx=24, pady=(0, 8))
 
+        # grid, not pack/side="left" - four buttons shrink to fit a narrower
+        # window or a scaled-up-DPI screen instead of the last one or two
+        # running off the edge.
         top = ctk.CTkFrame(self, fg_color="transparent")
         top.pack(fill="x", padx=24)
-        styled_button(top, "Refresh", self.refresh, kind="secondary").pack(side="left")
+        for col in range(4):
+            top.grid_columnconfigure(col, weight=1, uniform="staff_top")
+        styled_button(top, "Refresh", self.refresh, kind="secondary").grid(
+            row=0, column=0, sticky="ew", padx=(0, 4))
         self.add_btn = styled_button(top, "Add Staff", self.open_add_dialog, kind="primary")
-        self.add_btn.pack(side="left", padx=8)
+        self.add_btn.grid(row=0, column=1, sticky="ew", padx=4)
         self.pin_btn = styled_button(top, "Reset PIN", self.open_reset_pin_dialog, kind="secondary")
-        self.pin_btn.pack(side="left", padx=8)
+        self.pin_btn.grid(row=0, column=2, sticky="ew", padx=4)
         self.toggle_btn = styled_button(top, "Activate / Deactivate", self.toggle_active, kind="danger")
-        self.toggle_btn.pack(side="left", padx=8)
+        self.toggle_btn.grid(row=0, column=3, sticky="ew", padx=(4, 0))
 
         tree_frame = ctk.CTkFrame(self, fg_color="transparent")
         tree_frame.pack(fill="both", expand=True, padx=24, pady=10)
