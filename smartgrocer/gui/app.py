@@ -306,7 +306,7 @@ class SmartGrocerApp(ctk.CTk):
     def open_login_dialog(self):
         dialog = ctk.CTkToplevel(self)
         dialog.title("Login")
-        dialog.geometry("340x420")
+        screens.fit_dialog(dialog, 340, 420)
         dialog.configure(fg_color=theme.BG_LIGHT)
         dialog.grab_set()
 
@@ -368,7 +368,7 @@ class SmartGrocerApp(ctk.CTk):
         change, so a forgot-PIN reset can't quietly go unnoticed."""
         dialog = ctk.CTkToplevel(self)
         dialog.title("Forgot PIN")
-        dialog.geometry("340x260")
+        screens.fit_dialog(dialog, 340, 260)
         dialog.configure(fg_color=theme.BG_LIGHT)
         dialog.grab_set()
 
@@ -452,7 +452,7 @@ class SmartGrocerApp(ctk.CTk):
 
         dialog = ctk.CTkToplevel(self)
         dialog.title("Change My PIN")
-        dialog.geometry("320x260")
+        screens.fit_dialog(dialog, 320, 260)
         dialog.configure(fg_color=theme.BG_LIGHT)
         dialog.grab_set()
 
@@ -519,7 +519,7 @@ class SmartGrocerApp(ctk.CTk):
 
         dialog = ctk.CTkToplevel(self)
         dialog.title("Close Day")
-        dialog.geometry("360x260")
+        screens.fit_dialog(dialog, 360, 260)
         dialog.configure(fg_color=theme.BG_LIGHT)
         dialog.grab_set()
 
