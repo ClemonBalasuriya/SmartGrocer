@@ -324,6 +324,66 @@ def test_staff_add_reset_pin_and_deactivate():
     except ValueError:
         pass
 
+    # 'owner' is a valid third role (sees the Activity Log, on top of
+    # everything an admin can do) - who is ALLOWED to create one is a
+    # GUI-level policy decision (see StaffScreen), not enforced here.
+    owner_id = staff.add_staff(conn, "Shop Owner", "owner", "9090")
+    assert conn.execute("SELECT role FROM staff WHERE id=?", (owner_id,)).fetchone()["role"] == "owner"
+
+    try:
+        staff.add_staff(conn, "", "cashier", "1111")
+        assert False, "should have rejected a blank name"
+    except ValueError:
+        pass
+
+
+def test_audit_log_records_who_did_what_to_whom():
+    from smartgrocer import audit
+    conn = _fresh_db()
+    cashier_id = staff.add_staff(conn, "Clemon", "cashier", "12345")
+
+    audit.record(conn, actor_staff_id=1, action="staff.add", target_staff_id=cashier_id,
+                 details="added as cashier")
+    audit.record(conn, actor_staff_id=1, action="staff.pin_reset", target_staff_id=cashier_id)
+
+    log = audit.list_log(conn)
+    assert len(log) == 2
+    newest = log[0]  # list_log orders newest first
+    assert newest["action"] == "staff.pin_reset"
+    assert newest["target_staff_id"] == cashier_id
+    assert newest["target_name"] == "Clemon"
+    assert newest["actor_name"] == "Admin" and newest["actor_role"] == "admin"
+
+    # The snapshot survives the actor/target changing later.
+    staff.set_active(conn, cashier_id, False)
+    log_after = audit.list_log(conn)
+    assert log_after[0]["target_name"] == "Clemon"  # unchanged even though Clemon is now inactive
+
+
+def test_notifications_config_round_trips_and_send_is_a_safe_noop_when_unconfigured():
+    from smartgrocer import notifications
+    # Nothing configured yet (fresh default) - send() must not raise and
+    # must not claim any channel succeeded.
+    notifications.save(dict(notifications._DEFAULT))
+    assert notifications.send("Test", "hello") == []
+
+    cfg = notifications.load()
+    cfg["email_enabled"] = True
+    cfg["smtp_host"] = "127.0.0.1"  # nothing listening here - fails fast (connection refused) rather
+    cfg["smtp_port"] = 1            # than spending the full network timeout against a real SMTP host
+    cfg["smtp_user"] = "shop@example.com"
+    cfg["smtp_app_password"] = "not-a-real-password"
+    cfg["owner_email"] = "owner@example.com"
+    notifications.save(cfg)
+    reloaded = notifications.load()
+    assert reloaded["email_enabled"] is True
+    assert reloaded["owner_email"] == "owner@example.com"
+
+    # An unreachable/failing SMTP server must fail quietly, not raise.
+    assert notifications.send("Test", "hello") == []
+
+    notifications.save(dict(notifications._DEFAULT))  # leave shared test state clean
+
 
 def test_mobile_scan_server_end_to_end():
     # Exercises the phone-scanner companion the same way a real phone

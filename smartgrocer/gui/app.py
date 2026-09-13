@@ -45,6 +45,7 @@ NAV_ITEMS = [
     ("📄  Reports", "reports", screens.ReportsScreen),
     ("👤  Staff", "staff", screens.StaffScreen),
     ("🌐  Network", "network", screens.NetworkScreen),
+    ("🛡️  Activity Log", "audit", screens.ActivityLogScreen),
 ]
 
 
@@ -160,11 +161,45 @@ class SmartGrocerApp(ctk.CTk):
         # added - not a Staff-specific bug, the sidebar itself ran out of
         # room). This scrolls just the nav list; the logo and day-status
         # above stay fixed.
+        # Colors visible against the dark sidebar - the previous attempt
+        # used near-black on near-black for the scrollbar thumb, which made
+        # it there but effectively invisible, on top of CustomTkinter's
+        # scrollable frames only reacting to the mouse wheel when the
+        # pointer is over bare background rather than a child widget (which
+        # here is nearly the whole list, since every button fills the
+        # width) - between the two, there was no way to actually discover
+        # or use the scrolling. _enable_wheel_scroll below fixes the wheel
+        # part; the color fix here fixes the "I can't even see a scrollbar"
+        # part.
+        # Small, unambiguous scroll-arrow buttons above/below the list -
+        # a guaranteed click-to-scroll fallback that doesn't depend on
+        # mouse-wheel event forwarding working correctly at all, since
+        # that's been the actual point of failure so far. Packed with
+        # side="top"/"bottom" BEFORE nav_scroll, so they claim their space
+        # first and nav_scroll's fill="both", expand=True only fills
+        # whatever's left between them.
+        def _scroll_nav(units: int):
+            canvas = getattr(nav_scroll, "_parent_canvas", None)
+            if canvas is not None:
+                canvas.yview_scroll(units, "units")
+
+        ctk.CTkButton(
+            self.sidebar, text="▲", height=20, width=40, font=ctk.CTkFont(size=11),
+            fg_color="transparent", text_color="#9FB0CC", hover_color=theme.NAVY_DARKER,
+            command=lambda: _scroll_nav(-2),
+        ).pack(side="top", pady=(0, 2))
+        ctk.CTkButton(
+            self.sidebar, text="▼", height=20, width=40, font=ctk.CTkFont(size=11),
+            fg_color="transparent", text_color="#9FB0CC", hover_color=theme.NAVY_DARKER,
+            command=lambda: _scroll_nav(2),
+        ).pack(side="bottom", pady=(2, 8))
+
         nav_scroll = ctk.CTkScrollableFrame(
             self.sidebar, fg_color="transparent",
-            scrollbar_button_color=theme.NAVY_DARKER, scrollbar_button_hover_color="#2A3D6B",
+            scrollbar_button_color=theme.ACCENT_BLUE, scrollbar_button_hover_color=theme.ACCENT_BLUE_HOVER,
         )
-        nav_scroll.pack(fill="both", expand=True, padx=0, pady=(0, 8))
+        nav_scroll.pack(side="top", fill="both", expand=True, padx=0, pady=(0, 0))
+        self._nav_scroll = nav_scroll
 
         self.nav_buttons: dict[str, ctk.CTkButton] = {}
         for label, key, _cls in NAV_ITEMS:
@@ -177,6 +212,22 @@ class SmartGrocerApp(ctk.CTk):
             )
             btn.pack(fill="x", padx=14, pady=3)
             self.nav_buttons[key] = btn
+
+        # CTkScrollableFrame only wires up mouse-wheel scrolling for its own
+        # bare background, not for widgets packed inside it - a
+        # widely-reported CustomTkinter limitation, and a real problem here
+        # since nav buttons fill essentially the whole list with barely any
+        # bare background left to hover over. Binding the wheel globally
+        # (bind_all reaches every widget, buttons included, since "wheel"
+        # isn't a button-native event they intercept) and only acting on it
+        # when the pointer is actually over this list - checked by walking
+        # up from whatever widget is under the cursor - makes it scroll
+        # from anywhere over the nav list, and does nothing everywhere else
+        # so it can't interfere with scrolling elsewhere in the app (e.g.
+        # the POS screen's own scrollable body).
+        self.bind_all("<MouseWheel>", self._on_global_mousewheel)
+        self.bind_all("<Button-4>", self._on_global_mousewheel)  # Linux scroll up
+        self.bind_all("<Button-5>", self._on_global_mousewheel)  # Linux scroll down
 
         self.container = ctk.CTkFrame(self, corner_radius=0, fg_color=theme.BG_LIGHT)
         self.container.grid(row=0, column=1, sticky="nsew")
@@ -328,6 +379,31 @@ class SmartGrocerApp(ctk.CTk):
 
         ctk.CTkButton(dialog, text="Close Day", command=submit, fg_color=theme.DANGER_RED,
                       hover_color=theme.DANGER_RED_HOVER).pack(pady=20)
+
+    def _on_global_mousewheel(self, event) -> None:
+        """Scroll the sidebar's nav list when the mouse wheel turns over
+        it - see the long comment where this is bound for why a global
+        binding, checked against the pointer position, is needed instead
+        of relying on CTkScrollableFrame's own (button-blind) wheel
+        handling. Does nothing at all when the pointer isn't over the nav
+        list, so it can't steal scroll events meant for anything else."""
+        nav_scroll = getattr(self, "_nav_scroll", None)
+        if nav_scroll is None:
+            return
+        widget = self.winfo_containing(event.x_root, event.y_root)
+        while widget is not None:
+            if widget is nav_scroll:
+                canvas = getattr(nav_scroll, "_parent_canvas", None)
+                if canvas is not None:
+                    if event.num == 4:
+                        delta = -1
+                    elif event.num == 5:
+                        delta = 1
+                    else:
+                        delta = -1 if event.delta > 0 else 1
+                    canvas.yview_scroll(delta, "units")
+                return
+            widget = widget.master
 
     def is_client_till(self) -> bool:
         """True when this till has no database of its own and is talking

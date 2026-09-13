@@ -21,6 +21,8 @@ from .. import staff as staff_module
 from .. import mobile_scan
 from .. import netclient
 from .. import netserver
+from .. import audit
+from .. import notifications
 from .. import db as db_module
 from . import theme
 from .theme import tree_clear, tree_insert
@@ -1740,12 +1742,17 @@ class SuppliersScreen(BaseScreen):
 # --------------------------------------------------------------------------- #
 
 class StaffScreen(BaseScreen):
-    """Add cashiers/admins and set their login PIN, without needing a
+    """Add cashiers/admins/owners and set their login PIN, without needing a
     developer to reach into the database by hand every time someone new
     joins the till. Managing staff (adding, deactivating, resetting a PIN)
-    is restricted to whoever is currently logged in as Admin - everyone can
-    still see the list, since a cashier glancing at who's on shift is
-    harmless, but only Admin can change it."""
+    is restricted to whoever is currently logged in as Admin or Owner -
+    everyone can still see the list, since a cashier glancing at who's on
+    shift is harmless, but only Admin/Owner can change it.
+
+    Every sensitive change made here (adding staff, resetting a PIN,
+    activating/deactivating) is written to the Activity Log (audit.py) with
+    who did it, and a best-effort notification (notifications.py) is sent
+    to the Owner so nothing has to be discovered after the fact."""
 
     def __init__(self, parent, app):
         super().__init__(parent, app)
@@ -1782,20 +1789,40 @@ class StaffScreen(BaseScreen):
     def on_show(self):
         self.refresh()
 
-    def _is_admin(self) -> bool:
+    def _current_role(self) -> str | None:
         if not self.app.logged_in:
-            return False
+            return None
         row = self.conn.execute(
             "SELECT role FROM staff WHERE id=?", (self.app.current_staff_id,)
         ).fetchone()
-        return bool(row and row["role"] == "admin")
+        return row["role"] if row else None
+
+    def _is_admin(self) -> bool:
+        """True for Admin OR Owner - Owner is a superset of Admin's
+        privileges, so anywhere Admin can manage staff, Owner can too."""
+        return self._current_role() in ("admin", "owner")
+
+    def _is_owner(self) -> bool:
+        return self._current_role() == "owner"
+
+    def _any_owner_exists(self) -> bool:
+        return self.conn.execute("SELECT 1 FROM staff WHERE role='owner' LIMIT 1").fetchone() is not None
+
+    def _actor_label(self) -> str:
+        row = self.conn.execute(
+            "SELECT name, role FROM staff WHERE id=?", (self.app.current_staff_id,)
+        ).fetchone()
+        if not row:
+            return "Someone"
+        return f"{row['role'].capitalize()} {row['name']}"
 
     def refresh(self):
         is_admin = self._is_admin()
         self.hint.configure(
-            text="Logged in as Admin - you can add, deactivate, or reset PINs below."
+            text="Logged in as " + ("Owner" if self._is_owner() else "Admin")
+            + " - you can add, deactivate, or reset PINs below."
             if is_admin else
-            "Only Admin can add staff, reset PINs, or deactivate someone - log in as "
+            "Only Admin/Owner can add staff, reset PINs, or deactivate someone - log in as "
             "Admin from the sidebar first. Anyone can view this list."
         )
         for btn in (self.add_btn, self.pin_btn, self.toggle_btn):
@@ -1811,12 +1838,20 @@ class StaffScreen(BaseScreen):
     def _require_admin(self) -> bool:
         if self._is_admin():
             return True
-        messagebox.showwarning("Admin required", "Log in as Admin (sidebar) to manage staff.")
+        messagebox.showwarning("Admin required", "Log in as Admin or Owner (sidebar) to manage staff.")
         return False
 
     def open_add_dialog(self):
         if not self._require_admin():
             return
+        # Only an existing Owner can create another Owner - unless there is
+        # no Owner account anywhere yet, in which case anyone with Admin
+        # rights can bootstrap the very first one. This stops a compromised
+        # or dishonest Admin from quietly promoting themselves once a real
+        # Owner already exists.
+        can_offer_owner = self._is_owner() or not self._any_owner_exists()
+        role_choices = ["cashier", "admin", "owner"] if can_offer_owner else ["cashier", "admin"]
+
         dialog = ctk.CTkToplevel(self)
         dialog.title("Add Staff")
         dialog.geometry("360x340")
@@ -1829,7 +1864,12 @@ class StaffScreen(BaseScreen):
 
         ctk.CTkLabel(dialog, text="Role:").pack(anchor="w", padx=16, pady=(12, 0))
         role_var = tk.StringVar(value="cashier")
-        ctk.CTkOptionMenu(dialog, values=["cashier", "admin"], variable=role_var, width=300).pack(padx=16)
+        ctk.CTkOptionMenu(dialog, values=role_choices, variable=role_var, width=300).pack(padx=16)
+        if not can_offer_owner:
+            ctk.CTkLabel(
+                dialog, text="Only an existing Owner can create another Owner account.",
+                font=ctk.CTkFont(size=10), text_color=theme.TEXT_MUTED, wraplength=300,
+            ).pack(anchor="w", padx=16, pady=(2, 0))
 
         ctk.CTkLabel(dialog, text="PIN (numbers, used to log in at the till):").pack(
             anchor="w", padx=16, pady=(12, 0))
@@ -1837,11 +1877,26 @@ class StaffScreen(BaseScreen):
         ctk.CTkEntry(dialog, textvariable=pin_var, width=300).pack(padx=16)
 
         def save():
+            role = role_var.get()
+            if role == "owner" and not can_offer_owner:
+                # Defensive - shouldn't be reachable since "owner" isn't
+                # even offered in this case, but never trust client state.
+                messagebox.showerror("Not allowed", "Only an existing Owner can create another Owner.")
+                return
             try:
-                staff_module.add_staff(self.conn, name_var.get(), role_var.get(), pin_var.get())
+                new_id = staff_module.add_staff(self.conn, name_var.get(), role, pin_var.get())
             except ValueError as e:
                 messagebox.showerror("Cannot add staff", str(e))
                 return
+            name_saved = name_var.get().strip()
+            audit.record(
+                self.conn, actor_staff_id=self.app.current_staff_id, action="staff.add",
+                target_staff_id=new_id, details=f"role={role}",
+            )
+            notifications.send(
+                "SmartGrocer: staff added",
+                f"{self._actor_label()} added a new {role} account: {name_saved}.",
+            )
             dialog.destroy()
             self.refresh()
 
@@ -1855,6 +1910,8 @@ class StaffScreen(BaseScreen):
             messagebox.showwarning("No staff selected", "Select a staff member first.")
             return
         staff_id = int(sel[0])
+        target = self.conn.execute("SELECT name FROM staff WHERE id=?", (staff_id,)).fetchone()
+        target_name = target["name"] if target else f"staff#{staff_id}"
 
         dialog = ctk.CTkToplevel(self)
         dialog.title("Reset PIN")
@@ -1872,6 +1929,14 @@ class StaffScreen(BaseScreen):
             except ValueError as e:
                 messagebox.showerror("Cannot update PIN", str(e))
                 return
+            audit.record(
+                self.conn, actor_staff_id=self.app.current_staff_id, action="staff.pin_reset",
+                target_staff_id=staff_id,
+            )
+            notifications.send(
+                "SmartGrocer: PIN changed",
+                f"{self._actor_label()} changed the PIN for {target_name}.",
+            )
             dialog.destroy()
             messagebox.showinfo("PIN updated", "The PIN has been changed.")
 
@@ -1891,7 +1956,17 @@ class StaffScreen(BaseScreen):
         if row["active"] and staff_id == self.app.current_staff_id:
             messagebox.showerror("Cannot deactivate", "You cannot deactivate the account you're currently logged in as.")
             return
-        staff_module.set_active(self.conn, staff_id, not row["active"])
+        new_active = not row["active"]
+        staff_module.set_active(self.conn, staff_id, new_active)
+        audit.record(
+            self.conn, actor_staff_id=self.app.current_staff_id,
+            action="staff.activate" if new_active else "staff.deactivate",
+            target_staff_id=staff_id,
+        )
+        notifications.send(
+            f"SmartGrocer: staff {'activated' if new_active else 'deactivated'}",
+            f"{self._actor_label()} {'activated' if new_active else 'deactivated'} {row['name']}.",
+        )
         self.refresh()
 
 
@@ -2080,3 +2155,175 @@ class NetworkScreen(BaseScreen):
             return
         self.app.disconnect_from_till()
         self.refresh()
+
+
+# --------------------------------------------------------------------------- #
+# Activity log (Owner only)
+# --------------------------------------------------------------------------- #
+
+class ActivityLogScreen(BaseScreen):
+    """Owner-only view of every sensitive staff/account action ever taken -
+    who added a cashier, who reset whose PIN, who deactivated whom, and
+    when. This is the shop owner's answer to "who did that" without having
+    to ask around. Also hosts the Notification Settings dialog, since
+    deciding who gets pinged about these actions is naturally the same
+    Owner-only screen."""
+
+    COLUMNS = ["When", "Who", "Role", "Action", "Target", "Details"]
+    ACTION_LABELS = {
+        "staff.add": "Added staff",
+        "staff.pin_reset": "Reset PIN",
+        "staff.activate": "Activated staff",
+        "staff.deactivate": "Deactivated staff",
+    }
+
+    def __init__(self, parent, app):
+        super().__init__(parent, app)
+        self.header("Activity Log")
+
+        self.hint = ctk.CTkLabel(
+            self, text="", font=ctk.CTkFont(size=12), text_color=theme.TEXT_MUTED, wraplength=760, justify="left",
+        )
+        self.hint.pack(anchor="w", padx=24, pady=(0, 8))
+
+        top = ctk.CTkFrame(self, fg_color="transparent")
+        top.pack(fill="x", padx=24)
+        self.refresh_btn = styled_button(top, "Refresh", self.refresh, kind="secondary")
+        self.refresh_btn.pack(side="left")
+        self.notify_btn = styled_button(top, "Notification Settings", self.open_notification_settings, kind="secondary")
+        self.notify_btn.pack(side="left", padx=8)
+
+        tree_frame = ctk.CTkFrame(self, fg_color="transparent")
+        tree_frame.pack(fill="both", expand=True, padx=24, pady=10)
+        self.tree = make_treeview(
+            tree_frame, self.COLUMNS,
+            {"When": 140, "Who": 140, "Role": 80, "Action": 150, "Target": 140, "Details": 160},
+        )
+        self.tree.master_frame.pack(fill="both", expand=True)
+
+    def on_show(self):
+        self.refresh()
+
+    def _is_owner(self) -> bool:
+        if not self.app.logged_in:
+            return False
+        row = self.conn.execute(
+            "SELECT role FROM staff WHERE id=?", (self.app.current_staff_id,)
+        ).fetchone()
+        return bool(row and row["role"] == "owner")
+
+    def refresh(self):
+        is_owner = self._is_owner()
+        self.hint.configure(
+            text="Every add/deactivate/PIN-reset action taken by an Admin or Owner, newest first."
+            if is_owner else
+            "Only the Owner can view the Activity Log - log in as Owner from the sidebar first."
+        )
+        self.refresh_btn.configure(state="normal" if is_owner else "disabled")
+        self.notify_btn.configure(state="normal" if is_owner else "disabled")
+        tree_clear(self.tree)
+        if not is_owner:
+            return
+        for row in audit.list_log(self.conn):
+            tree_insert(
+                self.tree,
+                (
+                    row["at"],
+                    row["actor_name"],
+                    row["actor_role"].capitalize(),
+                    self.ACTION_LABELS.get(row["action"], row["action"]),
+                    row["target_name"] or "",
+                    row["details"] or "",
+                ),
+                iid=str(row["id"]),
+            )
+
+    def open_notification_settings(self):
+        if not self._is_owner():
+            messagebox.showwarning("Owner required", "Log in as Owner (sidebar) to change notification settings.")
+            return
+
+        config = notifications.load()
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Notification Settings")
+        dialog.geometry("460x620")
+        dialog.configure(fg_color=theme.BG_LIGHT)
+        dialog.grab_set()
+
+        scroll = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=4, pady=4)
+
+        def section(text):
+            ctk.CTkLabel(
+                scroll, text=text, font=ctk.CTkFont(size=13, weight="bold"), text_color=theme.NAVY_DARK,
+            ).pack(anchor="w", padx=12, pady=(14, 2))
+
+        def field(label, key, show=None):
+            ctk.CTkLabel(scroll, text=label, font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(6, 0))
+            var = tk.StringVar(value=str(config.get(key, "") or ""))
+            ctk.CTkEntry(scroll, textvariable=var, width=400, show=show).pack(padx=12)
+            return var
+
+        ctk.CTkLabel(
+            scroll,
+            text="When an Admin or Owner adds staff, resets a PIN, or activates/deactivates someone, "
+                 "send a notification here. Email works right away with a Gmail app password. SMS/"
+                 "WhatsApp need a paid Twilio account - leave those blank to skip them.",
+            font=ctk.CTkFont(size=11), text_color=theme.TEXT_MUTED, wraplength=400, justify="left",
+        ).pack(anchor="w", padx=12, pady=(10, 0))
+
+        section("Email")
+        email_enabled_var = tk.BooleanVar(value=bool(config.get("email_enabled")))
+        ctk.CTkCheckBox(scroll, text="Enable email notifications", variable=email_enabled_var).pack(
+            anchor="w", padx=12, pady=(4, 0))
+        smtp_host_var = field("SMTP host (usually smtp.gmail.com):", "smtp_host")
+        smtp_port_var = field("SMTP port (usually 587):", "smtp_port")
+        smtp_user_var = field("Sending Gmail address:", "smtp_user")
+        smtp_pass_var = field("Gmail app password:", "smtp_app_password", show="*")
+        owner_email_var = field("Owner's email (receives notifications):", "owner_email")
+
+        section("SMS / WhatsApp (Twilio - optional, paid)")
+        sid_var = field("Twilio Account SID:", "twilio_account_sid")
+        token_var = field("Twilio Auth Token:", "twilio_auth_token", show="*")
+        from_sms_var = field("Twilio SMS number (e.g. +14155551234):", "twilio_from_sms")
+        from_wa_var = field("Twilio WhatsApp sender (e.g. whatsapp:+14155238886):", "twilio_from_whatsapp")
+        owner_phone_var = field("Owner's phone (receives SMS/WhatsApp, e.g. +94771234567):", "owner_phone")
+
+        status_label = ctk.CTkLabel(scroll, text="", font=ctk.CTkFont(size=11), text_color=theme.TEXT_MUTED)
+        status_label.pack(anchor="w", padx=12, pady=(10, 0))
+
+        def collect() -> dict:
+            return {
+                "email_enabled": bool(email_enabled_var.get()),
+                "smtp_host": smtp_host_var.get().strip(),
+                "smtp_port": int(smtp_port_var.get().strip() or 587) if smtp_port_var.get().strip().isdigit() else 587,
+                "smtp_user": smtp_user_var.get().strip(),
+                "smtp_app_password": smtp_pass_var.get(),
+                "owner_email": owner_email_var.get().strip(),
+                "twilio_account_sid": sid_var.get().strip(),
+                "twilio_auth_token": token_var.get().strip(),
+                "twilio_from_sms": from_sms_var.get().strip(),
+                "twilio_from_whatsapp": from_wa_var.get().strip(),
+                "owner_phone": owner_phone_var.get().strip(),
+            }
+
+        def save():
+            notifications.save(collect())
+            status_label.configure(text="Saved.", text_color=theme.TEXT_MUTED)
+
+        def send_test():
+            notifications.save(collect())
+            sent = notifications.send("SmartGrocer: test notification", "This is a test notification from SmartGrocer.")
+            if sent:
+                status_label.configure(text=f"Saved and sent via: {', '.join(sent)}", text_color=theme.TEXT_MUTED)
+            else:
+                status_label.configure(
+                    text="Saved, but nothing sent - check the settings above are filled in and correct.",
+                    text_color=theme.TEXT_MUTED,
+                )
+
+        btn_row = ctk.CTkFrame(scroll, fg_color="transparent")
+        btn_row.pack(fill="x", padx=12, pady=16)
+        styled_button(btn_row, "Save", save, kind="primary").pack(side="left")
+        styled_button(btn_row, "Save & Send Test", send_test, kind="secondary").pack(side="left", padx=8)

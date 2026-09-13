@@ -71,10 +71,27 @@ CREATE TABLE IF NOT EXISTS stock_batches (
 CREATE TABLE IF NOT EXISTS staff (
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
     name    TEXT NOT NULL,
-    role    TEXT NOT NULL DEFAULT 'cashier',    -- 'admin' | 'cashier'
+    role    TEXT NOT NULL DEFAULT 'cashier',    -- 'owner' | 'admin' | 'cashier'
     pin     TEXT NOT NULL DEFAULT '0000',
     active  INTEGER NOT NULL DEFAULT 1          -- 0 = deactivated (kept for invoice history, hidden from login)
 );
+
+-- Every sensitive staff/account action (added, PIN reset, activated,
+-- deactivated) gets a row here - who did it, to whom, and when - so the
+-- Owner can see the full history rather than trusting word of mouth about
+-- who changed what. See audit.py.
+CREATE TABLE IF NOT EXISTS audit_log (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    at              TEXT NOT NULL,
+    actor_staff_id  INTEGER REFERENCES staff(id),
+    actor_name      TEXT NOT NULL,              -- snapshot, so the log still reads correctly if the actor is later renamed/deactivated
+    actor_role      TEXT NOT NULL,
+    action          TEXT NOT NULL,               -- e.g. 'staff.add', 'staff.pin_reset', 'staff.activate', 'staff.deactivate'
+    target_staff_id INTEGER REFERENCES staff(id),
+    target_name     TEXT,
+    details         TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_auditlog_at ON audit_log(at);
 
 CREATE TABLE IF NOT EXISTS invoices (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
