@@ -151,10 +151,25 @@ class SmartGrocerApp(ctk.CTk):
         divider = ctk.CTkFrame(self.sidebar, height=1, fg_color="#1E2D52")
         divider.pack(fill="x", padx=16, pady=(0, 12))
 
+        # Scrollable, not packed straight into the sidebar - there are
+        # enough nav items now (11 screens plus Network) that they no
+        # longer all fit in a normal-sized window above the logo/day-status
+        # area, and a plain pack() would just silently clip whatever didn't
+        # fit off the bottom with no way to reach it (that's exactly what
+        # was making the Staff screen's button disappear once Network was
+        # added - not a Staff-specific bug, the sidebar itself ran out of
+        # room). This scrolls just the nav list; the logo and day-status
+        # above stay fixed.
+        nav_scroll = ctk.CTkScrollableFrame(
+            self.sidebar, fg_color="transparent",
+            scrollbar_button_color=theme.NAVY_DARKER, scrollbar_button_hover_color="#2A3D6B",
+        )
+        nav_scroll.pack(fill="both", expand=True, padx=0, pady=(0, 8))
+
         self.nav_buttons: dict[str, ctk.CTkButton] = {}
         for label, key, _cls in NAV_ITEMS:
             btn = ctk.CTkButton(
-                self.sidebar, text=label, anchor="w", corner_radius=8, height=38,
+                nav_scroll, text=label, anchor="w", corner_radius=8, height=38,
                 font=ctk.CTkFont(size=13),
                 fg_color="transparent", text_color="#D6DEEC",
                 hover_color=theme.NAVY_DARKER,
