@@ -21,8 +21,8 @@ import json
 import ssl
 
 from smartgrocer import (
-    association, cash_drawer, customers, data_generator, db, forecasting, layout, mobile_scan, pos,
-    promotions, receipts, reports, staff, suppliers,
+    association, cash_drawer, customers, data_generator, db, forecasting, layout, mobile_scan, netclient,
+    netserver, pos, promotions, receipts, reports, staff, suppliers,
 )
 
 
@@ -32,6 +32,18 @@ def _fresh_db():
     code_to_id = data_generator.insert_products(conn)
     data_generator.generate_history(conn, code_to_id, days=200, avg_invoices_per_day=40)
     return conn
+
+
+def _fresh_db_with_path():
+    """Like _fresh_db, but also hands back the file path - needed for
+    multi-till tests, where a second, independent connection (the local
+    verification connection, or another simulated till) has to open the
+    exact same file rather than share the in-memory conn object."""
+    tmp = Path(tempfile.mkdtemp()) / "test_smartgrocer.db"
+    conn = db.reset_db(tmp)
+    code_to_id = data_generator.insert_products(conn)
+    data_generator.generate_history(conn, code_to_id, days=200, avg_invoices_per_day=40)
+    return conn, tmp
 
 
 def _product_with_stock(conn, min_qty=10):
@@ -384,6 +396,96 @@ def test_mobile_scan_server_end_to_end():
         server.stop()
 
 
+def test_netserver_lets_a_remote_till_share_the_same_database():
+    # This is the multi-cashier-till feature: a "Cashier Till" runs the
+    # ordinary app but with a netclient.RemoteConnection standing in for
+    # self.app.conn instead of a local sqlite3 connection. Every existing
+    # module (pos.py here) must work completely unchanged against it, and
+    # what it writes must actually land in the shared database file - not
+    # some private copy - which is verified via a second, independent
+    # local connection to the same file.
+    conn, db_path = _fresh_db_with_path()
+    server = netserver.NetDBServer(db_path)
+    server.start(port=0)  # random free port - avoids clashing with a real Main Till or another test
+    try:
+        remote = netclient.RemoteConnection("127.0.0.1", server.port, server.pairing_code)
+        try:
+            assert remote.ping() is True
+
+            product_id = pos.add_product(
+                remote, code="REMOTE-TILL-001", name_en="Remote Till Item", category="Snacks",
+                cost_price=10, cash_price=25, initial_qty=40,
+            )
+            # Visible from a completely separate, local connection to the same file.
+            local_row = conn.execute("SELECT * FROM products WHERE code=?", ("REMOTE-TILL-001",)).fetchone()
+            assert local_row is not None and local_row["id"] == product_id
+
+            # A full checkout (multi-statement, uses executemany internally)
+            # works the same over the network as it does locally.
+            result = pos.create_invoice(remote, staff_id=1, cart=[pos.CartLine(product_id=product_id, qty=5)])
+            assert result.net_total == 125.0
+            assert pos.get_stock_on_hand(conn, product_id) == 35
+
+            # staff.py (a different module, unmodified for this feature)
+            # also works unchanged over the same remote connection.
+            new_staff_id = staff.add_staff(remote, "Remote Cashier", "cashier", "9999")
+            assert any(s["id"] == new_staff_id for s in staff.list_staff(conn))
+        finally:
+            remote.close()
+    finally:
+        server.stop()
+
+
+def test_netserver_rejects_wrong_pairing_code_and_stale_session():
+    conn, db_path = _fresh_db_with_path()
+    server = netserver.NetDBServer(db_path)
+    server.start(port=0)  # random free port - avoids clashing with a real Main Till or another test
+    try:
+        try:
+            netclient.RemoteConnection("127.0.0.1", server.port, "0000")
+            assert False, "expected RemoteError for a wrong pairing code"
+        except netclient.RemoteError:
+            pass
+
+        remote = netclient.RemoteConnection("127.0.0.1", server.port, server.pairing_code)
+        remote.close()  # server now forgets this session
+        try:
+            remote.execute("SELECT 1")
+            assert False, "expected RemoteError for a disconnected session"
+        except netclient.RemoteError:
+            pass
+    finally:
+        server.stop()
+
+
+def test_netserver_reports_duplicate_barcode_as_a_value_error():
+    # A raw constraint violation from the remote database (bypassing
+    # add_product's own pre-check, to exercise the actual network error
+    # path a genuine two-till race could hit) must surface as a ValueError
+    # so it lands in the same error dialogs as a local duplicate does,
+    # not as an unhandled network exception.
+    conn, db_path = _fresh_db_with_path()
+    server = netserver.NetDBServer(db_path)
+    server.start(port=0)  # random free port - avoids clashing with a real Main Till or another test
+    try:
+        remote = netclient.RemoteConnection("127.0.0.1", server.port, server.pairing_code)
+        try:
+            existing = conn.execute("SELECT code FROM products LIMIT 1").fetchone()
+            try:
+                remote.execute(
+                    "INSERT INTO products (code,name_en,category,cost_price,cash_price,credit_price,"
+                    "wholesale_price) VALUES (?,?,?,?,?,?,?)",
+                    (existing["code"], "Dup", "Snacks", 1, 2, 2, 1),
+                )
+                assert False, "expected a duplicate-code error"
+            except ValueError as e:
+                assert isinstance(e, netclient.RemoteIntegrityError)
+        finally:
+            remote.close()
+    finally:
+        server.stop()
+
+
 def test_barcode_exact_match_lookup():
     # This is what the POS screen's scan-to-cart shortcut relies on: a
     # scanner "typing" a code into the search box should resolve to exactly
@@ -507,6 +609,34 @@ def test_receive_stock_tops_up_existing_product():
         assert False, "expected ValueError for unknown product"
     except ValueError:
         pass
+
+
+def test_till_config_round_trips_and_defaults_to_standalone():
+    from smartgrocer import till_config
+    # A fresh install (no config file written yet) must behave exactly like
+    # today's single-till app - "standalone" is the only mode that changes
+    # nothing about existing behavior.
+    default = till_config.load()
+    assert default["mode"] == "standalone"
+
+    till_config.save("server", pairing_code="1234")
+    reloaded = till_config.load()
+    assert reloaded["mode"] == "server"
+    assert reloaded["pairing_code"] == "1234"
+
+    till_config.save("client", server_host="192.168.1.5", server_port=8765, pairing_code="4321")
+    reloaded2 = till_config.load()
+    assert reloaded2 == {
+        "mode": "client", "server_host": "192.168.1.5", "server_port": 8765, "pairing_code": "4321",
+    }
+
+    try:
+        till_config.save("not-a-real-mode")
+        assert False, "expected ValueError for an invalid mode"
+    except ValueError:
+        pass
+
+    till_config.save("standalone")  # leave shared test state clean for anything that runs after this
 
 
 def test_receipt_text_includes_key_fields():

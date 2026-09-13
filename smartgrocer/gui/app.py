@@ -22,7 +22,10 @@ import customtkinter as ctk
 
 from .. import cash_drawer
 from .. import db
+from .. import netclient
+from .. import netserver
 from .. import staff as staff_module
+from .. import till_config
 from . import screens
 from . import theme
 
@@ -41,6 +44,7 @@ NAV_ITEMS = [
     ("🗺️  Store Layout", "layout", screens.LayoutScreen),
     ("📄  Reports", "reports", screens.ReportsScreen),
     ("👤  Staff", "staff", screens.StaffScreen),
+    ("🌐  Network", "network", screens.NetworkScreen),
 ]
 
 
@@ -52,8 +56,38 @@ class SmartGrocerApp(ctk.CTk):
         self.minsize(1000, 650)
 
         self.db_path = db_path or db.DEFAULT_DB_PATH
-        self.conn = db.get_conn(self.db_path)
-        db.init_db(self.conn)
+        self.net_server = None  # only set once this till shares its data with others (Network screen)
+        self.till_config = till_config.load()
+
+        if self.till_config["mode"] == "client":
+            # This till has no database of its own - it connects to
+            # another till (the "Main Till") over the shop's network
+            # instead. If that till isn't reachable right now (network
+            # hiccup, it hasn't been switched on yet), fall back to a
+            # local database rather than refusing to open at all - a
+            # cashier shouldn't be locked out of ringing up sales just
+            # because Wi-Fi blipped. Anything rung up during that fallback
+            # stays local only (it does NOT get merged into the shared
+            # data automatically) until reconnected, which the warning
+            # below says plainly.
+            try:
+                self.conn = netclient.RemoteConnection(
+                    self.till_config["server_host"], self.till_config["server_port"],
+                    self.till_config["pairing_code"],
+                )
+            except netclient.RemoteError as e:
+                messagebox.showwarning(
+                    "Can't reach the Main Till",
+                    f"{e}\n\nOpening a temporary local copy instead so this till can still be used. "
+                    "Anything rung up while disconnected will NOT appear on the Main Till or other "
+                    "tills - reconnect from the Network screen as soon as possible.",
+                )
+                self.conn = db.get_conn(self.db_path)
+                db.init_db(self.conn)
+        else:
+            self.conn = db.get_conn(self.db_path)
+            db.init_db(self.conn)
+
         self.current_staff_id = 1  # default to Admin until someone logs in via the sidebar
         self.logged_in = False
         self.mobile_scan_server = None  # lazily created the first time POS opens "Phone Scanner"
@@ -69,22 +103,29 @@ class SmartGrocerApp(ctk.CTk):
         self.sidebar.grid(row=0, column=0, sticky="nsw")
         self.sidebar.grid_propagate(False)
 
+        # wraplength keeps every sidebar label from rendering wider than the
+        # (fixed-width, grid_propagate(False)) sidebar - without it, a label
+        # whose natural width exceeds the sidebar just overflows past its
+        # edge instead of wrapping, which is what was clipping the last
+        # letter or two off "by Balasuriya Group".
+        sidebar_text_width = 200  # 240px sidebar - padding
+
         try:
             from PIL import Image
             logo_img = Image.open(theme.LOGO_PATH)
-            logo_ctk = ctk.CTkImage(light_image=logo_img, dark_image=logo_img, size=(72, 72))
-            ctk.CTkLabel(self.sidebar, image=logo_ctk, text="").pack(pady=(28, 6))
+            logo_ctk = ctk.CTkImage(light_image=logo_img, dark_image=logo_img, size=(120, 120))
+            ctk.CTkLabel(self.sidebar, image=logo_ctk, text="").pack(pady=(24, 8))
         except Exception:
             pass  # logo is decorative - never block app startup over a missing/unreadable asset
 
         title = ctk.CTkLabel(self.sidebar, text="SmartGrocer", font=ctk.CTkFont(size=22, weight="bold"),
-                              text_color=theme.TEXT_ON_NAVY)
+                              text_color=theme.TEXT_ON_NAVY, wraplength=sidebar_text_width, justify="center")
         title.pack(pady=(0, 2), padx=20)
         subtitle = ctk.CTkLabel(self.sidebar, text="POS & Decision Support", font=ctk.CTkFont(size=12),
-                                 text_color="#9FB0CC")
+                                 text_color="#9FB0CC", wraplength=sidebar_text_width, justify="center")
         subtitle.pack(pady=(0, 4), padx=20)
         brand = ctk.CTkLabel(self.sidebar, text="by Balasuriya Group", font=ctk.CTkFont(size=11, slant="italic"),
-                              text_color="#7A8CAD")
+                              text_color="#7A8CAD", wraplength=sidebar_text_width, justify="center")
         brand.pack(pady=(0, 18), padx=20)
 
         # --- Day status / cashier login - the daily open/close ritual every
@@ -136,7 +177,15 @@ class SmartGrocerApp(ctk.CTk):
         self.show_frame("dashboard")
         self.refresh_day_status()
 
+        if self.till_config["mode"] == "server":
+            # Was sharing before the app was last closed - resume
+            # automatically with the SAME pairing code, so any Cashier
+            # Till already configured to connect here doesn't need to be
+            # re-paired after every restart of the Main Till.
+            self.start_sharing(pairing_code=self.till_config.get("pairing_code"))
+
     def show_frame(self, key: str):
+        self.current_frame_key = key
         frame = self.frames[key]
         frame.tkraise()
         for k, btn in self.nav_buttons.items():
@@ -146,6 +195,19 @@ class SmartGrocerApp(ctk.CTk):
                 text_color="#FFFFFF" if is_active else "#D6DEEC",
             )
         if hasattr(frame, "on_show"):
+            frame.on_show()
+
+    def refresh_current_frame(self):
+        """Re-run whichever screen is on-screen right now's own on_show()
+        logic. Needed because logging in/out happens from the sidebar,
+        which can be clicked while sitting on a screen whose buttons
+        depend on who's logged in (e.g. Staff screen's "Add Staff" is only
+        enabled for Admin) - without this, that screen keeps showing its
+        pre-login state (buttons stuck disabled) until you navigate away
+        and back, which is exactly what "logged in as Admin but still
+        can't add a cashier" turned out to be."""
+        frame = self.frames.get(getattr(self, "current_frame_key", None))
+        if frame is not None and hasattr(frame, "on_show"):
             frame.on_show()
 
     def refresh_day_status(self):
@@ -204,6 +266,7 @@ class SmartGrocerApp(ctk.CTk):
             self.current_staff_id = row["id"]
             self.logged_in = True
             self.refresh_day_status()
+            self.refresh_current_frame()
             dialog.destroy()
 
         ctk.CTkButton(dialog, text="Login", command=submit, fg_color=theme.SUCCESS_GREEN,
@@ -245,14 +308,80 @@ class SmartGrocerApp(ctk.CTk):
                 messagebox.showinfo("Day closed - cash matches", msg)
             self.logged_in = False
             self.refresh_day_status()
+            self.refresh_current_frame()
             dialog.destroy()
 
         ctk.CTkButton(dialog, text="Close Day", command=submit, fg_color=theme.DANGER_RED,
                       hover_color=theme.DANGER_RED_HOVER).pack(pady=20)
 
+    def is_client_till(self) -> bool:
+        """True when this till has no database of its own and is talking
+        to another till's server instead (see connect_to_till)."""
+        return isinstance(self.conn, netclient.RemoteConnection)
+
+    def start_sharing(self, pairing_code: str | None = None) -> None:
+        """Turn this till into the "Main Till" other cashier tills connect
+        to, using its own existing local database. Safe to call again if
+        already sharing (no-op, same as the Phone Scanner button)."""
+        if self.net_server is None:
+            self.net_server = netserver.NetDBServer(self.db_path, pairing_code=pairing_code)
+        if not self.net_server.running:
+            self.net_server.start()
+        till_config.save("server", pairing_code=self.net_server.pairing_code)
+        self.till_config = till_config.load()
+
+    def stop_sharing(self) -> None:
+        if self.net_server is not None:
+            self.net_server.stop()
+        till_config.save("standalone")
+        self.till_config = till_config.load()
+
+    def connect_to_till(self, host: str, port: int, pairing_code: str) -> None:
+        """Switch THIS till into a Cashier Till connected to another one.
+        Raises netclient.RemoteError if the other till can't be reached -
+        callers should show that message and leave the current connection
+        (local or remote) in place rather than assume this succeeded."""
+        new_conn = netclient.RemoteConnection(host, port, pairing_code)  # raises before anything is torn down
+        old_conn = self.conn
+        self.conn = new_conn
+        try:
+            old_conn.close()
+        except Exception:
+            pass
+        till_config.save("client", server_host=host, server_port=port, pairing_code=pairing_code)
+        self.till_config = till_config.load()
+        self.logged_in = False
+        self.current_staff_id = 1
+        self.refresh_day_status()
+        self.refresh_current_frame()
+
+    def disconnect_from_till(self) -> None:
+        """Leave Cashier Till mode and go back to this PC's own local
+        database (today's default, single-till behavior). Does NOT touch
+        the Main Till's data - this only changes what THIS till points at."""
+        old_conn = self.conn
+        self.conn = db.get_conn(self.db_path)
+        db.init_db(self.conn)
+        try:
+            old_conn.close()
+        except Exception:
+            pass
+        till_config.save("standalone")
+        self.till_config = till_config.load()
+        self.logged_in = False
+        self.current_staff_id = 1
+        self.refresh_day_status()
+        self.refresh_current_frame()
+
     def _on_close(self):
         if self.mobile_scan_server is not None and self.mobile_scan_server.running:
             self.mobile_scan_server.stop()
+        if self.net_server is not None and self.net_server.running:
+            self.net_server.stop()
+        try:
+            self.conn.close()
+        except Exception:
+            pass
         self.destroy()
 
 

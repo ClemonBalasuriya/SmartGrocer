@@ -38,7 +38,7 @@ below) once you have one.
 - **Item return / refund** (`pos.return_items`, POS screen's "Return / Refund" button) - look up a past invoice by number, return part or all of a line, restock it, and refund it (or, for a credit sale, reduce the customer's balance instead of handing back cash).
 - **Hold / resume invoice** (`pos.hold_cart`/`resume_held_invoice`, POS screen's "Hold Invoice" / "Resume Held" buttons) - park an in-progress cart and bring it back later, matching the sample POS system's F9 Hold Invoice.
 - **Split / mixed payment** (POS screen's "Payment: split" option) - collect part cash, part card, part cheque and/or part credit on one sale, matching the sample POS system's Mix Payment screen.
-- **Balasuriya Group branding** - the whole GUI (sidebar, buttons, tables) now uses a navy/blue theme sampled from the company logo, shown in the sidebar, instead of CustomTkinter's stock look.
+- **Balasuriya Group branding** - the whole GUI (sidebar, buttons, tables) now uses a navy/blue theme sampled from the company logo, shown in the sidebar, instead of CustomTkinter's stock look. Sidebar labels now wrap instead of overflowing past the sidebar's edge (was clipping the last letter or two of "by Balasuriya Group").
 - **Cash drawer / day open-close** (`smartgrocer/cash_drawer.py`, sidebar "Login / Open Day" / "Close Day") - start the day with a counted opening float, and every cashier logs in with their staff PIN (ties every sale to who actually rang it up, not just whoever was picked from a list); closing the day counts the actual cash and shows the variance against what the system expects.
 - **Printed receipts** (`smartgrocer/receipts.py`) - every completed sale saves a printable receipt to `exports/receipts/` and opens it with your default text viewer so you can Ctrl+P it.
 - **Quick-item buttons** on the POS screen - your top ~12 best-selling items appear as one-tap buttons so the cashier doesn't have to search/type every single sale.
@@ -48,6 +48,7 @@ below) once you have one.
 - **Staff management screen** (`smartgrocer/staff.py`, Staff screen) - add cashier/admin accounts and set their login PIN from inside the app instead of needing a developer to edit the database by hand. Only whoever is currently logged in as Admin can add staff, reset a PIN, or deactivate someone; deactivating (not deleting) keeps that person's name on their past invoices and cash sessions.
 - **Phone-as-barcode-scanner companion** (`smartgrocer/mobile_scan.py`, POS screen's "Phone Scanner" button) - turns any phone on the shop's Wi-Fi into a hands-free second scanner with nothing to install: the phone opens a plain web page (scan a QR code shown on the till, or type the address) and its **live camera feed** auto-detects barcodes/QR codes roughly twice a second - point it at items and they land in the till's cart on their own, no per-item tap needed (a one-photo-per-item fallback kicks in automatically if the phone's browser can't do a live camera feed). Works identically on Android and iPhone since it's a browser page, not a native app. Needs HTTPS to get camera access at all, so the server generates and caches its own self-signed certificate - the phone's browser shows a one-time "connection not private" warning per phone, which the POS screen's dialog explains how to click through (it's expected for a private local-network device, not a sign of a problem). A short pairing code (shown on the till) stops anyone else on the shop Wi-Fi from adding to a stranger's cart, and a brief per-code cooldown stops one item being added over and over while the phone is still pointed at it. See the module's docstring for the full reasoning, including why this still uses plain request/response per frame rather than a persistent WebSocket connection. Needs `opencv-contrib-python` and `cryptography` (added to `requirements.txt`) - a `pip install -r requirements.txt` is needed after pulling this update.
 - **UPC-A / EAN-13 barcode matching** (`pos.get_product_by_code`) - a UPC-A barcode (12 digits) and its EAN-13 form (the same number with a leading zero, 13 digits) are the same physical barcode, but the phone camera's decoder doesn't always report the same one from scan to scan. Without this, a product saved from one reading could come back "not in the catalog" the next time it's scanned, purely because the decoder returned the other, equally valid, form of the same code. Product lookup (search box, Phone Scanner, and the Add/Scan Item dialog's catalog check) now treats both forms as the same product; short PLU/manual codes are untouched. The POS search box also now says clearly when nothing matches, instead of just showing an empty results list.
+- **Multi-till networking** (`smartgrocer/netserver.py`, `netclient.py`, `till_config.py`, Network screen) - lets more than one cashier till (wired or Wi-Fi, doesn't matter which) share the exact same live product/stock/sales data instead of each till having its own separate, disconnected database file. One PC is the "Main Till" (keeps the real database, shares it); every other PC is a "Cashier Till" that connects to it instead of opening a database file of its own. Every existing screen and module works completely unchanged either way - `pos.py`, `staff.py`, every raw query in `screens.py` - because `netclient.RemoteConnection` makes a network connection to the Main Till look exactly like a normal database connection everywhere else in the code (see `netclient.py`'s docstring for why that's both simpler and safer than adding a network endpoint per feature one at a time). Protected by a pairing code and the same kind of self-signed-HTTPS setup as the Phone Scanner; each connected till gets its own database session so one till's in-progress sale doesn't leak into another's queries (backed by SQLite's WAL mode, also newly turned on in `db.py`). See "Setting up more than one till" below for how to actually connect a second PC.
 
 These were added because this system is meant for the shop's actual day-to-day operation, not only as a decision-support/analytics layer - the four analytics objectives from the proposal are still there underneath, but the POS itself now behaves like a till a cashier would use every day.
 
@@ -67,6 +68,9 @@ smartgrocer/
   receipts.py        printable per-sale receipt generation
   staff.py           cashier/admin accounts: add, reset PIN, deactivate
   mobile_scan.py     phone-as-barcode-scanner companion (local HTTP server + OpenCV decode)
+  netserver.py       multi-till server: exposes this PC's database to other cashier tills over the network
+  netclient.py       multi-till client: makes a remote till's database look like a local one everywhere else
+  till_config.py     this till's saved networking role (standalone / server / client)
   forecasting.py     SARIMA/SARIMAX/Holt-Winters/Seasonal Naive + model selection
   promotions.py      urgency scoring, tiered expiry alerts, discount suggestion
   association.py     Apriori from scratch, bundle recommendations
@@ -99,6 +103,45 @@ python main.py
 On first run it will ask whether to build the synthetic ~9-month demo
 dataset - say yes to see every screen populated immediately. Say no to start
 from a clean database when you're ready to enter your own shop's data.
+
+## Setting up more than one till
+
+By default every till is "Standalone" - exactly today's behavior, nothing
+changes unless you touch the Network screen. To add a second (or third...)
+cashier till so it shares the same live stock/sales data:
+
+1. **Pick one PC as the Main Till** - whichever one is least likely to be
+   switched off during the day (it keeps the real database). It needs
+   nothing extra - it's already running SmartGrocer normally.
+2. On the Main Till, open the **Network** screen (sidebar) and click
+   **"Share This Till's Data"**. It shows an address (like
+   `https://192.168.1.5:8790/`) and a 4-digit pairing code - leave this
+   screen open, or just remember the two values; they stay the same across
+   restarts.
+3. **Set up each additional PC exactly like the first one** - copy the
+   SmartGrocer folder to it, install Python + `pip install -r
+   requirements.txt` there too (see Setup above), but **don't** copy the
+   `data/` folder over - a Cashier Till doesn't keep its own database.
+4. On that PC, run `python main.py`, open the **Network** screen, click
+   **"Connect to Another Till"**, and enter the Main Till's address, port,
+   and pairing code from step 2. That till now shows and updates the exact
+   same products, stock, and sales as the Main Till, in real time.
+5. Both PCs need to be on the **same network** - the same shop Wi-Fi, or
+   plugged into the same router/switch by cable. It does not need to be
+   the internet; the two PCs just need to be able to reach each other.
+
+Notes:
+- The very first time a Cashier Till connects, Windows may ask to allow
+  the connection through the Firewall - allow it (it's the same private
+  network, not the internet).
+- If the Main Till is closed or loses network for a moment, a Cashier Till
+  falls back to a temporary local copy so the cashier isn't locked out -
+  but anything rung up during that time stays on that till only until it's
+  reconnected (there's no automatic merge of that fallback data yet, so
+  reconnect as soon as possible and treat that gap as something to
+  reconcile by hand, e.g. from that till's own receipts).
+- "Stop Sharing" (Main Till) or "Disconnect" (Cashier Till) on the Network
+  screen reverts to Standalone at any time.
 
 ## Running the tests
 

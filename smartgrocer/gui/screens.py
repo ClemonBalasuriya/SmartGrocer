@@ -19,6 +19,8 @@ from .. import receipts as receipts_module
 from .. import suppliers as suppliers_module
 from .. import staff as staff_module
 from .. import mobile_scan
+from .. import netclient
+from .. import netserver
 from .. import db as db_module
 from . import theme
 from .theme import tree_clear, tree_insert
@@ -535,6 +537,16 @@ class POSScreen(BaseScreen):
             stock = pos.get_stock_on_hand(self.conn, p["id"])
             tree_insert(self.results_tree, (p["code"], p["name_en"], f"{p['cash_price']:.2f}", f"{stock:.0f}"),
                         iid=str(p["id"]))
+        if not self._search_results:
+            # Previously this failed silently (an empty results box looks
+            # the same as "still typing") - spelling it out, and echoing
+            # back exactly what was searched for, makes a genuine
+            # code/name mismatch obvious immediately rather than the
+            # cashier assuming the scan just didn't register.
+            messagebox.showinfo("Not found", f"No product in the catalog matches '{query}'.\n\n"
+                                 "If you just added this item, check the Inventory screen's Code "
+                                 "column for the exact code that was saved and compare it with what "
+                                 "you're scanning/typing here - they must match exactly.")
 
     def add_selected_to_cart(self):
         sel = self.results_tree.selection()
@@ -1880,4 +1892,191 @@ class StaffScreen(BaseScreen):
             messagebox.showerror("Cannot deactivate", "You cannot deactivate the account you're currently logged in as.")
             return
         staff_module.set_active(self.conn, staff_id, not row["active"])
+        self.refresh()
+
+
+# --------------------------------------------------------------------------- #
+# Multi-till networking
+# --------------------------------------------------------------------------- #
+
+class NetworkScreen(BaseScreen):
+    """Connect more than one till to the same live data, wired or
+    wireless - one PC (the "Main Till") keeps the real database and shares
+    it over the shop's network; any other PC ("Cashier Till") connects to
+    it here instead of keeping its own separate copy. See netserver.py /
+    netclient.py for how the connection itself works; this screen is just
+    the on/off switch and pairing UI for it, in the same spirit as the
+    Phone Scanner dialog on the POS screen."""
+
+    def __init__(self, parent, app):
+        super().__init__(parent, app)
+        self.header("Network / Multi-Till")
+        self.hint = ctk.CTkLabel(
+            self, text="Connect more than one till to the same stock and sales data - wired Ethernet "
+                       "or Wi-Fi both work, this only cares that the tills are on the same network.",
+            font=ctk.CTkFont(size=12), text_color=theme.TEXT_MUTED, wraplength=760, justify="left",
+        )
+        self.hint.pack(anchor="w", padx=24, pady=(0, 10))
+
+        self.status_card = ctk.CTkFrame(self, fg_color=theme.CARD_BG_ALT, corner_radius=10)
+        self.status_card.pack(fill="x", padx=24, pady=(0, 14))
+        self.status_label = ctk.CTkLabel(
+            self.status_card, text="", font=ctk.CTkFont(size=14, weight="bold"),
+            text_color=theme.NAVY_DARK, justify="left", wraplength=700,
+        )
+        self.status_label.pack(anchor="w", padx=16, pady=(14, 4))
+        self.status_detail = ctk.CTkLabel(
+            self.status_card, text="", font=ctk.CTkFont(size=12), text_color=theme.TEXT_MUTED,
+            justify="left", wraplength=700,
+        )
+        self.status_detail.pack(anchor="w", padx=16, pady=(0, 14))
+
+        btn_row = ctk.CTkFrame(self, fg_color="transparent")
+        btn_row.pack(fill="x", padx=24)
+        self.share_btn = styled_button(btn_row, "Share This Till's Data", self.start_sharing, kind="primary")
+        self.share_btn.pack(side="left")
+        self.stop_share_btn = styled_button(btn_row, "Stop Sharing", self.stop_sharing, kind="danger")
+        self.stop_share_btn.pack(side="left", padx=8)
+        self.connect_btn = styled_button(btn_row, "Connect to Another Till", self.open_connect_dialog,
+                                          kind="secondary")
+        self.connect_btn.pack(side="left", padx=8)
+        self.disconnect_btn = styled_button(btn_row, "Disconnect (Use This PC's Own Data)",
+                                             self.disconnect, kind="danger")
+        self.disconnect_btn.pack(side="left", padx=8)
+
+        warning_card = ctk.CTkFrame(self, fg_color=theme.CARD_BG_ALT, corner_radius=8)
+        warning_card.pack(fill="x", padx=24, pady=(16, 0))
+        ctk.CTkLabel(
+            warning_card,
+            text="One till has to be the \"Main Till\" - the one whose database is the real one - and "
+                 "every other till connects to it as a \"Cashier Till\". Pick whichever PC is least "
+                 "likely to be turned off during the day. The first time another till connects, its "
+                 "browser/app will show a one-time \"connection not private\" warning, same as the "
+                 "phone-scanner feature - that's expected for a private shop network, not a problem.",
+            text_color=theme.TEXT_DARK, font=ctk.CTkFont(size=11), wraplength=740, justify="left",
+        ).pack(padx=14, pady=12)
+
+    def on_show(self):
+        self.refresh()
+
+    def refresh(self):
+        is_client = self.app.is_client_till()
+        server = self.app.net_server
+
+        if is_client:
+            host = self.app.till_config.get("server_host")
+            port = self.app.till_config.get("server_port")
+            reachable = self.app.conn.ping() if hasattr(self.app.conn, "ping") else False
+            self.status_label.configure(
+                text=f"Cashier Till - connected to {host}:{port}" + ("" if reachable else " (unreachable right now)")
+            )
+            self.status_detail.configure(
+                text="This till is using the Main Till's shared data. Disconnect to go back to a "
+                     "database that only this PC uses."
+                if reachable else
+                "Can't reach the Main Till right now - check it's turned on and both PCs are on the "
+                "same network. This till may be showing a temporary local fallback copy in the "
+                "meantime (see the warning shown when it lost the connection)."
+            )
+        elif server is not None and server.running:
+            self.status_label.configure(text="Main Till - sharing this PC's data")
+            self.status_detail.configure(
+                text=f"Address: {server.url}    Pairing code: {server.pairing_code}\n"
+                     f"Connected cashier tills right now: {server.connected_till_count}\n"
+                     "On each other till, open the Network screen -> \"Connect to Another Till\" and "
+                     "enter this PC's address and pairing code."
+            )
+        else:
+            self.status_label.configure(text="Standalone - this till's data isn't shared")
+            self.status_detail.configure(
+                text="This is the normal single-till setup: everything stays on this PC. Use "
+                     "\"Share This Till's Data\" to let other cashier tills connect to it, or "
+                     "\"Connect to Another Till\" if this PC should use another till's data instead."
+            )
+
+        self.share_btn.configure(state="disabled" if (is_client or (server and server.running)) else "normal")
+        self.stop_share_btn.configure(state="normal" if (server and server.running) else "disabled")
+        self.connect_btn.configure(state="disabled" if (is_client or (server and server.running)) else "normal")
+        self.disconnect_btn.configure(state="normal" if is_client else "disabled")
+
+    def start_sharing(self):
+        try:
+            self.app.start_sharing()
+        except OSError as e:
+            messagebox.showerror("Could not start sharing", str(e))
+            return
+        self.refresh()
+        messagebox.showinfo(
+            "Now sharing",
+            f"This till is now the Main Till.\n\nAddress: {self.app.net_server.url}\n"
+            f"Pairing code: {self.app.net_server.pairing_code}\n\n"
+            "Enter these on each other till's Network screen (\"Connect to Another Till\").",
+        )
+
+    def stop_sharing(self):
+        if self.app.net_server and self.app.net_server.connected_till_count > 0:
+            if not messagebox.askyesno(
+                "Cashier tills are connected",
+                f"{self.app.net_server.connected_till_count} other till(s) are currently using this "
+                "PC's data. Stopping sharing will disconnect them immediately - they won't be able to "
+                "ring up sales until reconnected. Stop sharing anyway?",
+            ):
+                return
+        self.app.stop_sharing()
+        self.refresh()
+
+    def open_connect_dialog(self):
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Connect to Another Till")
+        dialog.geometry("380x340")
+        dialog.configure(fg_color=theme.BG_LIGHT)
+        dialog.grab_set()
+
+        ctk.CTkLabel(
+            dialog, text="Enter the address and pairing code shown on the Main Till's Network screen:",
+            wraplength=340, justify="left",
+        ).pack(anchor="w", padx=16, pady=(16, 10))
+
+        ctk.CTkLabel(dialog, text="Main Till address (e.g. 192.168.1.5):").pack(anchor="w", padx=16)
+        host_var = tk.StringVar()
+        ctk.CTkEntry(dialog, textvariable=host_var).pack(fill="x", padx=16)
+
+        ctk.CTkLabel(dialog, text="Port (leave as shown on the Main Till):").pack(anchor="w", padx=16, pady=(10, 0))
+        port_var = tk.StringVar(value=str(netserver.DEFAULT_PORT))
+        ctk.CTkEntry(dialog, textvariable=port_var).pack(fill="x", padx=16)
+
+        ctk.CTkLabel(dialog, text="Pairing code:").pack(anchor="w", padx=16, pady=(10, 0))
+        code_var = tk.StringVar()
+        ctk.CTkEntry(dialog, textvariable=code_var).pack(fill="x", padx=16)
+
+        def connect():
+            host = host_var.get().strip()
+            if not host:
+                messagebox.showerror("Invalid input", "Enter the Main Till's address.")
+                return
+            try:
+                port = int(port_var.get().strip())
+            except ValueError:
+                messagebox.showerror("Invalid input", "Port must be a number.")
+                return
+            try:
+                self.app.connect_to_till(host, port, code_var.get().strip())
+            except netclient.RemoteError as e:
+                messagebox.showerror("Could not connect", str(e))
+                return
+            dialog.destroy()
+            self.refresh()
+            messagebox.showinfo("Connected", "This till is now using the Main Till's shared data.")
+
+        styled_button(dialog, "Connect", connect, kind="primary", width=140).pack(pady=18)
+
+    def disconnect(self):
+        if not messagebox.askyesno(
+            "Disconnect this till?",
+            "This till will go back to using a database that only this PC can see, starting empty "
+            "unless it had one before. Any sales made while connected stay on the Main Till - they "
+            "won't be copied here. Continue?",
+        ):
+            return
+        self.app.disconnect_from_till()
         self.refresh()

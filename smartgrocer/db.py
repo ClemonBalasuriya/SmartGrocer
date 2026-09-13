@@ -202,12 +202,25 @@ CREATE INDEX IF NOT EXISTS idx_creditsettlements_date ON credit_settlements(sett
 """
 
 
-def get_conn(db_path: Path | str = DEFAULT_DB_PATH) -> sqlite3.Connection:
+def get_conn(db_path: Path | str = DEFAULT_DB_PATH, *, check_same_thread: bool = True) -> sqlite3.Connection:
     db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(str(db_path), check_same_thread=check_same_thread)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # WAL lets one connection write while others keep reading committed data
+    # without blocking, instead of the whole file being locked for the
+    # duration of a transaction - needed now that more than one connection
+    # to this same file is normal: background report/forecast threads and
+    # the phone-scanner thread already each open their own connection, and
+    # a multi-till setup (netserver.py) gives each connected cashier till
+    # its own connection too. busy_timeout makes SQLite wait and retry for a
+    # few seconds if two connections do collide on a write, instead of
+    # failing immediately with "database is locked" - collisions should be
+    # rare given how short each POS transaction is, but a shop shouldn't see
+    # a cryptic error over an overlap of a few milliseconds.
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 8000")
     return conn
 
 
