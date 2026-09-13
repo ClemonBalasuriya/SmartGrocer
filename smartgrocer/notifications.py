@@ -31,6 +31,14 @@ difference:
 send() never raises - a notification failing to go out must never be
 allowed to block the action that triggered it (a PIN reset has to still
 succeed even if the Owner's inbox rejects the email).
+
+send() defaults to the Owner (owner_email/owner_phone above), but a caller
+can pass to_email/to_phone to message someone else instead - used when a
+cashier's own PIN is reset so THEY hear about it too (with their new PIN),
+not only the Owner (who instead gets a separate "who changed what" message
+naming the admin responsible). Either override still requires the same
+underlying email_enabled/Twilio configuration to be filled in - this only
+changes who a message goes to, not whether sending is turned on at all.
 """
 
 from __future__ import annotations
@@ -83,48 +91,80 @@ def save(config: dict) -> None:
     _CONFIG_PATH.write_text(json.dumps(merged, indent=2))
 
 
-def send(subject: str, message: str) -> list[str]:
+_UNSET = object()  # sentinel so send() can tell "not given at all" (use Owner) apart from
+                   # an explicit to_email=None/to_phone=None (this recipient has no
+                   # email/phone on file - skip just that channel, don't fall back to Owner)
+
+
+def send(subject: str, message: str, *, to_email=_UNSET, to_phone=_UNSET, debug: bool = False):
     """Best-effort fan-out to every channel that's actually configured.
     Returns the list of channels that reported success (e.g. ["email"]) -
     useful for a "test notification" button, but the caller should not
     treat an empty list as an error worth surfacing to whoever triggered
-    the underlying action."""
+    the underlying action (that's exactly why real exceptions are swallowed
+    here rather than raised - see the module docstring).
+
+    Sends to the Owner (owner_email/owner_phone) when to_email/to_phone
+    aren't passed at all; pass either explicitly (a string, or None to
+    deliberately skip that one channel) to message someone else instead -
+    see the module docstring.
+
+    debug=True additionally returns a list of (channel, reason) pairs for
+    everything that did NOT go out - both "not configured yet" reasons and
+    the actual exception from a real send attempt (e.g. a wrong Gmail app
+    password) - so a human troubleshooting setup can see exactly what's
+    wrong instead of a bare "nothing sent". Used only by the Notification
+    Settings "Save & Send Test" button; every other caller leaves this off
+    and gets back the plain list it always has."""
     config = load()
-    sent = []
+    sent: list[str] = []
+    errors: list[tuple[str, str]] = []
 
-    if config["email_enabled"] and config["smtp_user"] and config["smtp_app_password"] and config["owner_email"]:
-        try:
-            _send_email(config, subject, message)
-            sent.append("email")
-        except Exception:
-            pass
-
-    if config["twilio_account_sid"] and config["twilio_auth_token"] and config["owner_phone"]:
-        if config["twilio_from_sms"]:
+    email_target = config["owner_email"] if to_email is _UNSET else to_email
+    if email_target:
+        if not config["email_enabled"]:
+            errors.append(("email", 'Email is turned off - tick "Enable email notifications".'))
+        elif not (config["smtp_user"] and config["smtp_app_password"]):
+            errors.append(("email", "Sending Gmail address or app password is blank."))
+        else:
             try:
-                _send_twilio(config, config["twilio_from_sms"], config["owner_phone"], message)
-                sent.append("sms")
-            except Exception:
-                pass
-        if config["twilio_from_whatsapp"]:
-            try:
-                _send_twilio(config, config["twilio_from_whatsapp"], f"whatsapp:{config['owner_phone']}", message)
-                sent.append("whatsapp")
-            except Exception:
-                pass
+                _send_email(config, subject, message, email_target)
+                sent.append("email")
+            except Exception as e:
+                errors.append(("email", f"{type(e).__name__}: {e}"))
 
+    phone_target = config["owner_phone"] if to_phone is _UNSET else to_phone
+    if phone_target:
+        if not (config["twilio_account_sid"] and config["twilio_auth_token"]):
+            errors.append(("sms/whatsapp", "Twilio Account SID or Auth Token is blank."))
+        else:
+            if config["twilio_from_sms"]:
+                try:
+                    _send_twilio(config, config["twilio_from_sms"], phone_target, message)
+                    sent.append("sms")
+                except Exception as e:
+                    errors.append(("sms", f"{type(e).__name__}: {e}"))
+            if config["twilio_from_whatsapp"]:
+                try:
+                    _send_twilio(config, config["twilio_from_whatsapp"], f"whatsapp:{phone_target}", message)
+                    sent.append("whatsapp")
+                except Exception as e:
+                    errors.append(("whatsapp", f"{type(e).__name__}: {e}"))
+
+    if debug:
+        return sent, errors
     return sent
 
 
-def _send_email(config: dict, subject: str, message: str) -> None:
+def _send_email(config: dict, subject: str, message: str, to_addr: str) -> None:
     msg = MIMEText(message)
     msg["Subject"] = subject
     msg["From"] = config["smtp_user"]
-    msg["To"] = config["owner_email"]
+    msg["To"] = to_addr
     with smtplib.SMTP(config["smtp_host"], int(config["smtp_port"]), timeout=10) as server:
         server.starttls()
         server.login(config["smtp_user"], config["smtp_app_password"])
-        server.sendmail(config["smtp_user"], [config["owner_email"]], msg.as_string())
+        server.sendmail(config["smtp_user"], [to_addr], msg.as_string())
 
 
 def _send_twilio(config: dict, from_: str, to: str, message: str) -> None:

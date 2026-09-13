@@ -373,8 +373,9 @@ class SmartGrocerApp(ctk.CTk):
         dialog.grab_set()
 
         ctk.CTkLabel(
-            dialog, text="We'll email a new PIN to the address saved for this account. "
-                        "If none is saved, ask an Admin/Owner to reset it for you instead.",
+            dialog, text="We'll email a new PIN to the address saved for this account. If none is "
+                        "saved, ask an Admin/Owner to add one (Staff screen > Edit Contact Info), "
+                        "then try again - nobody, Owner included, can set your PIN for you directly.",
             wraplength=300, justify="left", text_color=theme.TEXT_MUTED, font=ctk.CTkFont(size=11),
         ).pack(anchor="w", padx=16, pady=(16, 10))
 
@@ -396,31 +397,40 @@ class SmartGrocerApp(ctk.CTk):
                 return
             if not row["email"] and not row["phone"]:
                 status_label.configure(
-                    text="No email or phone is saved for this account - ask an Admin/Owner to reset your PIN."
+                    text="No email or phone is saved for this account - ask an Admin/Owner to add one "
+                         "(Staff screen > Edit Contact Info), then try again."
                 )
                 return
             new_pin = staff_module.generate_temp_pin()
-            staff_module.update_pin(self.conn, row["id"], new_pin)
-            audit.record(
-                self.conn, actor_staff_id=row["id"], action="staff.pin_forgot_reset",
-                target_staff_id=row["id"], details="self-service forgot-PIN reset",
-            )
+            # Send BEFORE changing anything - if delivery fails, the PIN
+            # must stay exactly as it was, or this would lock the person
+            # out worse than before (a new PIN nobody, including them,
+            # actually knows). Only commit the change once we know it
+            # reached them.
             sent = notifications.send(
                 "SmartGrocer: your new PIN",
                 f"You requested a PIN reset for your SmartGrocer account. Your new PIN is: {new_pin}\n\n"
                 "If you didn't request this, tell the shop owner right away.",
                 to_email=row["email"] or None, to_phone=row["phone"] or None,
             )
+            if not sent:
+                status_label.configure(
+                    text="Couldn't send it - your PIN was NOT changed. Most likely the shop hasn't "
+                         "finished setting up email/SMS yet: ask an Admin/Owner to open Activity Log > "
+                         "Notification Settings and use \"Save & Send Test\" there, which shows the "
+                         "exact error (e.g. a wrong Gmail app password)."
+                )
+                return
+            staff_module.update_pin(self.conn, row["id"], new_pin)
+            audit.record(
+                self.conn, actor_staff_id=row["id"], action="staff.pin_forgot_reset",
+                target_staff_id=row["id"], details="self-service forgot-PIN reset",
+            )
             notifications.send(
                 "SmartGrocer: PIN reset via Forgot PIN",
                 f"{row['name']} ({row['role']}) used Forgot PIN to reset their own PIN.",
             )
-            if sent:
-                status_label.configure(text=f"Sent via: {', '.join(sent)}. Check your inbox/phone.")
-            else:
-                status_label.configure(
-                    text="Couldn't deliver it (email/SMS not set up or unreachable) - ask an Admin/Owner instead."
-                )
+            status_label.configure(text=f"Sent via: {', '.join(sent)}. Check your inbox/phone - your PIN is updated.")
 
         ctk.CTkButton(dialog, text="Send New PIN", command=send_reset, fg_color=theme.ACCENT_BLUE,
                       hover_color=theme.ACCENT_BLUE_HOVER).pack(pady=16)
@@ -428,10 +438,10 @@ class SmartGrocerApp(ctk.CTk):
     def open_change_my_pin_dialog(self):
         """Anyone currently logged in can change their OWN PIN here,
         without needing an Admin/Owner - they just have to know their
-        current one. Unlike Staff screen's Owner-only "Reset PIN" (which
-        changes someone ELSE's PIN with no old-PIN check), this always
-        acts on whoever is logged in right now, so it needs no role
-        check of its own."""
+        current one. This is one of only two ways a PIN ever changes now
+        (the other being "Forgot PIN?" above) - nobody, Owner included, can
+        set or see someone else's PIN directly. Always acts on whoever is
+        logged in right now, so it needs no role check of its own."""
         if not self.logged_in:
             messagebox.showwarning("Not logged in", "Log in first (sidebar) to change your PIN.")
             return
@@ -481,6 +491,19 @@ class SmartGrocerApp(ctk.CTk):
                 "SmartGrocer: PIN changed",
                 f"{row['role'].capitalize()} {row['name']} changed their own PIN.",
             )
+            # Also confirm it to the individual themselves, at whatever
+            # contact info THEY have on file - a standard "your password
+            # was just changed" security confirmation, separate from the
+            # Owner's copy above. No PIN value in it (they just typed it
+            # themselves and already know it).
+            target_email = row["email"] or None
+            target_phone = row["phone"] or None
+            if target_email or target_phone:
+                notifications.send(
+                    "SmartGrocer: your PIN was changed",
+                    "Your SmartGrocer PIN was just changed. If this wasn't you, contact the shop owner immediately.",
+                    to_email=target_email, to_phone=target_phone,
+                )
             dialog.destroy()
             messagebox.showinfo("PIN changed", "Your PIN has been updated.")
 

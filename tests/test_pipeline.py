@@ -324,12 +324,6 @@ def test_staff_add_reset_pin_and_deactivate():
     except ValueError:
         pass
 
-    # 'owner' is a valid third role (sees the Activity Log, on top of
-    # everything an admin can do) - who is ALLOWED to create one is a
-    # GUI-level policy decision (see StaffScreen), not enforced here.
-    owner_id = staff.add_staff(conn, "Shop Owner", "owner", "9090")
-    assert conn.execute("SELECT role FROM staff WHERE id=?", (owner_id,)).fetchone()["role"] == "owner"
-
     try:
         staff.add_staff(conn, "", "cashier", "1111")
         assert False, "should have rejected a blank name"
@@ -354,6 +348,94 @@ def test_staff_add_reset_pin_and_deactivate():
         assert False, "should have rejected a malformed email"
     except ValueError:
         pass
+
+
+def test_exactly_one_owner_seeded_by_default_never_two_never_deactivatable():
+    # A fresh database must come with exactly one Owner account already in
+    # it (PIN 1234, changeable via "Change My PIN") - the shop should never
+    # be in a state with zero Owners, and Admin/Cashier must keep their
+    # familiar ids (Admin=1) since a few places (this suite included) treat
+    # id 1 as "the default account" before anyone has logged in.
+    conn = _fresh_db()
+    admin_row = conn.execute("SELECT * FROM staff WHERE id=1").fetchone()
+    assert admin_row["name"] == "Admin" and admin_row["role"] == "admin"
+    owners = conn.execute("SELECT * FROM staff WHERE role='owner'").fetchall()
+    assert len(owners) == 1
+    assert owners[0]["pin"] == "1234"
+    owner_id = owners[0]["id"]
+
+    # Can't create a second Owner, even though 'owner' is otherwise a
+    # perfectly valid role value.
+    try:
+        staff.add_staff(conn, "Second Owner", "owner", "9999")
+        assert False, "should have rejected creating a second Owner"
+    except ValueError as e:
+        assert "already exists" in str(e)
+
+    # Can't deactivate the Owner account, unlike any other role.
+    try:
+        staff.set_active(conn, owner_id, False)
+        assert False, "should have rejected deactivating the Owner"
+    except ValueError:
+        pass
+    assert conn.execute("SELECT active FROM staff WHERE id=?", (owner_id,)).fetchone()["active"] == 1
+
+    # An ordinary admin/cashier can still be deactivated as normal.
+    cashier_id = staff.add_staff(conn, "Ordinary Cashier", "cashier", "5555")
+    staff.set_active(conn, cashier_id, False)
+    assert conn.execute("SELECT active FROM staff WHERE id=?", (cashier_id,)).fetchone()["active"] == 0
+
+
+def test_update_contact_sets_and_clears_email_phone_without_touching_pin():
+    conn = _fresh_db()
+    sid = staff.add_staff(conn, "Clemon", "cashier", "12345")
+    before_pin = conn.execute("SELECT pin FROM staff WHERE id=?", (sid,)).fetchone()["pin"]
+
+    staff.update_contact(conn, sid, "clemon@example.com", "+94771111111")
+    row = conn.execute("SELECT * FROM staff WHERE id=?", (sid,)).fetchone()
+    assert row["email"] == "clemon@example.com"
+    assert row["phone"] == "+94771111111"
+    assert row["pin"] == before_pin  # never touched by this
+
+    # Blanking both fields clears them to NULL, not empty strings.
+    staff.update_contact(conn, sid, "", "")
+    cleared = conn.execute("SELECT * FROM staff WHERE id=?", (sid,)).fetchone()
+    assert cleared["email"] is None and cleared["phone"] is None
+
+    try:
+        staff.update_contact(conn, sid, "not-an-email", "")
+        assert False, "expected ValueError for malformed email"
+    except ValueError:
+        pass
+
+
+def test_notifications_debug_mode_reports_why_nothing_was_sent():
+    from smartgrocer import notifications
+
+    # Nothing configured at all and no recipient given -> no errors either,
+    # since there was nothing to even attempt (matches the plain, non-debug
+    # behavior of returning an empty list quietly).
+    notifications.save(dict(notifications._DEFAULT))
+    sent, errors = notifications.send("Test", "hello", debug=True)
+    assert sent == [] and errors == []
+
+    # A recipient IS given (as gui/app.py's Forgot PIN does) but email is
+    # disabled - must explain why, not just fail silently.
+    sent, errors = notifications.send("Test", "hello", to_email="cashier@example.com", debug=True)
+    assert sent == []
+    assert any(ch == "email" for ch, _ in errors)
+
+    # Enabled but pointed at nothing listening - the real exception text
+    # should come back, not just "email" with no explanation.
+    cfg = dict(notifications._DEFAULT)
+    cfg.update(email_enabled=True, smtp_host="127.0.0.1", smtp_port=1,
+               smtp_user="shop@example.com", smtp_app_password="x", owner_email="owner@example.com")
+    notifications.save(cfg)
+    sent, errors = notifications.send("Test", "hello", debug=True)
+    assert sent == []
+    assert len(errors) == 1 and errors[0][0] == "email" and errors[0][1]  # non-empty reason string
+
+    notifications.save(dict(notifications._DEFAULT))
 
 
 def test_generate_temp_pin_is_numeric_and_varies():

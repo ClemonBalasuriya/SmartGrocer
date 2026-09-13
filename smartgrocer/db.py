@@ -73,7 +73,10 @@ CREATE TABLE IF NOT EXISTS staff (
     name    TEXT NOT NULL,
     role    TEXT NOT NULL DEFAULT 'cashier',    -- 'owner' | 'admin' | 'cashier'
     pin     TEXT NOT NULL DEFAULT '0000',
-    active  INTEGER NOT NULL DEFAULT 1          -- 0 = deactivated (kept for invoice history, hidden from login)
+    active  INTEGER NOT NULL DEFAULT 1,         -- 0 = deactivated (kept for invoice history, hidden from login)
+    email   TEXT,                               -- optional - lets notifications.py email THIS person directly
+                                                 -- (e.g. "your PIN was changed"), not just the shop Owner
+    phone   TEXT                                -- optional - same idea for SMS/WhatsApp, needs Twilio configured
 );
 
 -- Every sensitive staff/account action (added, PIN reset, activated,
@@ -254,19 +257,38 @@ def _migrate(conn: sqlite3.Connection) -> None:
     staff_cols = {r["name"] for r in conn.execute("PRAGMA table_info(staff)")}
     if "active" not in staff_cols:
         conn.execute("ALTER TABLE staff ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
+    if "email" not in staff_cols:
+        conn.execute("ALTER TABLE staff ADD COLUMN email TEXT")
+    if "phone" not in staff_cols:
+        conn.execute("ALTER TABLE staff ADD COLUMN phone TEXT")
     conn.commit()
 
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    is_fresh_install = conn.execute("SELECT COUNT(*) c FROM staff").fetchone()["c"] == 0
     _migrate(conn)
-    if conn.execute("SELECT COUNT(*) c FROM staff").fetchone()["c"] == 0:
+    if is_fresh_install:
+        # Admin first, so it keeps id=1 (a few places, tests included, take
+        # that as "the default account" before anyone has logged in) -
+        # Owner is seeded separately below, after this, so it doesn't
+        # shift that.
         conn.execute(
             "INSERT INTO staff (name, role, pin) VALUES (?,?,?)", ("Admin", "admin", "1234")
         )
         conn.execute(
             "INSERT INTO staff (name, role, pin) VALUES (?,?,?)", ("Cashier", "cashier", "0000")
         )
+    # Exactly one Owner account must always exist (staff.py refuses to ever
+    # create a second one, or to deactivate this one) - add the default
+    # one, PIN 1234, the first time this runs against a database that
+    # doesn't have one yet, fresh install or an existing shop's database
+    # upgrading in place. Only ever adds one if none exists at all, so an
+    # Owner someone already created (with whatever PIN they chose) is
+    # never touched or duplicated.
+    if conn.execute("SELECT 1 FROM staff WHERE role='owner' LIMIT 1").fetchone() is None:
+        conn.execute("INSERT INTO staff (name, role, pin) VALUES (?,?,?)", ("Owner", "owner", "1234"))
+        conn.commit()
     if conn.execute("SELECT COUNT(*) c FROM customers").fetchone()["c"] == 0:
         conn.execute(
             "INSERT INTO customers (name, phone, credit_limit) VALUES (?,?,?)",

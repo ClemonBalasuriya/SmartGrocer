@@ -1924,23 +1924,32 @@ class SuppliersScreen(BaseScreen):
 # --------------------------------------------------------------------------- #
 
 class StaffScreen(BaseScreen):
-    """Add cashiers/admins/owners and set their login PIN, without needing a
-    developer to reach into the database by hand every time someone new
-    joins the till. Everyone can see the list, since a cashier glancing at
-    who's on shift is harmless. Adding staff or activating/deactivating
-    someone needs Admin or Owner; resetting a PIN is Owner-only - a PIN is
-    how every account is protected, so only the Owner can hand out a new
-    one, rather than any Admin being able to lock a cashier out (or back
-    in) of their own account.
+    """Add cashiers/admins and set them up, without needing a developer to
+    reach into the database by hand every time someone new joins the till.
+    Everyone can see the list, since a cashier glancing at who's on shift is
+    harmless. Adding staff, editing someone's saved contact info, or
+    activating/deactivating someone needs Admin or Owner.
 
-    Every sensitive change made here (adding staff, resetting a PIN,
+    Nobody manages anyone else's PIN here anymore - not even the Owner.
+    Every account only ever changes its OWN PIN, either directly ("Change
+    My PIN" in the sidebar) or via a random one emailed/texted to itself if
+    forgotten ("Forgot PIN?" on the Login screen) - see staff.py's module
+    docstring for why a "reset someone else's PIN" feature was removed
+    (an Admin/Owner being able to silently hand themselves access to any
+    account was exactly the kind of thing worth not having at all). What
+    THIS screen's "Edit Contact Info" is for: making sure someone actually
+    HAS an email/phone on file, so Forgot PIN has somewhere to send their
+    reset to if they ever need it.
+
+    There is exactly one Owner account, always - db.py seeds it
+    automatically, staff.add_staff refuses to create a second one, and
+    staff.set_active refuses to deactivate it, so it can never be created,
+    duplicated, or removed from here.
+
+    Every sensitive change made here (adding staff, editing contact info,
     activating/deactivating) is written to the Activity Log (audit.py) with
     who did it, and a best-effort notification (notifications.py) is sent
-    to the Owner so nothing has to be discovered after the fact. Adding
-    staff or resetting a PIN also messages that PERSON directly (their new
-    PIN, by email/SMS/WhatsApp) if they have an email or phone on file -
-    the Owner's notification says who made the change, theirs tells them
-    what changed and what their new PIN is."""
+    to the Owner so nothing has to be discovered after the fact."""
 
     def __init__(self, parent, app):
         super().__init__(parent, app)
@@ -1962,8 +1971,8 @@ class StaffScreen(BaseScreen):
             row=0, column=0, sticky="ew", padx=(0, 4))
         self.add_btn = styled_button(top, "Add Staff", self.open_add_dialog, kind="primary")
         self.add_btn.grid(row=0, column=1, sticky="ew", padx=4)
-        self.pin_btn = styled_button(top, "Reset PIN", self.open_reset_pin_dialog, kind="secondary")
-        self.pin_btn.grid(row=0, column=2, sticky="ew", padx=4)
+        self.contact_btn = styled_button(top, "Edit Contact Info", self.open_edit_contact_dialog, kind="secondary")
+        self.contact_btn.grid(row=0, column=2, sticky="ew", padx=4)
         self.toggle_btn = styled_button(top, "Activate / Deactivate", self.toggle_active, kind="danger")
         self.toggle_btn.grid(row=0, column=3, sticky="ew", padx=(4, 0))
 
@@ -1990,12 +1999,6 @@ class StaffScreen(BaseScreen):
         privileges, so anywhere Admin can manage staff, Owner can too."""
         return self._current_role() in ("admin", "owner")
 
-    def _is_owner(self) -> bool:
-        return self._current_role() == "owner"
-
-    def _any_owner_exists(self) -> bool:
-        return self.conn.execute("SELECT 1 FROM staff WHERE role='owner' LIMIT 1").fetchone() is not None
-
     def _actor_label(self) -> str:
         row = self.conn.execute(
             "SELECT name, role FROM staff WHERE id=?", (self.app.current_staff_id,)
@@ -2006,19 +2009,15 @@ class StaffScreen(BaseScreen):
 
     def refresh(self):
         is_admin = self._is_admin()
-        is_owner = self._is_owner()
-        if is_owner:
-            hint_text = "Logged in as Owner - you can add staff, reset PINs, or deactivate someone below."
-        elif is_admin:
-            hint_text = ("Logged in as Admin - you can add staff or deactivate someone below. "
-                         "Only the Owner can reset a PIN.")
-        else:
-            hint_text = ("Only Admin/Owner can add staff or deactivate someone (Owner-only for PIN resets) - "
-                        "log in from the sidebar first. Anyone can view this list.")
-        self.hint.configure(text=hint_text)
-        self.add_btn.configure(state="normal" if is_admin else "disabled")
-        self.toggle_btn.configure(state="normal" if is_admin else "disabled")
-        self.pin_btn.configure(state="normal" if is_owner else "disabled")
+        self.hint.configure(
+            text="Logged in as " + ("Owner" if self._current_role() == "owner" else "Admin")
+            + " - you can add staff, edit contact info, or deactivate someone below."
+            if is_admin else
+            "Only Admin/Owner can add staff, edit contact info, or deactivate someone - "
+            "log in from the sidebar first. Anyone can view this list."
+        )
+        for btn in (self.add_btn, self.contact_btn, self.toggle_btn):
+            btn.configure(state="normal" if is_admin else "disabled")
         tree_clear(self.tree)
         for s in staff_module.list_staff(self.conn):
             tree_insert(
@@ -2033,23 +2032,13 @@ class StaffScreen(BaseScreen):
         messagebox.showwarning("Admin required", "Log in as Admin or Owner (sidebar) to manage staff.")
         return False
 
-    def _require_owner(self) -> bool:
-        if self._is_owner():
-            return True
-        messagebox.showwarning("Owner required", "Only the Owner can reset a PIN - log in as Owner (sidebar).")
-        return False
-
     def open_add_dialog(self):
         if not self._require_admin():
             return
-        # Only an existing Owner can create another Owner - unless there is
-        # no Owner account anywhere yet, in which case anyone with Admin
-        # rights can bootstrap the very first one. This stops a compromised
-        # or dishonest Admin from quietly promoting themselves once a real
-        # Owner already exists.
-        can_offer_owner = self._is_owner() or not self._any_owner_exists()
-        role_choices = ["cashier", "admin", "owner"] if can_offer_owner else ["cashier", "admin"]
-
+        # "owner" is never offered here - there is exactly one Owner
+        # account for the whole shop, seeded automatically (db.py), and
+        # staff.add_staff refuses to create a second one even if this
+        # dropdown were somehow bypassed.
         dialog = ctk.CTkToplevel(self)
         dialog.title("Add Staff")
         dialog.geometry("360x460")
@@ -2062,19 +2051,14 @@ class StaffScreen(BaseScreen):
 
         ctk.CTkLabel(dialog, text="Role:").pack(anchor="w", padx=16, pady=(12, 0))
         role_var = tk.StringVar(value="cashier")
-        ctk.CTkOptionMenu(dialog, values=role_choices, variable=role_var, width=300).pack(padx=16)
-        if not can_offer_owner:
-            ctk.CTkLabel(
-                dialog, text="Only an existing Owner can create another Owner account.",
-                font=ctk.CTkFont(size=10), text_color=theme.TEXT_MUTED, wraplength=300,
-            ).pack(anchor="w", padx=16, pady=(2, 0))
+        ctk.CTkOptionMenu(dialog, values=["cashier", "admin"], variable=role_var, width=300).pack(padx=16)
 
         ctk.CTkLabel(dialog, text="PIN (numbers, used to log in at the till):").pack(
             anchor="w", padx=16, pady=(12, 0))
         pin_var = tk.StringVar()
         ctk.CTkEntry(dialog, textvariable=pin_var, width=300).pack(padx=16)
 
-        ctk.CTkLabel(dialog, text="Email (optional - lets us tell them their PIN directly):").pack(
+        ctk.CTkLabel(dialog, text="Email (optional - needed for them to use \"Forgot PIN?\" later):").pack(
             anchor="w", padx=16, pady=(12, 0))
         email_var = tk.StringVar()
         ctk.CTkEntry(dialog, textvariable=email_var, width=300).pack(padx=16)
@@ -2086,11 +2070,6 @@ class StaffScreen(BaseScreen):
 
         def save():
             role = role_var.get()
-            if role == "owner" and not can_offer_owner:
-                # Defensive - shouldn't be reachable since "owner" isn't
-                # even offered in this case, but never trust client state.
-                messagebox.showerror("Not allowed", "Only an existing Owner can create another Owner.")
-                return
             pin_saved = pin_var.get().strip()
             try:
                 new_id = staff_module.add_staff(
@@ -2115,7 +2094,8 @@ class StaffScreen(BaseScreen):
                 notifications.send(
                     "SmartGrocer: welcome",
                     f"You've been added to SmartGrocer as {role} by {self._actor_label()}. "
-                    f"Your login PIN is: {pin_saved}",
+                    f"Your login PIN is: {pin_saved}\n\n"
+                    "You can change this PIN yourself any time from the sidebar's \"Change My PIN\".",
                     to_email=target_email, to_phone=target_phone,
                 )
             dialog.destroy()
@@ -2123,59 +2103,74 @@ class StaffScreen(BaseScreen):
 
         styled_button(dialog, "Save", save, kind="primary", width=140).pack(pady=20)
 
-    def open_reset_pin_dialog(self):
-        if not self._require_owner():
+    def open_edit_contact_dialog(self):
+        """Lets an Admin/Owner add or correct the email/phone saved for
+        someone else - never their PIN. The main reason to use this: a
+        cashier who was added without an email/phone has no way to use
+        "Forgot PIN?" if they're ever locked out - this gives them one for
+        next time. It does not change anyone's PIN by itself."""
+        if not self._require_admin():
             return
         sel = self.tree.selection()
         if not sel:
             messagebox.showwarning("No staff selected", "Select a staff member first.")
             return
         staff_id = int(sel[0])
-        target = self.conn.execute("SELECT name, email, phone FROM staff WHERE id=?", (staff_id,)).fetchone()
-        target_name = target["name"] if target else f"staff#{staff_id}"
-        target_email = (target["email"] if target else None) or None
-        target_phone = (target["phone"] if target else None) or None
+        row = self.conn.execute("SELECT * FROM staff WHERE id=?", (staff_id,)).fetchone()
+        if row is None:
+            return
 
         dialog = ctk.CTkToplevel(self)
-        dialog.title("Reset PIN")
-        dialog.geometry("320x180")
+        dialog.title(f"Edit Contact Info - {row['name']}")
+        dialog.geometry("360x260")
         dialog.configure(fg_color=theme.BG_LIGHT)
         dialog.grab_set()
 
-        ctk.CTkLabel(dialog, text="New PIN:").pack(anchor="w", padx=16, pady=(16, 0))
-        pin_var = tk.StringVar()
-        ctk.CTkEntry(dialog, textvariable=pin_var, width=280).pack(padx=16)
+        ctk.CTkLabel(dialog, text="Email:").pack(anchor="w", padx=16, pady=(16, 0))
+        email_var = tk.StringVar(value=row["email"] or "")
+        ctk.CTkEntry(dialog, textvariable=email_var, width=300).pack(padx=16)
+
+        ctk.CTkLabel(dialog, text="Phone:").pack(anchor="w", padx=16, pady=(12, 0))
+        phone_var = tk.StringVar(value=row["phone"] or "")
+        ctk.CTkEntry(dialog, textvariable=phone_var, width=300).pack(padx=16)
+
+        ctk.CTkLabel(
+            dialog, text="This doesn't change their PIN - only they can do that, themselves, from "
+                        "\"Change My PIN\" or \"Forgot PIN?\".",
+            font=ctk.CTkFont(size=10), text_color=theme.TEXT_MUTED, wraplength=320, justify="left",
+        ).pack(anchor="w", padx=16, pady=(12, 0))
 
         def save():
-            new_pin = pin_var.get().strip()
+            new_email = email_var.get().strip() or None
+            new_phone = phone_var.get().strip() or None
             try:
-                staff_module.update_pin(self.conn, staff_id, new_pin)
+                staff_module.update_contact(self.conn, staff_id, email_var.get(), phone_var.get())
             except ValueError as e:
-                messagebox.showerror("Cannot update PIN", str(e))
+                messagebox.showerror("Cannot save", str(e))
                 return
             audit.record(
-                self.conn, actor_staff_id=self.app.current_staff_id, action="staff.pin_reset",
+                self.conn, actor_staff_id=self.app.current_staff_id, action="staff.edit_contact",
                 target_staff_id=staff_id,
             )
-            # Two different messages: the Owner's own copy says WHO changed
-            # it (there's only one Owner, so this is really a self-record,
-            # but it still lands in their inbox/phone as a live alert); the
-            # target's copy says WHAT changed and gives them the new PIN.
             notifications.send(
-                "SmartGrocer: PIN changed",
-                f"{self._actor_label()} changed the PIN for {target_name}.",
+                "SmartGrocer: contact info edited",
+                f"{self._actor_label()} edited the saved contact info for {row['name']}.",
             )
-            if target_email or target_phone:
+            # Confirm it TO that person too, at whichever address/number is
+            # now on file - so a change they didn't make or expect (not
+            # just a PIN change) still reaches them directly, not only the
+            # Owner's "who did what" copy above.
+            if new_email or new_phone:
                 notifications.send(
-                    "SmartGrocer: your PIN was changed",
-                    f"Your SmartGrocer PIN was changed by {self._actor_label()}. Your new PIN is: {new_pin}\n\n"
-                    "If you didn't expect this, tell the shop owner.",
-                    to_email=target_email, to_phone=target_phone,
+                    "SmartGrocer: your contact info was updated",
+                    f"Your saved email/phone for SmartGrocer was updated by {self._actor_label()}.\n\n"
+                    "If you didn't expect this, contact the shop owner.",
+                    to_email=new_email, to_phone=new_phone,
                 )
             dialog.destroy()
-            messagebox.showinfo("PIN updated", "The PIN has been changed.")
+            self.refresh()
 
-        styled_button(dialog, "Save", save, kind="primary", width=140).pack(pady=16)
+        styled_button(dialog, "Save", save, kind="primary", width=140).pack(pady=18)
 
     def toggle_active(self):
         if not self._require_admin():
@@ -2192,16 +2187,36 @@ class StaffScreen(BaseScreen):
             messagebox.showerror("Cannot deactivate", "You cannot deactivate the account you're currently logged in as.")
             return
         new_active = not row["active"]
-        staff_module.set_active(self.conn, staff_id, new_active)
+        try:
+            staff_module.set_active(self.conn, staff_id, new_active)
+        except ValueError as e:
+            # e.g. "The Owner account cannot be deactivated" - there is
+            # exactly one Owner, always, and this is enforced in staff.py
+            # itself (not just by disabling a button), so this is the real
+            # backstop, not just UI dressing.
+            messagebox.showerror("Cannot deactivate", str(e))
+            return
         audit.record(
             self.conn, actor_staff_id=self.app.current_staff_id,
             action="staff.activate" if new_active else "staff.deactivate",
             target_staff_id=staff_id,
         )
-        notifications.send(
-            f"SmartGrocer: staff {'activated' if new_active else 'deactivated'}",
-            f"{self._actor_label()} {'activated' if new_active else 'deactivated'} {row['name']}.",
-        )
+        verb = "activated" if new_active else "deactivated"
+        # Owner's copy: who did it, to whom. The affected person's own copy
+        # (only if they have contact info on file): what changed to THEIR
+        # account - matching how every other account-affecting action here
+        # (add, contact edit) also messages the individual, not just the
+        # Owner.
+        notifications.send(f"SmartGrocer: staff {verb}", f"{self._actor_label()} {verb} {row['name']}.")
+        target_email = row["email"] or None
+        target_phone = row["phone"] or None
+        if target_email or target_phone:
+            notifications.send(
+                f"SmartGrocer: your account was {verb}",
+                f"Your SmartGrocer account was {verb} by {self._actor_label()}.\n\n"
+                "If you didn't expect this, contact the shop owner.",
+                to_email=target_email, to_phone=target_phone,
+            )
         self.refresh()
 
 
@@ -2409,9 +2424,10 @@ class ActivityLogScreen(BaseScreen):
     COLUMNS = ["When", "Who", "Role", "Action", "Target", "Details"]
     ACTION_LABELS = {
         "staff.add": "Added staff",
-        "staff.pin_reset": "Reset PIN",
+        "staff.pin_reset": "Reset PIN",  # historical - this action is no longer generated (see staff.py)
         "staff.pin_self_change": "Changed own PIN",
         "staff.pin_forgot_reset": "Reset PIN (forgot)",
+        "staff.edit_contact": "Edited contact info",
         "staff.activate": "Activated staff",
         "staff.deactivate": "Deactivated staff",
         "product.edit": "Edited item",
@@ -2539,7 +2555,10 @@ class ActivityLogScreen(BaseScreen):
         from_wa_var = field("Twilio WhatsApp sender (e.g. whatsapp:+14155238886):", "twilio_from_whatsapp")
         owner_phone_var = field("Owner's phone (receives SMS/WhatsApp, e.g. +94771234567):", "owner_phone")
 
-        status_label = ctk.CTkLabel(scroll, text="", font=ctk.CTkFont(size=11), text_color=theme.TEXT_MUTED)
+        status_label = ctk.CTkLabel(
+            scroll, text="", font=ctk.CTkFont(size=11), text_color=theme.TEXT_MUTED,
+            wraplength=400, justify="left",
+        )
         status_label.pack(anchor="w", padx=12, pady=(10, 0))
 
         def collect() -> dict:
@@ -2563,14 +2582,28 @@ class ActivityLogScreen(BaseScreen):
 
         def send_test():
             notifications.save(collect())
-            sent = notifications.send("SmartGrocer: test notification", "This is a test notification from SmartGrocer.")
-            if sent:
+            sent, errors = notifications.send(
+                "SmartGrocer: test notification", "This is a test notification from SmartGrocer.", debug=True,
+            )
+            if sent and not errors:
                 status_label.configure(text=f"Saved and sent via: {', '.join(sent)}", text_color=theme.TEXT_MUTED)
-            else:
+            elif sent:
                 status_label.configure(
-                    text="Saved, but nothing sent - check the settings above are filled in and correct.",
+                    text=f"Saved. Sent via: {', '.join(sent)}. Also failed: "
+                         + "; ".join(f"{ch} - {why}" for ch, why in errors),
                     text_color=theme.TEXT_MUTED,
                 )
+            else:
+                # Real reasons, not a bare "didn't work" - e.g. Gmail
+                # rejecting the app password, so it's fixable without
+                # guessing. Every other place in the app that sends a
+                # notification deliberately hides this detail (a
+                # notification failing must never block the action that
+                # triggered it) - here, on this settings screen, showing it
+                # is the whole point.
+                reason = "; ".join(f"{ch}: {why}" for ch, why in errors) if errors else \
+                    "Nothing is filled in above yet."
+                status_label.configure(text=f"Saved, but nothing sent - {reason}", text_color=theme.TEXT_MUTED)
 
         btn_row = ctk.CTkFrame(scroll, fg_color="transparent")
         btn_row.pack(fill="x", padx=12, pady=16)
