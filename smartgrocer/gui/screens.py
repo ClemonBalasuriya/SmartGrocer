@@ -311,13 +311,22 @@ class POSScreen(BaseScreen):
         self.quick_items_frame.pack(fill="x", padx=24, pady=(2, 6))
         self.tier_var.trace_add("write", lambda *a: self._refresh_quick_items())
 
+        # fill="both" WITHOUT expand=True: inside a CTkScrollableFrame,
+        # "expand" fights with the scrollbar's own idea of how tall the
+        # content is (the inner frame tries to stretch to match the
+        # visible viewport instead of its natural content size), which
+        # silently breaks scrolling to anything below it - the results-box
+        # sizing bug's sibling. Giving the cart a fixed, generous row
+        # count (with its own internal scrollbar for a long basket) keeps
+        # its height predictable instead.
         cart_frame = ctk.CTkFrame(body, fg_color="transparent")
-        cart_frame.pack(fill="both", expand=True, padx=24, pady=(6, 0))
+        cart_frame.pack(fill="both", padx=24, pady=(6, 0))
         self.cart_tree = make_treeview(
             cart_frame, ["Item", "Qty", "Unit Price", "Line Total"],
             {"Item": 320, "Qty": 80, "Unit Price": 100, "Line Total": 110},
+            rows=10,
         )
-        self.cart_tree.master_frame.pack(fill="both", expand=True)
+        self.cart_tree.master_frame.pack(fill="both")
 
         bottom = ctk.CTkFrame(body, fg_color="transparent")
         bottom.pack(fill="x", padx=24, pady=(4, 0))
@@ -437,11 +446,19 @@ class POSScreen(BaseScreen):
 
         dialog = ctk.CTkToplevel(self)
         dialog.title("Phone Scanner")
-        dialog.geometry("380x560")
+        dialog.geometry("400x700")
         dialog.configure(fg_color=theme.BG_LIGHT)
         dialog.grab_set()
 
-        ctk.CTkLabel(dialog, text="Scan this with your phone's camera app", font=ctk.CTkFont(size=13, weight="bold"),
+        # Scrollable, same reasoning as the POS screen itself: this has a
+        # fair amount stacked vertically (QR code, address, pairing code,
+        # two blocks of instructions) and a resizable Toplevel is easy to
+        # leave too short on a smaller screen with nothing below the fold
+        # reachable otherwise.
+        body = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
+        body.pack(fill="both", expand=True)
+
+        ctk.CTkLabel(body, text="Scan this with your phone's camera app", font=ctk.CTkFont(size=13, weight="bold"),
                      text_color=theme.NAVY_DARK).pack(pady=(16, 6))
 
         try:
@@ -450,25 +467,40 @@ class POSScreen(BaseScreen):
             png_bytes = mobile_scan.generate_qr_png_bytes(server.url)
             qr_img = Image.open(io.BytesIO(png_bytes))
             ctk_qr = ctk.CTkImage(light_image=qr_img, dark_image=qr_img, size=(220, 220))
-            ctk.CTkLabel(dialog, image=ctk_qr, text="").pack(pady=6)
+            ctk.CTkLabel(body, image=ctk_qr, text="").pack(pady=6)
         except Exception:
             pass  # the URL/code below still work even if the QR image can't be rendered here
 
-        ctk.CTkLabel(dialog, text="or open this address in the phone's browser:",
+        ctk.CTkLabel(body, text="or open this address in the phone's browser:",
                      text_color=theme.TEXT_MUTED, font=ctk.CTkFont(size=11)).pack(pady=(6, 0))
-        ctk.CTkLabel(dialog, text=server.url, font=ctk.CTkFont(size=13, weight="bold"),
+        ctk.CTkLabel(body, text=server.url, font=ctk.CTkFont(size=13, weight="bold"),
                      text_color=theme.ACCENT_BLUE).pack(pady=(0, 12))
 
-        ctk.CTkLabel(dialog, text="Then enter this pairing code once on the phone:",
+        ctk.CTkLabel(body, text="Then enter this pairing code once on the phone:",
                      text_color=theme.TEXT_MUTED, font=ctk.CTkFont(size=11)).pack()
-        ctk.CTkLabel(dialog, text=server.pairing_code, font=ctk.CTkFont(size=30, weight="bold"),
+        ctk.CTkLabel(body, text=server.pairing_code, font=ctk.CTkFont(size=30, weight="bold"),
                      text_color=theme.NAVY_DARK).pack(pady=(2, 14))
 
+        warning_card = ctk.CTkFrame(body, fg_color=theme.CARD_BG_ALT, corner_radius=8)
+        warning_card.pack(fill="x", padx=20, pady=(0, 10))
         ctk.CTkLabel(
-            dialog,
-            text="Both devices must be on the same Wi-Fi. Scans keep landing in this "
-                 "cart even while this window is closed - close it and keep ringing up "
-                 "items on the till at the same time.",
+            warning_card,
+            text="The FIRST time you open that address, the phone will warn "
+                 "\"Connection not private\" / \"Not Secure\" - that's expected, not a "
+                 "problem: it's this PC talking to your phone directly, not the "
+                 "internet. On Android/Chrome tap Advanced, then \"Proceed\". On "
+                 "iPhone/Safari tap Show Details, then \"visit this website\". You "
+                 "only need to do this once per phone.",
+            text_color=theme.TEXT_DARK, font=ctk.CTkFont(size=11), wraplength=320, justify="left",
+        ).pack(padx=12, pady=10)
+
+        ctk.CTkLabel(
+            body,
+            text="Both devices must be on the same Wi-Fi. Once connected, point the "
+                 "camera at items - they're added automatically, no need to tap "
+                 "anything per item. Scans keep landing in this cart even while this "
+                 "window is closed - close it and keep ringing up items on the till "
+                 "at the same time.",
             text_color=theme.TEXT_MUTED, font=ctk.CTkFont(size=11), wraplength=320, justify="left",
         ).pack(padx=20, pady=(0, 14))
 

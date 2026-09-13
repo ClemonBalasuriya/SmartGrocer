@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import base64
 import http.client
 import json
+import ssl
 
 from smartgrocer import (
     association, cash_drawer, customers, data_generator, db, forecasting, layout, mobile_scan, pos,
@@ -314,11 +315,15 @@ def test_staff_add_reset_pin_and_deactivate():
 
 def test_mobile_scan_server_end_to_end():
     # Exercises the phone-scanner companion the same way a real phone
-    # would: a plain HTTP POST carrying a photo, decoded server-side.
-    # Uses a self-generated QR code as the "photo" (OpenCV can't generate
-    # a 1D barcode to test against, but the decode path is identical
-    # either way - see mobile_scan._decode_code) to keep this test free of
-    # any external test-image file.
+    # would once it has clicked through the self-signed certificate
+    # warning: an HTTPS POST carrying a photo, decoded server-side. Uses a
+    # self-generated QR code as the "photo" (OpenCV can't generate a 1D
+    # barcode to test against, but the decode path is identical either way
+    # - see mobile_scan._decode_code) to keep this test free of any
+    # external test-image file. The client context below mirrors what a
+    # phone's browser does after accepting the "not private" warning - it
+    # doesn't verify the certificate, since there's no real CA behind a
+    # private shop network's self-signed one.
     conn = _fresh_db()
     db_path = conn.execute("PRAGMA database_list").fetchone()["file"]
     p = conn.execute("SELECT * FROM products LIMIT 1").fetchone()
@@ -342,32 +347,38 @@ def test_mobile_scan_server_end_to_end():
 
     server = mobile_scan.MobileScanServer(on_scan)
     server.start()
+    client_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    client_ctx.check_hostname = False
+    client_ctx.verify_mode = ssl.CERT_NONE
+
+    def post(body: dict) -> dict:
+        conn_ = http.client.HTTPSConnection("127.0.0.1", server.port, context=client_ctx, timeout=5)
+        conn_.request("POST", "/scan", body=json.dumps(body), headers={"Content-Type": "application/json"})
+        return json.loads(conn_.getresponse().read())
+
     try:
         png = mobile_scan.generate_qr_png_bytes(p["code"])
         b64 = base64.b64encode(png).decode()
-        body = json.dumps({"code": server.pairing_code, "image": "data:image/png;base64," + b64})
 
-        conn2 = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
-        conn2.request("POST", "/scan", body=body, headers={"Content-Type": "application/json"})
-        resp = json.loads(conn2.getresponse().read())
+        resp = post({"code": server.pairing_code, "image": "data:image/png;base64," + b64})
         assert resp == {"ok": True, "found": True, "code": p["code"], "name": p["name_en"], "added": True}
         assert seen == [p["code"]]
 
+        # scanning the same code again immediately is a duplicate (still
+        # pointed at the same item) - reported, but not re-added
+        resp_dup = post({"code": server.pairing_code, "image": "data:image/png;base64," + b64})
+        assert resp_dup == {"ok": True, "found": True, "code": p["code"], "duplicate": True}
+        assert seen == [p["code"]]  # on_scan was not called a second time
+
         # wrong pairing code must be rejected without ever reaching on_scan
-        conn3 = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
-        bad_body = json.dumps({"code": "0000", "image": "data:image/png;base64," + b64})
-        conn3.request("POST", "/scan", body=bad_body, headers={"Content-Type": "application/json"})
-        resp2 = json.loads(conn3.getresponse().read())
+        resp2 = post({"code": "0000", "image": "data:image/png;base64," + b64})
         assert resp2 == {"ok": False, "error": "wrong_pairing_code"}
         assert seen == [p["code"]]  # unchanged - the bad request never called on_scan
 
         # a barcode/QR that isn't in the catalogue is reported, not crashed on
         unknown_png = mobile_scan.generate_qr_png_bytes("no-such-code-999")
         unknown_b64 = base64.b64encode(unknown_png).decode()
-        conn4 = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
-        unknown_body = json.dumps({"code": server.pairing_code, "image": "data:image/png;base64," + unknown_b64})
-        conn4.request("POST", "/scan", body=unknown_body, headers={"Content-Type": "application/json"})
-        resp3 = json.loads(conn4.getresponse().read())
+        resp3 = post({"code": server.pairing_code, "image": "data:image/png;base64," + unknown_b64})
         assert resp3["found"] is True and resp3.get("unknown") is True
     finally:
         server.stop()

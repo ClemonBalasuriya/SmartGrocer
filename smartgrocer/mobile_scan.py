@@ -2,40 +2,47 @@
 SmartGrocer - phone-as-barcode-scanner companion.
 
 Lets any phone on the same shop Wi-Fi become a wireless barcode/QR scanner
-for the POS screen, with nothing to install: the phone just opens a web
-page in its own browser (Safari on iPhone, Chrome on Android - it makes no
-difference, since this is a plain web page, not a native app) and takes a
-photo of the code with its normal camera app. SmartGrocer decodes the
-photo and adds the item to the cart, then tells the phone what it added.
+for the POS screen, with nothing to install: the phone opens a web page in
+its own browser (Safari on iPhone, Chrome on Android - it makes no
+difference, since this is a plain web page, not a native app), points its
+camera at items, and each one lands in the till's cart within a second or
+two, hands-free - no tapping a shutter button per item.
 
 Design notes, since a few choices here are deliberate rather than obvious:
 
-- No live camera preview / continuous auto-scan. The phone uses the
-  standard HTML `<input type=file capture>` control, which hands the
-  photo-taking off to the phone's own native camera app. The alternative
-  (a live in-page video feed via `getUserMedia`) needs the page to be
-  loaded over HTTPS - browsers refuse camera access to a plain-HTTP page
-  unless it's "localhost", and this page is loaded from this PC's LAN IP
-  (e.g. http://192.168.1.5:8765) so it doesn't qualify. Serving HTTPS here
-  would mean generating a self-signed certificate and asking every phone
-  to click through a "not private" warning the first time - a confusing,
-  fragile ask for a cashier. One tap per item to open the camera is a
-  little slower than true live scanning, but it works everywhere,
-  reliably, with no security prompts to explain.
-- Plain HTTP request/response instead of a persistent connection
-  (WebSocket). Every scan is already a full round trip anyway (send the
-  photo, get back what was decoded and added), so a standing connection
-  wouldn't make it feel any more instant - it would only add a second,
-  hand-written network protocol to get right and keep working. A plain
-  POST to a local Python HTTP server is about as close to "cannot break"
-  as networking code gets.
+- Live camera feed, over HTTPS with a self-signed certificate. A
+  continuous auto-scan view (`getUserMedia`) needs the page to be loaded
+  over HTTPS - browsers refuse camera access to a plain-HTTP page unless
+  it's "localhost", and this page is loaded from the PC's LAN IP (e.g.
+  https://192.168.1.5:8765). There's no real certificate authority for a
+  private shop network to get a trusted certificate from, so this
+  generates its own self-signed one (`_ensure_self_signed_cert`, cached in
+  exports/ so it doesn't regenerate every launch). The phone's browser
+  will show a "connection not private" warning the FIRST time it opens the
+  page - that's expected for a self-signed certificate talking to a
+  device on your own network, not a sign of anything wrong; the cashier
+  taps through it once per phone (see the POS screen's dialog text for the
+  exact steps) and it's remembered after that.
+- The phone posts a small downscaled JPEG frame roughly twice a second
+  while the camera view is open; the server decodes it and, on a
+  successful read, adds the item and tells the phone what it added. A
+  short per-code cooldown (`_DUPLICATE_WINDOW_SECONDS`) stops the same
+  item being added repeatedly while the phone is still pointed at it.
+- Plain HTTP-over-TLS request/response instead of a persistent connection
+  (WebSocket) for each frame. A standing connection wouldn't make this
+  feel any more instant - each frame is already a full round trip (send
+  it, get back what was decoded) - and would only add a second,
+  hand-written protocol to get right. If the live view can't start (camera
+  permission denied, or an older browser without `getUserMedia`), the page
+  falls back to the phone's native camera app for a one-photo-per-item
+  flow using the exact same `/scan` endpoint.
 - Barcode/QR decoding happens with OpenCV (`cv2.barcode.BarcodeDetector`
   for EAN-13/EAN-8/UPC-A/UPC-E, `cv2.QRCodeDetector` for QR) - already a
   project dependency's cousin (numpy), pure `pip install`, no separate
   system library (like zbar) to install by hand on Windows. It reads
   standard printed barcodes and QR codes; a dedicated USB/Bluetooth
   scanner is still the faster, more forgiving choice for a busy till, but
-  this makes a reliable backup that needs no extra hardware.
+  this makes a reliable, hands-free backup that needs no extra hardware.
 - A short pairing code (shown on the POS screen, entered once on the
   phone) guards the /scan endpoint - the server is reachable by anything
   on the shop's Wi-Fi, so without this, anyone on that network could add
@@ -46,16 +53,25 @@ from __future__ import annotations
 
 import base64
 import binascii
+import datetime
+import ipaddress
 import json
 import secrets
 import socket
+import ssl
+import tempfile
 import threading
 import time
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Optional
 
 import cv2
 import numpy as np
+
+from . import db as db_module
+
+_DUPLICATE_WINDOW_SECONDS = 2.5  # how long a just-scanned code is ignored, to stop one item adding itself repeatedly
 
 
 def get_lan_ip() -> str:
@@ -91,6 +107,59 @@ def generate_qr_png_bytes(data: str, scale: int = 8, border: int = 32) -> bytes:
     return buf.tobytes()
 
 
+def _ensure_self_signed_cert(lan_ip: str) -> tuple[Path, Path]:
+    """Return (cert_path, key_path) for an HTTPS certificate covering this
+    PC's current LAN IP, generating and caching one under exports/ if none
+    exists yet or the cached one doesn't cover this IP (e.g. the PC picked
+    up a new address from the router) or has expired. Reusing a cached
+    cert across app restarts means a phone that already clicked through
+    the "not private" warning once doesn't have to do it again every time
+    the till app is relaunched."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    cert_dir = db_module.ensure_output_dir()
+    cert_path = cert_dir / "mobile_scan_cert.pem"
+    key_path = cert_dir / "mobile_scan_key.pem"
+
+    if cert_path.exists() and key_path.exists():
+        try:
+            existing = x509.load_pem_x509_certificate(cert_path.read_bytes())
+            san = existing.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+            covers_ip = ipaddress.ip_address(lan_ip) in san.get_values_for_type(x509.IPAddress)
+            not_expired = existing.not_valid_after_utc > datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30)
+            if covers_ip and not_expired:
+                return cert_path, key_path
+        except Exception:
+            pass  # anything wrong with the cached cert - just regenerate below
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "SmartGrocer Phone Scanner")])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    san_entries = [x509.IPAddress(ipaddress.ip_address(lan_ip)), x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
+                   x509.DNSName("localhost")]
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=3650))
+        .add_extension(x509.SubjectAlternativeName(san_entries), critical=False)
+        .sign(key, hashes.SHA256())
+    )
+    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
+    ))
+    return cert_path, key_path
+
+
 def _decode_code(frame: np.ndarray, barcode_detector, qr_detector) -> Optional[str]:
     """Try a standard printed barcode first (the common case for a
     manufactured product), then QR. Returns the decoded text, or None."""
@@ -110,7 +179,7 @@ def _decode_code(frame: np.ndarray, barcode_detector, qr_detector) -> Optional[s
 
 
 class MobileScanServer:
-    """Owns a background HTTP server that serves the phone-scanning page
+    """Owns a background HTTPS server that serves the phone-scanning page
     and receives decoded scans. `on_scan(code)` is called from the
     server's own request-handling thread (never the Tkinter thread) with
     the decoded barcode/QR text, and must return a dict describing what
@@ -123,6 +192,9 @@ class MobileScanServer:
         self._thread: Optional[threading.Thread] = None
         self._barcode_detector = cv2.barcode.BarcodeDetector()
         self._qr_detector = cv2.QRCodeDetector()
+        self._last_code: Optional[str] = None
+        self._last_code_at: float = 0.0
+        self._lock = threading.Lock()
 
     @property
     def running(self) -> bool:
@@ -134,7 +206,7 @@ class MobileScanServer:
 
     @property
     def url(self) -> str:
-        return f"http://{get_lan_ip()}:{self.port}/"
+        return f"https://{get_lan_ip()}:{self.port}/"
 
     def start(self, port: int = 0) -> None:
         if self._httpd is not None:
@@ -143,7 +215,7 @@ class MobileScanServer:
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, fmt, *args):
-                pass  # this fires once per photo taken - keep the console quiet
+                pass  # this fires a couple of times a second while the camera view is open - keep the console quiet
 
             def _send_json(self, status: int, payload: dict):
                 body = json.dumps(payload).encode("utf-8")
@@ -176,7 +248,18 @@ class MobileScanServer:
                     return
                 self._send_json(200, server._handle_scan_request(payload))
 
+            def handle_one_request(self):
+                try:
+                    super().handle_one_request()
+                except (ssl.SSLError, ConnectionResetError, OSError):
+                    pass  # a phone's browser dropping/retrying the connection isn't a server bug
+
         self._httpd = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+        lan_ip = get_lan_ip()
+        cert_path, key_path = _ensure_self_signed_cert(lan_ip)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(certfile=str(cert_path), keyfile=str(key_path))
+        self._httpd.socket = ctx.wrap_socket(self._httpd.socket, server_side=True)
         self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
         self._thread.start()
 
@@ -208,6 +291,13 @@ class MobileScanServer:
         if not decoded:
             return {"ok": True, "found": False}
 
+        with self._lock:
+            now = time.time()
+            if decoded == self._last_code and (now - self._last_code_at) < _DUPLICATE_WINDOW_SECONDS:
+                return {"ok": True, "found": True, "code": decoded, "duplicate": True}
+            self._last_code = decoded
+            self._last_code_at = now
+
         try:
             result = self.on_scan(decoded) or {}
         except Exception as e:  # a bug here shouldn't take the whole server down
@@ -228,20 +318,24 @@ _PAGE_HTML = """<!doctype html>
   .sub { color:#9FB0CC; font-size:13px; margin-bottom:18px; }
   input { width:100%; box-sizing:border-box; padding:14px; font-size:24px; text-align:center;
           letter-spacing:6px; border-radius:10px; border:none; margin-bottom:12px; }
-  button { width:100%; box-sizing:border-box; padding:18px; font-size:17px; font-weight:600;
+  button { width:100%; box-sizing:border-box; padding:16px; font-size:16px; font-weight:600;
            border:none; border-radius:10px; margin-bottom:10px; }
   .primary { background:#2F6FED; color:#fff; }
-  .scan-btn { background:#1FAA59; color:#fff; font-size:22px; padding:28px; }
+  .scan-btn { background:#1FAA59; color:#fff; font-size:20px; padding:24px; }
   .card { background:#16223F; border-radius:12px; padding:16px; margin-bottom:12px; }
   .log-item { padding:10px 0; border-bottom:1px solid #22304F; font-size:14px; }
   .ok { color:#6EE7A8; }
   .warn { color:#F4A6A6; }
   #screen-connect, #screen-scan { display:none; }
+  #video { width:100%; border-radius:12px; background:#000; margin-bottom:10px; }
+  .badge { display:inline-block; padding:3px 10px; border-radius:20px; font-size:11px; font-weight:600; }
+  .badge-live { background:#1FAA59; color:#fff; }
+  .badge-photo { background:#3A4B78; color:#fff; }
 </style>
 </head>
 <body>
   <h1>SmartGrocer &ndash; Phone Scanner</h1>
-  <div class="sub">Photograph a barcode or QR code and it's added straight to the till's cart.</div>
+  <div class="sub">Point the camera at barcodes/QR codes - each one is added straight to the till's cart.</div>
 
   <div id="screen-connect">
     <div class="card">
@@ -253,19 +347,28 @@ _PAGE_HTML = """<!doctype html>
   </div>
 
   <div id="screen-scan">
-    <button class="scan-btn" onclick="document.getElementById('camera-input').click()">Scan Item</button>
+    <div id="mode-badge" class="badge badge-live" style="margin-bottom:10px;">Live camera</div>
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="canvas" style="display:none;"></canvas>
+
+    <button id="photo-btn" class="scan-btn" style="display:none;"
+            onclick="document.getElementById('camera-input').click()">Scan Item</button>
     <input id="camera-input" type="file" accept="image/*" capture="environment" style="display:none">
+
     <div id="status" class="sub">&nbsp;</div>
     <div class="card" id="log"></div>
   </div>
 
 <script>
 var pairingCode = sessionStorage.getItem('sg_code') || '';
+var busy = false;
+var liveTimer = null;
 
 function sgShowScreen() {
   var connected = !!pairingCode;
   document.getElementById('screen-connect').style.display = connected ? 'none' : 'block';
   document.getElementById('screen-scan').style.display = connected ? 'block' : 'none';
+  if (connected) sgStartCamera();
 }
 
 function sgConnect() {
@@ -288,6 +391,74 @@ function sgAddLog(text, ok) {
   log.insertBefore(div, log.firstChild);
 }
 
+function sgBeep() {
+  try {
+    var AudioCtx = window.AudioContext || window.webkitAudioContext;
+    var ctx = new AudioCtx();
+    var osc = ctx.createOscillator();
+    var gain = ctx.createGain();
+    osc.frequency.value = 880;
+    gain.gain.value = 0.15;
+    osc.connect(gain); gain.connect(ctx.destination);
+    osc.start();
+    setTimeout(function () { osc.stop(); ctx.close(); }, 90);
+  } catch (e) { /* audio isn't essential - a silent scan still works */ }
+}
+
+// --- Live camera mode: grab a frame roughly every 400ms and post it. ---
+function sgStartCamera() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    sgUsePhotoMode('This browser can\\'t use the live camera here - using one-photo-per-item mode instead.');
+    return;
+  }
+  navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } })
+    .then(function (stream) {
+      var video = document.getElementById('video');
+      video.srcObject = stream;
+      document.getElementById('mode-badge').textContent = 'Live camera';
+      document.getElementById('mode-badge').className = 'badge badge-live';
+      document.getElementById('photo-btn').style.display = 'none';
+      video.style.display = 'block';
+      if (liveTimer) clearInterval(liveTimer);
+      liveTimer = setInterval(sgCaptureLiveFrame, 400);
+    })
+    .catch(function () {
+      sgUsePhotoMode('Camera access wasn\\'t granted - using one-photo-per-item mode instead (tap Scan Item each time).');
+    });
+}
+
+function sgUsePhotoMode(message) {
+  document.getElementById('video').style.display = 'none';
+  document.getElementById('mode-badge').textContent = 'Photo mode';
+  document.getElementById('mode-badge').className = 'badge badge-photo';
+  document.getElementById('photo-btn').style.display = 'block';
+  document.getElementById('status').textContent = message;
+}
+
+function sgCaptureLiveFrame() {
+  if (busy) return;
+  var video = document.getElementById('video');
+  if (!video.videoWidth) return;  // stream not ready yet
+  var canvas = document.getElementById('canvas');
+  var targetWidth = 480;
+  var scale = targetWidth / video.videoWidth;
+  canvas.width = targetWidth;
+  canvas.height = video.videoHeight * scale;
+  var ctx2d = canvas.getContext('2d');
+  ctx2d.drawImage(video, 0, 0, canvas.width, canvas.height);
+  var dataUrl = canvas.toDataURL('image/jpeg', 0.6);
+  busy = true;
+  fetch('/scan', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code: pairingCode, image: dataUrl })
+  })
+    .then(function (r) { return r.json(); })
+    .then(function (r) { busy = false; sgHandleResult(r); })
+    .catch(function () { busy = false; });
+}
+
+// --- Fallback: one photo per item via the phone's native camera app. ---
 document.getElementById('camera-input').addEventListener('change', function (e) {
   var file = e.target.files[0];
   e.target.value = '';
@@ -310,7 +481,6 @@ document.getElementById('camera-input').addEventListener('change', function (e) 
 
 function sgHandleResult(r) {
   var status = document.getElementById('status');
-  status.textContent = '\\u00a0';
   if (!r.ok && r.error === 'wrong_pairing_code') {
     pairingCode = '';
     sessionStorage.removeItem('sg_code');
@@ -319,9 +489,11 @@ function sgHandleResult(r) {
     return;
   }
   if (!r.found) {
-    status.textContent = 'No barcode found in that photo - try again, closer and in good light.';
+    status.textContent = '\\u00a0';
     return;
   }
+  if (r.duplicate) return;  // still pointed at the same item - stay quiet, don't spam the log
+  status.textContent = '\\u00a0';
   if (r.error) {
     sgAddLog('Scanned ' + r.code + ' - ' + r.error, false);
     return;
@@ -330,6 +502,7 @@ function sgHandleResult(r) {
     sgAddLog('Scanned ' + r.code + ' - not in the catalogue', false);
     return;
   }
+  sgBeep();
   sgAddLog('Added: ' + r.name + ' (' + r.code + ')', true);
 }
 
