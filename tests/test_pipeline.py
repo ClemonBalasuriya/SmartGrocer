@@ -401,6 +401,54 @@ def test_barcode_exact_match_lookup():
     assert pos.get_product_by_code(conn, "no-such-barcode-xyz") is None
 
 
+def test_add_product_creates_catalog_entry_with_opening_stock():
+    # This is the "add a brand-new product to the store" flow (Inventory
+    # screen's "Add New Product" dialog), distinct from the GRN dialog
+    # which only restocks a product that already exists.
+    conn = _fresh_db()
+    product_id = pos.add_product(
+        conn,
+        code="NEW-BARCODE-001",
+        name_en="Test Choc Bar 50g",
+        name_si="",
+        category="Snacks",
+        unit="pcs",
+        cost_price=50.0,
+        cash_price=80.0,
+        pack_size=1,
+        reorder_level=5,
+        initial_qty=24,
+    )
+    fetched = pos.get_product_by_code(conn, "NEW-BARCODE-001")
+    assert fetched is not None and fetched["id"] == product_id
+    assert fetched["name_en"] == "Test Choc Bar 50g"
+    # credit/wholesale prices default sensibly when left blank
+    assert fetched["credit_price"] == 80.0
+    assert fetched["wholesale_price"] == 50.0
+    assert pos.get_stock_on_hand(conn, product_id) == 24
+
+    # Duplicate barcode is rejected with a clear error, not a silent overwrite.
+    try:
+        pos.add_product(conn, code="NEW-BARCODE-001", name_en="Dup", category="Snacks",
+                         cost_price=1, cash_price=2)
+        assert False, "expected ValueError for duplicate code"
+    except ValueError as e:
+        assert "already exists" in str(e)
+
+    # Blank required fields are rejected.
+    for bad_kwargs in [
+        dict(code="", name_en="X", category="Y", cost_price=1, cash_price=2),
+        dict(code="ABC", name_en="", category="Y", cost_price=1, cash_price=2),
+        dict(code="ABC", name_en="X", category="", cost_price=1, cash_price=2),
+        dict(code="ABC", name_en="X", category="Y", cost_price=1, cash_price=0),
+    ]:
+        try:
+            pos.add_product(conn, **bad_kwargs)
+            assert False, f"expected ValueError for {bad_kwargs}"
+        except ValueError:
+            pass
+
+
 def test_receipt_text_includes_key_fields():
     conn = _fresh_db()
     p = _product_with_stock(conn, min_qty=1)

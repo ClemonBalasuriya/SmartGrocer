@@ -67,6 +67,97 @@ def get_product_by_code(conn: sqlite3.Connection, code: str) -> sqlite3.Row | No
     return conn.execute("SELECT * FROM products WHERE code=? AND active=1", (code,)).fetchone()
 
 
+def get_product_by_code_any(conn: sqlite3.Connection, code: str) -> sqlite3.Row | None:
+    """Like get_product_by_code but also matches inactive/deleted products
+    (used to give a clear "already exists" error when adding a new product)."""
+    return conn.execute("SELECT * FROM products WHERE code=?", (code,)).fetchone()
+
+
+def add_product(
+    conn: sqlite3.Connection,
+    *,
+    code: str,
+    name_en: str,
+    name_si: str = "",
+    category: str,
+    unit: str = "pcs",
+    cost_price: float,
+    cash_price: float,
+    credit_price: float | None = None,
+    wholesale_price: float | None = None,
+    pack_size: int = 1,
+    reorder_level: int = 10,
+    is_perishable: bool = False,
+    is_staple: bool = False,
+    child_target: bool = False,
+    initial_qty: float = 0.0,
+    expiry_date: str | None = None,
+) -> int:
+    """Register a brand-new product in the catalog.
+
+    code is the barcode/PLU - it can be typed on the keyboard or filled in by
+    scanning it with a USB barcode scanner (a scanner just types the digits
+    into the focused field, same as a keyboard) or the phone scanner. Raises
+    ValueError on bad/duplicate input. If initial_qty > 0, also creates an
+    opening stock batch so the product shows stock on hand immediately.
+    """
+    code = (code or "").strip()
+    name_en = (name_en or "").strip()
+    category = (category or "").strip()
+    unit = (unit or "pcs").strip() or "pcs"
+
+    if not code:
+        raise ValueError("Barcode / code cannot be blank")
+    if not name_en:
+        raise ValueError("Product name cannot be blank")
+    if not category:
+        raise ValueError("Category cannot be blank")
+
+    existing = get_product_by_code_any(conn, code)
+    if existing is not None:
+        raise ValueError(f"A product with code '{code}' already exists ({existing['name_en']})")
+
+    if cost_price < 0:
+        raise ValueError("Cost price cannot be negative")
+    if cash_price <= 0:
+        raise ValueError("Selling (cash) price must be greater than zero")
+    if credit_price is None:
+        credit_price = cash_price
+    if wholesale_price is None:
+        wholesale_price = cost_price
+    if pack_size < 1:
+        raise ValueError("Pack size must be at least 1")
+    if reorder_level < 0:
+        raise ValueError("Reorder level cannot be negative")
+    if initial_qty < 0:
+        raise ValueError("Initial quantity cannot be negative")
+    if expiry_date:
+        datetime.strptime(expiry_date, "%Y-%m-%d")  # raises ValueError if malformed
+
+    cur = conn.execute(
+        """INSERT INTO products
+           (code, name_en, name_si, category, unit, cost_price, cash_price,
+            credit_price, wholesale_price, pack_size, reorder_level,
+            is_perishable, is_staple, child_target, active)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)""",
+        (code, name_en, name_si.strip(), category, unit, cost_price, cash_price,
+         credit_price, wholesale_price, pack_size, reorder_level,
+         1 if is_perishable else 0, 1 if is_staple else 0, 1 if child_target else 0),
+    )
+    product_id = cur.lastrowid
+
+    if initial_qty > 0:
+        conn.execute(
+            """INSERT INTO stock_batches (product_id,batch_no,qty_received,qty_remaining,
+               received_date,expiry_date,cost_price,supplier_id) VALUES (?,?,?,?,?,?,?,NULL)""",
+            (product_id, f"OPENING-{datetime.now().date().isoformat()}", initial_qty, initial_qty,
+             datetime.now().date().isoformat(), expiry_date, cost_price),
+        )
+
+    conn.commit()
+    return product_id
+
+
 def get_stock_on_hand(conn: sqlite3.Connection, product_id: int) -> float:
     row = conn.execute(
         "SELECT COALESCE(SUM(qty_remaining),0) q FROM stock_batches WHERE product_id=?",

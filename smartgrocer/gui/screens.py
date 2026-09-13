@@ -789,6 +789,7 @@ class InventoryScreen(BaseScreen):
         btn_row.pack(fill="x", padx=24)
         styled_button(btn_row, "Refresh", self.refresh, kind="secondary").pack(side="left")
         styled_button(btn_row, "Export CSV", self.export, kind="secondary").pack(side="left", padx=8)
+        styled_button(btn_row, "Add New Product", self.open_add_product_dialog, kind="primary").pack(side="left", padx=8)
         styled_button(btn_row, "Receive Stock (GRN)", self.open_grn_dialog, kind="primary").pack(side="left", padx=8)
 
         tree_frame = ctk.CTkFrame(self, fg_color="transparent")
@@ -874,6 +875,177 @@ class InventoryScreen(BaseScreen):
                 messagebox.showerror("Invalid input", str(e))
 
         styled_button(dialog, "Save", save, kind="primary", width=140).pack(pady=18)
+
+    def open_add_product_dialog(self):
+        """Register a brand-new product in the catalog - not receiving more
+        stock of something that already exists (that's the GRN dialog
+        above), but creating the product record itself for the first time.
+        The barcode/code field can be filled by typing on the keyboard, by
+        a USB/Bluetooth barcode scanner (it just types the digits into
+        whichever field has focus, so the field is auto-focused for that),
+        or by scanning it with a phone via the same phone-scanner feature
+        used at the till."""
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Add New Product")
+        dialog.geometry("440x760")
+        dialog.configure(fg_color=theme.BG_LIGHT)
+        dialog.grab_set()
+
+        body = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
+        body.pack(fill="both", expand=True)
+
+        def field(label, initial=""):
+            ctk.CTkLabel(body, text=label).pack(anchor="w", padx=16, pady=(10, 0))
+            var = tk.StringVar(value=initial)
+            entry = ctk.CTkEntry(body, textvariable=var)
+            entry.pack(fill="x", padx=16)
+            return var, entry
+
+        ctk.CTkLabel(body, text="Barcode / Code:").pack(anchor="w", padx=16, pady=(12, 0))
+        code_row = ctk.CTkFrame(body, fg_color="transparent")
+        code_row.pack(fill="x", padx=16)
+        code_var = tk.StringVar()
+        code_entry = ctk.CTkEntry(code_row, textvariable=code_var)
+        code_entry.pack(side="left", fill="x", expand=True)
+        styled_button(
+            code_row, "Scan with Phone",
+            lambda: self._open_phone_capture_dialog(lambda scanned: code_var.set(scanned)),
+            kind="secondary", width=130,
+        ).pack(side="left", padx=(8, 0))
+        ctk.CTkLabel(body, text="Type it, use a USB/Bluetooth scanner (it types into this box like a "
+                                 "keyboard), or tap \"Scan with Phone\".",
+                     text_color=theme.TEXT_MUTED, font=ctk.CTkFont(size=11),
+                     wraplength=380, justify="left").pack(anchor="w", padx=16, pady=(2, 0))
+
+        name_en_var, _ = field("Product name (English):")
+        name_si_var, _ = field("Product name (Sinhala, optional):")
+        category_var, _ = field("Category:")
+        unit_var, _ = field("Unit (e.g. pcs, kg, g, L):", "pcs")
+
+        cost_var, _ = field("Cost price (what you pay):")
+        cash_var, _ = field("Cash selling price:")
+        credit_var, _ = field("Credit selling price (blank = same as cash):")
+        wholesale_var, _ = field("Wholesale price (blank = same as cost):")
+
+        pack_size_var, _ = field("Pack size (units per pack):", "1")
+        reorder_var, _ = field("Reorder level (low-stock alert threshold):", "10")
+        initial_qty_var, _ = field("Opening stock quantity (optional):", "0")
+        expiry_var, _ = field("Expiry date (YYYY-MM-DD, optional):")
+
+        flags_row = ctk.CTkFrame(body, fg_color="transparent")
+        flags_row.pack(fill="x", padx=16, pady=(14, 0))
+        perishable_var = tk.BooleanVar(value=False)
+        staple_var = tk.BooleanVar(value=False)
+        child_var = tk.BooleanVar(value=False)
+        ctk.CTkCheckBox(flags_row, text="Perishable", variable=perishable_var).pack(side="left")
+        ctk.CTkCheckBox(flags_row, text="Staple item", variable=staple_var).pack(side="left", padx=12)
+        ctk.CTkCheckBox(flags_row, text="Child-target item", variable=child_var).pack(side="left")
+
+        def save():
+            try:
+                product_id = pos.add_product(
+                    self.conn,
+                    code=code_var.get(),
+                    name_en=name_en_var.get(),
+                    name_si=name_si_var.get(),
+                    category=category_var.get(),
+                    unit=unit_var.get() or "pcs",
+                    cost_price=float(cost_var.get() or 0),
+                    cash_price=float(cash_var.get() or 0),
+                    credit_price=float(credit_var.get()) if credit_var.get().strip() else None,
+                    wholesale_price=float(wholesale_var.get()) if wholesale_var.get().strip() else None,
+                    pack_size=int(pack_size_var.get() or 1),
+                    reorder_level=int(reorder_var.get() or 0),
+                    is_perishable=perishable_var.get(),
+                    is_staple=staple_var.get(),
+                    child_target=child_var.get(),
+                    initial_qty=float(initial_qty_var.get() or 0),
+                    expiry_date=expiry_var.get().strip() or None,
+                )
+            except ValueError as e:
+                messagebox.showerror("Invalid input", str(e))
+                return
+            dialog.destroy()
+            self.refresh()
+            messagebox.showinfo("Product added", f"'{name_en_var.get().strip()}' was added to the catalog.")
+
+        styled_button(dialog, "Save Product", save, kind="primary", width=160).pack(pady=16)
+        dialog.after(150, code_entry.focus_set)
+
+    def _open_phone_capture_dialog(self, on_captured):
+        """Open a small phone-scanner dialog whose only job is to capture
+        one barcode/QR code and hand the decoded text to on_captured(code)
+        - used to fill in a text field (like the new-product barcode
+        field above) from the phone's camera. Reuses the same background
+        server the till's own Phone Scanner feature uses (POSScreen.
+        open_phone_scanner_dialog), so if that's already running for cart
+        scanning, this borrows it for one scan and hands it back exactly
+        as it was - the till keeps working normally either way."""
+        if getattr(self.app, "mobile_scan_server", None) is None:
+            self.app.mobile_scan_server = mobile_scan.MobileScanServer(lambda code: {"unknown": True})
+        server = self.app.mobile_scan_server
+        if not server.running:
+            try:
+                server.start()
+            except OSError as e:
+                messagebox.showerror("Could not start phone scanner", str(e))
+                return
+
+        previous_on_scan = server.on_scan
+        state = {"restored": False}
+
+        def restore():
+            if not state["restored"]:
+                state["restored"] = True
+                server.on_scan = previous_on_scan
+
+        def captured(code):
+            restore()
+            self.after(0, lambda: (on_captured(code), dialog.destroy()))
+            return {"name": code, "added": True}
+
+        server.on_scan = captured
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Scan Barcode with Phone")
+        dialog.geometry("400x620")
+        dialog.configure(fg_color=theme.BG_LIGHT)
+        dialog.grab_set()
+        dialog.protocol("WM_DELETE_WINDOW", lambda: (restore(), dialog.destroy()))
+
+        body = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
+        body.pack(fill="both", expand=True)
+
+        ctk.CTkLabel(body, text="Scan the product's barcode", font=ctk.CTkFont(size=14, weight="bold"),
+                     text_color=theme.NAVY_DARK).pack(pady=(16, 6))
+
+        try:
+            from PIL import Image
+            import io
+            png_bytes = mobile_scan.generate_qr_png_bytes(server.url)
+            qr_img = Image.open(io.BytesIO(png_bytes))
+            ctk_qr = ctk.CTkImage(light_image=qr_img, dark_image=qr_img, size=(200, 200))
+            ctk.CTkLabel(body, image=ctk_qr, text="").pack(pady=6)
+        except Exception:
+            pass
+
+        ctk.CTkLabel(body, text="Open this address on the phone (or scan the QR above):",
+                     text_color=theme.TEXT_MUTED, font=ctk.CTkFont(size=11)).pack(pady=(6, 0))
+        ctk.CTkLabel(body, text=server.url, font=ctk.CTkFont(size=13, weight="bold"),
+                     text_color=theme.ACCENT_BLUE).pack(pady=(0, 12))
+        ctk.CTkLabel(body, text="Pairing code:", text_color=theme.TEXT_MUTED, font=ctk.CTkFont(size=11)).pack()
+        ctk.CTkLabel(body, text=server.pairing_code, font=ctk.CTkFont(size=28, weight="bold"),
+                     text_color=theme.NAVY_DARK).pack(pady=(2, 12))
+        ctk.CTkLabel(
+            body,
+            text="Point the camera at the barcode - it fills in the field automatically as "
+                 "soon as it's read, and this window closes on its own. (First-time on a new "
+                 "phone: it'll show a one-time \"Connection not private\" warning - tap "
+                 "Advanced/Show Details then Proceed/visit this website.)",
+            text_color=theme.TEXT_MUTED, font=ctk.CTkFont(size=11), wraplength=340, justify="left",
+        ).pack(padx=20, pady=(0, 14))
+
+        styled_button(dialog, "Cancel", lambda: (restore(), dialog.destroy()), kind="secondary", width=140).pack(pady=(0, 16))
 
 
 # --------------------------------------------------------------------------- #
