@@ -80,8 +80,19 @@ def fit_dialog(dialog, width: int, height: int) -> None:
     for every dialog at once. Dialogs whose body is a CTkScrollableFrame
     packed with expand=True (with the button packed after it, not inside
     it) still show their button in full - a shorter window just means more
-    of the form scrolls, the button itself never gets less room."""
-    dialog.update_idletasks()
+    of the form scrolls, the button itself never gets less room.
+
+    Deliberately does NOT call update_idletasks() here: winfo_screenwidth/
+    winfo_screenheight read the physical screen, not this widget's own
+    drawn size, so no idle-task flush is needed to get them right - and
+    forcing one on a CTkToplevel this early (before its own content exists
+    yet, and before CustomTkinter's own delayed Windows setup, e.g. its
+    titlebar-color fix, has run) is exactly what caused a real regression:
+    on real Windows machines the dialog would render blank and then lose
+    focus back to the main window a moment later, looking like it "popped
+    up and went back to the screen". lift()/focus_force() below (plus a
+    delayed re-lift) is what actually keeps a freshly-opened dialog on top
+    and focused, without needing to touch idle tasks at all."""
     screen_w = dialog.winfo_screenwidth()
     screen_h = dialog.winfo_screenheight()
     max_w = max(300, screen_w - 80)
@@ -92,6 +103,15 @@ def fit_dialog(dialog, width: int, height: int) -> None:
     y = max(0, (screen_h - h) // 2 - 20)
     dialog.geometry(f"{w}x{h}+{x}+{y}")
     dialog.minsize(min(w, 300), min(h, 300))
+    dialog.lift()
+    dialog.focus_force()
+    # CustomTkinter does some of its own window setup a few milliseconds
+    # after a CTkToplevel is created (e.g. fixing the titlebar color on
+    # Windows), which can steal focus/stacking back to the main window
+    # right after this dialog opens - re-lifting it once that's had time to
+    # run keeps it on top and focused instead of appearing to vanish.
+    dialog.after(60, dialog.lift)
+    dialog.after(60, dialog.focus_force)
 
 
 def run_in_background(widget: ctk.CTkBaseClass, work_fn, on_done, on_error=None):
