@@ -231,10 +231,23 @@ def prompt_split_payment(parent, total: float) -> list[tuple[str, float]] | None
 class POSScreen(BaseScreen):
     def __init__(self, parent, app):
         super().__init__(parent, app)
-        self.header("POS / Checkout")
+        self.header("POS / Checkout")  # stays fixed at the top, outside the scrollable area below
         self.cart: list[dict] = []
 
-        top = ctk.CTkFrame(self, fg_color="transparent")
+        # Everything below goes in a scrollable frame, not straight into
+        # `self` - this screen has a lot stacked vertically (search/filter
+        # row, results, quick items, the cart, and two rows of action
+        # buttons), and on a smaller screen, a laptop with taskbar/title bar
+        # eating into the usable height, or Windows display scaling above
+        # 100%, that stack is taller than the window. Without a scrollbar
+        # the bottom of it (the Checkout button, Hold/Resume/Return/Phone
+        # Scanner) was simply cut off with no way to reach it at all -
+        # CTkScrollableFrame fixes that regardless of how small the window
+        # or screen ends up being.
+        body = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        body.pack(fill="both", expand=True)
+
+        top = ctk.CTkFrame(body, fg_color="transparent")
         top.pack(fill="x", padx=24)
 
         ctk.CTkLabel(top, text="Scan barcode or search item:", text_color=theme.TEXT_DARK).grid(
@@ -266,7 +279,7 @@ class POSScreen(BaseScreen):
                                            text_color=theme.DANGER_RED)
         self.cashier_label.grid(row=1, column=5, padx=(16, 0), sticky="w")
 
-        results_frame = ctk.CTkFrame(self, fg_color="transparent")
+        results_frame = ctk.CTkFrame(body, fg_color="transparent")
         results_frame.pack(fill="x", padx=24, pady=(6, 0))
         self.results_tree = make_treeview(
             results_frame, ["Code", "Name", "Cash Price", "Stock"],
@@ -276,20 +289,20 @@ class POSScreen(BaseScreen):
         self.results_tree.master_frame.pack(fill="x")
         self.results_tree.bind("<Double-1>", lambda e: self.add_selected_to_cart())
 
-        qty_row = ctk.CTkFrame(self, fg_color="transparent")
+        qty_row = ctk.CTkFrame(body, fg_color="transparent")
         qty_row.pack(fill="x", padx=24, pady=6)
         ctk.CTkLabel(qty_row, text="Qty:", text_color=theme.TEXT_DARK).pack(side="left")
         self.qty_var = tk.StringVar(value="1")
         ctk.CTkEntry(qty_row, textvariable=self.qty_var, width=70).pack(side="left", padx=8)
         styled_button(qty_row, "Add to Cart", self.add_selected_to_cart).pack(side="left")
 
-        ctk.CTkLabel(self, text="Quick Items (top sellers - tap to add):",
+        ctk.CTkLabel(body, text="Quick Items (top sellers - tap to add):",
                      text_color=theme.TEXT_MUTED, font=ctk.CTkFont(size=11)).pack(anchor="w", padx=24, pady=(4, 0))
-        self.quick_items_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.quick_items_frame = ctk.CTkFrame(body, fg_color="transparent")
         self.quick_items_frame.pack(fill="x", padx=24, pady=(2, 6))
         self.tier_var.trace_add("write", lambda *a: self._refresh_quick_items())
 
-        cart_frame = ctk.CTkFrame(self, fg_color="transparent")
+        cart_frame = ctk.CTkFrame(body, fg_color="transparent")
         cart_frame.pack(fill="both", expand=True, padx=24, pady=(6, 0))
         self.cart_tree = make_treeview(
             cart_frame, ["Item", "Qty", "Unit Price", "Line Total"],
@@ -297,7 +310,7 @@ class POSScreen(BaseScreen):
         )
         self.cart_tree.master_frame.pack(fill="both", expand=True)
 
-        bottom = ctk.CTkFrame(self, fg_color="transparent")
+        bottom = ctk.CTkFrame(body, fg_color="transparent")
         bottom.pack(fill="x", padx=24, pady=(4, 0))
         styled_button(bottom, "Remove Selected Line", self.remove_selected_line, kind="secondary").pack(side="left")
         styled_button(bottom, "Clear Cart", self.clear_cart, kind="secondary").pack(side="left", padx=8)
@@ -311,7 +324,7 @@ class POSScreen(BaseScreen):
         # or a smaller/scaled-up-DPI screen instead of running off the edge -
         # four buttons packed at their natural width stopped fitting once
         # "Phone Scanner" was added here.
-        bottom2 = ctk.CTkFrame(self, fg_color="transparent")
+        bottom2 = ctk.CTkFrame(body, fg_color="transparent")
         bottom2.pack(fill="x", padx=24, pady=(8, 12))
         for col in range(4):
             bottom2.grid_columnconfigure(col, weight=1, uniform="bottom2")
