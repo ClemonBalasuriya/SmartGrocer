@@ -789,7 +789,7 @@ class InventoryScreen(BaseScreen):
         btn_row.pack(fill="x", padx=24)
         styled_button(btn_row, "Refresh", self.refresh, kind="secondary").pack(side="left")
         styled_button(btn_row, "Export CSV", self.export, kind="secondary").pack(side="left", padx=8)
-        styled_button(btn_row, "Add New Product", self.open_add_product_dialog, kind="primary").pack(side="left", padx=8)
+        styled_button(btn_row, "Add / Scan Item", self.open_add_product_dialog, kind="primary").pack(side="left", padx=8)
         styled_button(btn_row, "Receive Stock (GRN)", self.open_grn_dialog, kind="primary").pack(side="left", padx=8)
 
         tree_frame = ctk.CTkFrame(self, fg_color="transparent")
@@ -853,22 +853,14 @@ class InventoryScreen(BaseScreen):
                 idx = names.index(product_var.get())
                 product = products[idx]
                 qty = float(qty_var.get())
-                cost = float(cost_var.get()) if cost_var.get() else (
-                    self.conn.execute("SELECT cost_price FROM products WHERE id=?", (product["id"],)).fetchone()["cost_price"])
+                cost = float(cost_var.get()) if cost_var.get().strip() else None
                 expiry = expiry_var.get().strip() or None
-                if expiry:
-                    date.fromisoformat(expiry)  # validates format
                 supplier_id = None
                 if supplier_var.get() != "(none)":
                     match = next((s for s in suppliers_list if s["name"] == supplier_var.get()), None)
                     supplier_id = match["id"] if match else None
-                self.conn.execute(
-                    """INSERT INTO stock_batches (product_id,batch_no,qty_received,qty_remaining,
-                       received_date,expiry_date,cost_price,supplier_id) VALUES (?,?,?,?,?,?,?,?)""",
-                    (product["id"], f"GRN-MANUAL-{date.today().isoformat()}", qty, qty,
-                     date.today().isoformat(), expiry, cost, supplier_id),
-                )
-                self.conn.commit()
+                pos.receive_stock(self.conn, product_id=product["id"], qty=qty, cost_price=cost,
+                                   expiry_date=expiry, supplier_id=supplier_id)
                 dialog.destroy()
                 self.refresh()
             except ValueError as e:
@@ -877,27 +869,38 @@ class InventoryScreen(BaseScreen):
         styled_button(dialog, "Save", save, kind="primary", width=140).pack(pady=18)
 
     def open_add_product_dialog(self):
-        """Register a brand-new product in the catalog - not receiving more
-        stock of something that already exists (that's the GRN dialog
-        above), but creating the product record itself for the first time.
-        The barcode/code field can be filled by typing on the keyboard, by
-        a USB/Bluetooth barcode scanner (it just types the digits into
+        """One entry point for "put an item into the store" that figures
+        out which of two things you mean, from the barcode itself - you
+        shouldn't have to know in advance whether a product is already in
+        the catalog before you can scan it in:
+
+        - Scan/type a code that's NOT in the catalog yet -> this is a
+          brand-new product, so the full details form appears (name,
+          category, prices, etc.) to register it for the first time.
+        - Scan/type a code that IS already in the catalog -> there's
+          nothing to ask except how many more units just came in, so it
+          shows the existing product's name/category/current stock and
+          just asks for the quantity received (same as the "Receive Stock
+          (GRN)" dialog, sharing pos.receive_stock with it).
+
+        The barcode field can be filled by typing on the keyboard, by a
+        USB/Bluetooth barcode scanner (it just types the digits into
         whichever field has focus, so the field is auto-focused for that),
         or by scanning it with a phone via the same phone-scanner feature
         used at the till."""
         dialog = ctk.CTkToplevel(self)
-        dialog.title("Add New Product")
-        dialog.geometry("440x760")
+        dialog.title("Add / Scan Item")
+        dialog.geometry("440x780")
         dialog.configure(fg_color=theme.BG_LIGHT)
         dialog.grab_set()
 
         body = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
         body.pack(fill="both", expand=True)
 
-        def field(label, initial=""):
-            ctk.CTkLabel(body, text=label).pack(anchor="w", padx=16, pady=(10, 0))
+        def field(parent, label, initial=""):
+            ctk.CTkLabel(parent, text=label).pack(anchor="w", padx=16, pady=(10, 0))
             var = tk.StringVar(value=initial)
-            entry = ctk.CTkEntry(body, textvariable=var)
+            entry = ctk.CTkEntry(parent, textvariable=var)
             entry.pack(fill="x", padx=16)
             return var, entry
 
@@ -909,30 +912,41 @@ class InventoryScreen(BaseScreen):
         code_entry.pack(side="left", fill="x", expand=True)
         styled_button(
             code_row, "Scan with Phone",
-            lambda: self._open_phone_capture_dialog(lambda scanned: code_var.set(scanned)),
+            lambda: self._open_phone_capture_dialog(lambda scanned: (code_var.set(scanned), check_code())),
             kind="secondary", width=130,
         ).pack(side="left", padx=(8, 0))
-        ctk.CTkLabel(body, text="Type it, use a USB/Bluetooth scanner (it types into this box like a "
-                                 "keyboard), or tap \"Scan with Phone\".",
-                     text_color=theme.TEXT_MUTED, font=ctk.CTkFont(size=11),
-                     wraplength=380, justify="left").pack(anchor="w", padx=16, pady=(2, 0))
 
-        name_en_var, _ = field("Product name (English):")
-        name_si_var, _ = field("Product name (Sinhala, optional):")
-        category_var, _ = field("Category:")
-        unit_var, _ = field("Unit (e.g. pcs, kg, g, L):", "pcs")
+        status_label = ctk.CTkLabel(
+            body, text="Type, scan with a USB/Bluetooth scanner, or tap \"Scan with Phone\" - "
+                       "then press Enter (or click away) to check the catalog.",
+            text_color=theme.TEXT_MUTED, font=ctk.CTkFont(size=11), wraplength=380, justify="left",
+        )
+        status_label.pack(anchor="w", padx=16, pady=(6, 6))
 
-        cost_var, _ = field("Cost price (what you pay):")
-        cash_var, _ = field("Cash selling price:")
-        credit_var, _ = field("Credit selling price (blank = same as cash):")
-        wholesale_var, _ = field("Wholesale price (blank = same as cost):")
+        # --- Existing-product path: just ask how much stock came in. ---
+        existing_frame = ctk.CTkFrame(body, fg_color="transparent")
+        existing_info = ctk.CTkLabel(existing_frame, text="", text_color=theme.NAVY_DARK,
+                                      font=ctk.CTkFont(size=13, weight="bold"), wraplength=380, justify="left")
+        existing_info.pack(anchor="w", padx=16, pady=(4, 8))
+        qty_received_var, _ = field(existing_frame, "Quantity received:", "10")
+        existing_cost_var, _ = field(existing_frame, "Cost price (per unit, blank = use last cost):")
+        existing_expiry_var, _ = field(existing_frame, "Expiry date (YYYY-MM-DD, blank if none):")
 
-        pack_size_var, _ = field("Pack size (units per pack):", "1")
-        reorder_var, _ = field("Reorder level (low-stock alert threshold):", "10")
-        initial_qty_var, _ = field("Opening stock quantity (optional):", "0")
-        expiry_var, _ = field("Expiry date (YYYY-MM-DD, optional):")
-
-        flags_row = ctk.CTkFrame(body, fg_color="transparent")
+        # --- New-product path: the full catalog-entry form. ---
+        new_frame = ctk.CTkFrame(body, fg_color="transparent")
+        name_en_var, _ = field(new_frame, "Product name (English):")
+        name_si_var, _ = field(new_frame, "Product name (Sinhala, optional):")
+        category_var, _ = field(new_frame, "Category:")
+        unit_var, _ = field(new_frame, "Unit (e.g. pcs, kg, g, L):", "pcs")
+        cost_var, _ = field(new_frame, "Cost price (what you pay):")
+        cash_var, _ = field(new_frame, "Cash selling price:")
+        credit_var, _ = field(new_frame, "Credit selling price (blank = same as cash):")
+        wholesale_var, _ = field(new_frame, "Wholesale price (blank = same as cost):")
+        pack_size_var, _ = field(new_frame, "Pack size (units per pack):", "1")
+        reorder_var, _ = field(new_frame, "Reorder level (low-stock alert threshold):", "10")
+        initial_qty_var, _ = field(new_frame, "Opening stock quantity (optional):", "0")
+        expiry_var, _ = field(new_frame, "Expiry date (YYYY-MM-DD, optional):")
+        flags_row = ctk.CTkFrame(new_frame, fg_color="transparent")
         flags_row.pack(fill="x", padx=16, pady=(14, 0))
         perishable_var = tk.BooleanVar(value=False)
         staple_var = tk.BooleanVar(value=False)
@@ -941,9 +955,35 @@ class InventoryScreen(BaseScreen):
         ctk.CTkCheckBox(flags_row, text="Staple item", variable=staple_var).pack(side="left", padx=12)
         ctk.CTkCheckBox(flags_row, text="Child-target item", variable=child_var).pack(side="left")
 
-        def save():
+        save_btn = styled_button(dialog, "Save", lambda: None, kind="primary", width=160)
+        save_btn.pack(pady=16)
+
+        state = {"mode": None, "product": None}
+
+        def save_existing():
+            code = code_var.get().strip()
+            product = pos.get_product_by_code(self.conn, code)
+            if product is None:
+                messagebox.showerror("Invalid input", "That barcode no longer matches a product - re-check it.")
+                check_code()
+                return
             try:
-                product_id = pos.add_product(
+                pos.receive_stock(
+                    self.conn, product_id=product["id"],
+                    qty=float(qty_received_var.get() or 0),
+                    cost_price=float(existing_cost_var.get()) if existing_cost_var.get().strip() else None,
+                    expiry_date=existing_expiry_var.get().strip() or None,
+                )
+            except ValueError as e:
+                messagebox.showerror("Invalid input", str(e))
+                return
+            dialog.destroy()
+            self.refresh()
+            messagebox.showinfo("Stock added", f"Added {qty_received_var.get()} {product['unit']} to '{product['name_en']}'.")
+
+        def save_new():
+            try:
+                pos.add_product(
                     self.conn,
                     code=code_var.get(),
                     name_en=name_en_var.get(),
@@ -969,7 +1009,40 @@ class InventoryScreen(BaseScreen):
             self.refresh()
             messagebox.showinfo("Product added", f"'{name_en_var.get().strip()}' was added to the catalog.")
 
-        styled_button(dialog, "Save Product", save, kind="primary", width=160).pack(pady=16)
+        def check_code(event=None):
+            code = code_var.get().strip()
+            if not code:
+                existing_frame.pack_forget()
+                new_frame.pack_forget()
+                save_btn.configure(state="disabled")
+                status_label.configure(text="Type, scan with a USB/Bluetooth scanner, or tap \"Scan with "
+                                             "Phone\" - then press Enter (or click away) to check the catalog.")
+                state["mode"] = None
+                return
+            product = pos.get_product_by_code(self.conn, code)
+            save_btn.configure(state="normal")
+            if product is not None:
+                state["mode"] = "existing"
+                new_frame.pack_forget()
+                on_hand = pos.get_stock_on_hand(self.conn, product["id"])
+                existing_info.configure(
+                    text=f"Already in the catalog: {product['name_en']} ({product['category']}) - "
+                         f"{on_hand:.0f} {product['unit']} in stock now. Just enter how many more came in."
+                )
+                existing_frame.pack(fill="x")
+                status_label.configure(text=f"Found an existing product for code '{code}'.")
+                save_btn.configure(text="Add Stock", command=save_existing)
+            else:
+                state["mode"] = "new"
+                existing_frame.pack_forget()
+                new_frame.pack(fill="x")
+                status_label.configure(text=f"Code '{code}' isn't in the catalog yet - fill in the new "
+                                             f"product's details below.")
+                save_btn.configure(text="Save New Product", command=save_new)
+
+        code_entry.bind("<Return>", check_code)
+        code_entry.bind("<FocusOut>", check_code)
+        save_btn.configure(state="disabled")
         dialog.after(150, code_entry.focus_set)
 
     def _open_phone_capture_dialog(self, on_captured):

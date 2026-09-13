@@ -449,6 +449,30 @@ def test_add_product_creates_catalog_entry_with_opening_stock():
             pass
 
 
+def test_receive_stock_tops_up_existing_product():
+    # This is the "already in the catalog - just ask the quantity" path of
+    # the Inventory screen's "Add / Scan Item" dialog (and the GRN dialog),
+    # as opposed to add_product which creates a brand-new catalog entry.
+    conn = _fresh_db()
+    p = conn.execute("SELECT * FROM products LIMIT 1").fetchone()
+    before = pos.get_stock_on_hand(conn, p["id"])
+    pos.receive_stock(conn, product_id=p["id"], qty=15)
+    after = pos.get_stock_on_hand(conn, p["id"])
+    assert after == before + 15
+
+    # Zero/negative quantity and an unknown product are rejected clearly.
+    try:
+        pos.receive_stock(conn, product_id=p["id"], qty=0)
+        assert False, "expected ValueError for zero quantity"
+    except ValueError:
+        pass
+    try:
+        pos.receive_stock(conn, product_id=999999, qty=5)
+        assert False, "expected ValueError for unknown product"
+    except ValueError:
+        pass
+
+
 def test_receipt_text_includes_key_fields():
     conn = _fresh_db()
     p = _product_with_stock(conn, min_qty=1)

@@ -158,6 +158,43 @@ def add_product(
     return product_id
 
 
+def receive_stock(
+    conn: sqlite3.Connection,
+    *,
+    product_id: int,
+    qty: float,
+    cost_price: float | None = None,
+    expiry_date: str | None = None,
+    supplier_id: int | None = None,
+    batch_no: str | None = None,
+) -> int:
+    """Add stock for a product that ALREADY exists in the catalog (a
+    restock / GRN) - as opposed to add_product, which creates the catalog
+    entry in the first place. Shared by the Inventory screen's "Receive
+    Stock (GRN)" dialog and the "Add / Scan Item" dialog's existing-product
+    path, so both go through the same validated, tested code."""
+    product = conn.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone()
+    if product is None:
+        raise ValueError("Product not found")
+    if qty <= 0:
+        raise ValueError("Quantity received must be greater than zero")
+    if cost_price is None:
+        cost_price = product["cost_price"]
+    if cost_price < 0:
+        raise ValueError("Cost price cannot be negative")
+    if expiry_date:
+        datetime.strptime(expiry_date, "%Y-%m-%d")  # raises ValueError if malformed
+
+    batch_no = batch_no or f"GRN-MANUAL-{datetime.now().date().isoformat()}"
+    cur = conn.execute(
+        """INSERT INTO stock_batches (product_id,batch_no,qty_received,qty_remaining,
+           received_date,expiry_date,cost_price,supplier_id) VALUES (?,?,?,?,?,?,?,?)""",
+        (product_id, batch_no, qty, qty, datetime.now().date().isoformat(), expiry_date, cost_price, supplier_id),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
 def get_stock_on_hand(conn: sqlite3.Connection, product_id: int) -> float:
     row = conn.execute(
         "SELECT COALESCE(SUM(qty_remaining),0) q FROM stock_batches WHERE product_id=?",
