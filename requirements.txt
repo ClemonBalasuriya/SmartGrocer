@@ -5,3 +5,4 @@ matplotlib>=3.7
 statsmodels>=0.14
 customtkinter>=5.2
 pillow>=10.0
+opencv-contrib-python>=4.8   # barcode/QR decoding for the phone-scanner companion (mobile_scan.py)

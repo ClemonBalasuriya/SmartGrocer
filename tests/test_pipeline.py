@@ -15,9 +15,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import base64
+import http.client
+import json
+
 from smartgrocer import (
-    association, cash_drawer, customers, data_generator, db, forecasting, layout, pos, promotions,
-    receipts, reports, staff, suppliers,
+    association, cash_drawer, customers, data_generator, db, forecasting, layout, mobile_scan, pos,
+    promotions, receipts, reports, staff, suppliers,
 )
 
 
@@ -306,6 +310,67 @@ def test_staff_add_reset_pin_and_deactivate():
         assert False, "should have rejected an unknown role"
     except ValueError:
         pass
+
+
+def test_mobile_scan_server_end_to_end():
+    # Exercises the phone-scanner companion the same way a real phone
+    # would: a plain HTTP POST carrying a photo, decoded server-side.
+    # Uses a self-generated QR code as the "photo" (OpenCV can't generate
+    # a 1D barcode to test against, but the decode path is identical
+    # either way - see mobile_scan._decode_code) to keep this test free of
+    # any external test-image file.
+    conn = _fresh_db()
+    db_path = conn.execute("PRAGMA database_list").fetchone()["file"]
+    p = conn.execute("SELECT * FROM products LIMIT 1").fetchone()
+    seen = []
+
+    def on_scan(code):
+        # Mirrors POSScreen.handle_phone_scan: this callback runs on the
+        # HTTP server's own background thread, so - like that real code -
+        # it must open its own connection rather than reuse one created on
+        # the test's (main) thread; sqlite3 connections aren't shareable
+        # across threads.
+        seen.append(code)
+        scan_conn = db.get_conn(db_path)
+        try:
+            product = pos.get_product_by_code(scan_conn, code)
+        finally:
+            scan_conn.close()
+        if product is None:
+            return {"unknown": True}
+        return {"name": product["name_en"], "added": True}
+
+    server = mobile_scan.MobileScanServer(on_scan)
+    server.start()
+    try:
+        png = mobile_scan.generate_qr_png_bytes(p["code"])
+        b64 = base64.b64encode(png).decode()
+        body = json.dumps({"code": server.pairing_code, "image": "data:image/png;base64," + b64})
+
+        conn2 = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
+        conn2.request("POST", "/scan", body=body, headers={"Content-Type": "application/json"})
+        resp = json.loads(conn2.getresponse().read())
+        assert resp == {"ok": True, "found": True, "code": p["code"], "name": p["name_en"], "added": True}
+        assert seen == [p["code"]]
+
+        # wrong pairing code must be rejected without ever reaching on_scan
+        conn3 = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
+        bad_body = json.dumps({"code": "0000", "image": "data:image/png;base64," + b64})
+        conn3.request("POST", "/scan", body=bad_body, headers={"Content-Type": "application/json"})
+        resp2 = json.loads(conn3.getresponse().read())
+        assert resp2 == {"ok": False, "error": "wrong_pairing_code"}
+        assert seen == [p["code"]]  # unchanged - the bad request never called on_scan
+
+        # a barcode/QR that isn't in the catalogue is reported, not crashed on
+        unknown_png = mobile_scan.generate_qr_png_bytes("no-such-code-999")
+        unknown_b64 = base64.b64encode(unknown_png).decode()
+        conn4 = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
+        unknown_body = json.dumps({"code": server.pairing_code, "image": "data:image/png;base64," + unknown_b64})
+        conn4.request("POST", "/scan", body=unknown_body, headers={"Content-Type": "application/json"})
+        resp3 = json.loads(conn4.getresponse().read())
+        assert resp3["found"] is True and resp3.get("unknown") is True
+    finally:
+        server.stop()
 
 
 def test_barcode_exact_match_lookup():

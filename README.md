@@ -44,6 +44,8 @@ below) once you have one.
 - **Cash Sessions** report - the full history of day-open/day-close cycles with expected vs counted cash and variance.
 - **Barcode-scanner scan-to-cart** - the POS screen's search box auto-focuses the moment you open it, and typing/scanning an *exact* product code (any USB or Bluetooth barcode scanner just types the code + Enter into whatever field has focus - no driver/integration needed) adds it straight to the cart at one click's fewer effort than before. A phone running a free scanner app such as "Barcode to PC" (connected over the shop Wi-Fi) works the same way, including for QR codes, with zero code changes needed here.
 - **Performance fixes** - two real, measured causes of the app feeling slow as transaction history grows, both fixed this round: (1) several report/dashboard queries wrapped the `datetime`/`expiry_date` columns in `date(...)` in their `WHERE` clause, which stops SQLite from using the existing indexes and forces a full table scan - rewritten to compare against the raw ISO8601 strings directly (see `reports.py`'s and `promotions.py`'s module notes); (2) the Forecasting, Bundle Recommendations, and Store Layout screens ran their SARIMA/Apriori/clustering computation directly on the GUI thread, freezing the whole window - they now run on a background thread (`gui/screens.py`'s `run_in_background` helper) with their own database connection, so the window stays responsive while a spinner/status label shows progress.
+- **Staff management screen** (`smartgrocer/staff.py`, Staff screen) - add cashier/admin accounts and set their login PIN from inside the app instead of needing a developer to edit the database by hand. Only whoever is currently logged in as Admin can add staff, reset a PIN, or deactivate someone; deactivating (not deleting) keeps that person's name on their past invoices and cash sessions.
+- **Phone-as-barcode-scanner companion** (`smartgrocer/mobile_scan.py`, POS screen's "Phone Scanner" button) - turns any phone on the shop's Wi-Fi into a second scanner with nothing to install: the phone opens a plain web page (scan a QR code shown on the till, or type the address), photographs a barcode/QR code with its normal camera app, and the item lands in the cart on the till a moment later. Works identically on Android and iPhone since it's a browser page, not a native app; a short pairing code (shown on the till) stops anyone else on the shop Wi-Fi from adding to a stranger's cart. See the module's docstring for why this uses plain HTTP requests and OpenCV decoding rather than a live camera feed over WebSocket - in short, a live in-page camera feed needs HTTPS (which means a self-signed certificate and a scary browser warning on every phone), and a request/response per photo already gets the "instant" feel without any of that, or a hand-written protocol to get right. Needs `opencv-contrib-python` (added to `requirements.txt`) - a `pip install -r requirements.txt` is needed after pulling this update.
 
 These were added because this system is meant for the shop's actual day-to-day operation, not only as a decision-support/analytics layer - the four analytics objectives from the proposal are still there underneath, but the POS itself now behaves like a till a cashier would use every day.
 
@@ -61,6 +63,8 @@ smartgrocer/
   suppliers.py       supplier master records + received-stock summary
   cash_drawer.py     day open/close: opening float, expected vs counted cash, variance
   receipts.py        printable per-sale receipt generation
+  staff.py           cashier/admin accounts: add, reset PIN, deactivate
+  mobile_scan.py     phone-as-barcode-scanner companion (local HTTP server + OpenCV decode)
   forecasting.py     SARIMA/SARIMAX/Holt-Winters/Seasonal Naive + model selection
   promotions.py      urgency scoring, tiered expiry alerts, discount suggestion
   association.py     Apriori from scratch, bundle recommendations
@@ -106,7 +110,8 @@ POS checkout/void/oversell-guard, forecasting + anomaly detection, Apriori
 rule recovery, promotion scoring bounds, layout coverage, report KPIs,
 customer credit/settlement/limit enforcement, item returns, hold/resume
 cart, split payment, supplier summary, cash drawer open/close/variance,
-receipt text, and exact-barcode lookup) - all 21 currently pass.
+receipt text, exact-barcode lookup, staff account management, and the
+phone-scanner's HTTP server end-to-end) - all 23 currently pass.
 
 ## A development note worth knowing for your viva
 

@@ -18,6 +18,7 @@ from .. import customers as customers_module
 from .. import receipts as receipts_module
 from .. import suppliers as suppliers_module
 from .. import staff as staff_module
+from .. import mobile_scan
 from .. import db as db_module
 from . import theme
 from .theme import tree_clear, tree_insert
@@ -311,6 +312,8 @@ class POSScreen(BaseScreen):
         styled_button(bottom2, "Hold Invoice", self.hold_invoice, kind="secondary").pack(side="left")
         styled_button(bottom2, "Resume Held", self.resume_invoice, kind="secondary").pack(side="left", padx=8)
         styled_button(bottom2, "Return / Refund", self.open_return_dialog, kind="danger").pack(side="left", padx=8)
+        styled_button(bottom2, "Phone Scanner", self.open_phone_scanner_dialog, kind="secondary").pack(
+            side="left", padx=8)
 
         self._search_results: list = []
 
@@ -368,6 +371,81 @@ class POSScreen(BaseScreen):
         tier_field = {"cash": "cash_price", "credit": "credit_price", "wholesale": "wholesale_price"}[self.tier_var.get()]
         self.cart.append({"product_id": product_id, "name": p["name_en"], "qty": 1.0, "unit_price": p[tier_field]})
         self.refresh_cart()
+
+    def handle_phone_scan(self, code: str) -> dict:
+        """Called from the phone-scanner's own background HTTP thread
+        (see mobile_scan.MobileScanServer) - never the Tkinter thread, so
+        this opens its own database connection rather than touching
+        self.conn, and hands the actual cart update back to the main
+        thread via .after() instead of mutating self.cart here directly.
+        The response returned to the phone is answered from the DB lookup
+        alone (not from waiting on that main-thread update), which is
+        simpler than cross-thread synchronization and is right in all but
+        a vanishingly rare failure between this reply and the .after()
+        call actually running."""
+        conn = db_module.get_conn(self.app.db_path)
+        try:
+            product = pos.get_product_by_code(conn, code)
+        finally:
+            conn.close()
+        if product is None:
+            return {"unknown": True}
+        self.after(0, lambda: self._quick_add(product["id"]))
+        return {"name": product["name_en"], "added": True}
+
+    def open_phone_scanner_dialog(self):
+        if getattr(self.app, "mobile_scan_server", None) is None:
+            self.app.mobile_scan_server = mobile_scan.MobileScanServer(self.handle_phone_scan)
+        server = self.app.mobile_scan_server
+        if not server.running:
+            try:
+                server.start()
+            except OSError as e:
+                messagebox.showerror("Could not start phone scanner", str(e))
+                return
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Phone Scanner")
+        dialog.geometry("380x560")
+        dialog.configure(fg_color=theme.BG_LIGHT)
+        dialog.grab_set()
+
+        ctk.CTkLabel(dialog, text="Scan this with your phone's camera app", font=ctk.CTkFont(size=13, weight="bold"),
+                     text_color=theme.NAVY_DARK).pack(pady=(16, 6))
+
+        try:
+            from PIL import Image
+            import io
+            png_bytes = mobile_scan.generate_qr_png_bytes(server.url)
+            qr_img = Image.open(io.BytesIO(png_bytes))
+            ctk_qr = ctk.CTkImage(light_image=qr_img, dark_image=qr_img, size=(220, 220))
+            ctk.CTkLabel(dialog, image=ctk_qr, text="").pack(pady=6)
+        except Exception:
+            pass  # the URL/code below still work even if the QR image can't be rendered here
+
+        ctk.CTkLabel(dialog, text="or open this address in the phone's browser:",
+                     text_color=theme.TEXT_MUTED, font=ctk.CTkFont(size=11)).pack(pady=(6, 0))
+        ctk.CTkLabel(dialog, text=server.url, font=ctk.CTkFont(size=13, weight="bold"),
+                     text_color=theme.ACCENT_BLUE).pack(pady=(0, 12))
+
+        ctk.CTkLabel(dialog, text="Then enter this pairing code once on the phone:",
+                     text_color=theme.TEXT_MUTED, font=ctk.CTkFont(size=11)).pack()
+        ctk.CTkLabel(dialog, text=server.pairing_code, font=ctk.CTkFont(size=30, weight="bold"),
+                     text_color=theme.NAVY_DARK).pack(pady=(2, 14))
+
+        ctk.CTkLabel(
+            dialog,
+            text="Both devices must be on the same Wi-Fi. Scans keep landing in this "
+                 "cart even while this window is closed - close it and keep ringing up "
+                 "items on the till at the same time.",
+            text_color=theme.TEXT_MUTED, font=ctk.CTkFont(size=11), wraplength=320, justify="left",
+        ).pack(padx=20, pady=(0, 14))
+
+        def stop_server():
+            server.stop()
+            dialog.destroy()
+
+        styled_button(dialog, "Stop Phone Scanner", stop_server, kind="danger", width=200).pack(pady=(0, 16))
 
     def do_search(self):
         query = self.search_var.get().strip()

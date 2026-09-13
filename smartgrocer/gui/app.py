@@ -40,7 +40,7 @@ NAV_ITEMS = [
     ("🔗  Bundle Recommendations", "bundles", screens.BundlesScreen),
     ("🗺️  Store Layout", "layout", screens.LayoutScreen),
     ("📄  Reports", "reports", screens.ReportsScreen),
-    ("🧑‍💼  Staff", "staff", screens.StaffScreen),
+    ("👤  Staff", "staff", screens.StaffScreen),
 ]
 
 
@@ -56,6 +56,8 @@ class SmartGrocerApp(ctk.CTk):
         db.init_db(self.conn)
         self.current_staff_id = 1  # default to Admin until someone logs in via the sidebar
         self.logged_in = False
+        self.mobile_scan_server = None  # lazily created the first time POS opens "Phone Scanner"
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         theme.apply_global_style()
         self.configure(fg_color=theme.BG_LIGHT)
@@ -247,6 +249,11 @@ class SmartGrocerApp(ctk.CTk):
 
         ctk.CTkButton(dialog, text="Close Day", command=submit, fg_color=theme.DANGER_RED,
                       hover_color=theme.DANGER_RED_HOVER).pack(pady=20)
+
+    def _on_close(self):
+        if self.mobile_scan_server is not None and self.mobile_scan_server.running:
+            self.mobile_scan_server.stop()
+        self.destroy()
 
 
 def run(db_path=None):
