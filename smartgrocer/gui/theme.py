@@ -36,6 +36,7 @@ ALERT_COLORS = {
     "critical_3day": "#FBD3A2",
     "warning_7day": "#FBF3A2",
     "low": "#FBD9D9",
+    "inactive": "#DADFE6",   # removed/deactivated item - greyed out, still visible so Owner can reactivate it
 }
 
 

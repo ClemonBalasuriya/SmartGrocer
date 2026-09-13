@@ -63,14 +63,41 @@ def search_products(conn: sqlite3.Connection, query: str, limit: int = 25) -> li
     ).fetchall()
 
 
+def _barcode_variants(code: str) -> list[str]:
+    """A UPC-A barcode (12 digits) and its EAN-13 form (13 digits, same
+    number with a leading zero) are physically the same barcode, but the
+    phone camera's decoder doesn't always report the same one from scan to
+    scan (the manufacturer's printed barcode is UPC-A; some reads come
+    back as its EAN-13-equivalent with a leading zero added). Without this,
+    a product saved from one reading could fail to match a later scan that
+    decodes to the other, equally valid, form. Only kicks in for all-digit
+    12/13-length codes, so short PLU/manual codes are never affected."""
+    code = (code or "").strip()
+    variants = [code]
+    if code.isdigit():
+        if len(code) == 12:
+            variants.append("0" + code)
+        elif len(code) == 13 and code.startswith("0"):
+            variants.append(code[1:])
+    return variants
+
+
 def get_product_by_code(conn: sqlite3.Connection, code: str) -> sqlite3.Row | None:
-    return conn.execute("SELECT * FROM products WHERE code=? AND active=1", (code,)).fetchone()
+    for variant in _barcode_variants(code):
+        row = conn.execute("SELECT * FROM products WHERE code=? AND active=1", (variant,)).fetchone()
+        if row is not None:
+            return row
+    return None
 
 
 def get_product_by_code_any(conn: sqlite3.Connection, code: str) -> sqlite3.Row | None:
     """Like get_product_by_code but also matches inactive/deleted products
     (used to give a clear "already exists" error when adding a new product)."""
-    return conn.execute("SELECT * FROM products WHERE code=?", (code,)).fetchone()
+    for variant in _barcode_variants(code):
+        row = conn.execute("SELECT * FROM products WHERE code=?", (variant,)).fetchone()
+        if row is not None:
+            return row
+    return None
 
 
 def add_product(
@@ -156,6 +183,100 @@ def add_product(
 
     conn.commit()
     return product_id
+
+
+def update_product(
+    conn: sqlite3.Connection,
+    product_id: int,
+    *,
+    name_en: str,
+    name_si: str = "",
+    category: str,
+    unit: str = "pcs",
+    cost_price: float,
+    cash_price: float,
+    credit_price: float | None = None,
+    wholesale_price: float | None = None,
+    pack_size: int = 1,
+    reorder_level: int = 10,
+    is_perishable: bool = False,
+    is_staple: bool = False,
+    child_target: bool = False,
+) -> None:
+    """Edit an existing product's details - name, category, prices, pack
+    size, reorder level, shelf-placement flags. The barcode/code itself is
+    NOT editable here: it's how every scan and every past stock batch/
+    invoice line identifies the product, so changing it could silently
+    disconnect history from the item it belongs to - add a new product
+    instead if the code was genuinely wrong. Available to Admin/Owner from
+    the Inventory screen's "Edit Item" button; unlike deactivate_product,
+    this doesn't touch stock levels at all."""
+    product = conn.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone()
+    if product is None:
+        raise ValueError("Product not found")
+
+    name_en = (name_en or "").strip()
+    category = (category or "").strip()
+    unit = (unit or "pcs").strip() or "pcs"
+
+    if not name_en:
+        raise ValueError("Product name cannot be blank")
+    if not category:
+        raise ValueError("Category cannot be blank")
+    if cost_price < 0:
+        raise ValueError("Cost price cannot be negative")
+    if cash_price <= 0:
+        raise ValueError("Selling (cash) price must be greater than zero")
+    if credit_price is None:
+        credit_price = cash_price
+    if wholesale_price is None:
+        wholesale_price = cost_price
+    if pack_size < 1:
+        raise ValueError("Pack size must be at least 1")
+    if reorder_level < 0:
+        raise ValueError("Reorder level cannot be negative")
+
+    conn.execute(
+        """UPDATE products SET name_en=?, name_si=?, category=?, unit=?, cost_price=?,
+           cash_price=?, credit_price=?, wholesale_price=?, pack_size=?, reorder_level=?,
+           is_perishable=?, is_staple=?, child_target=? WHERE id=?""",
+        (name_en, (name_si or "").strip(), category, unit, cost_price, cash_price,
+         credit_price, wholesale_price, pack_size, reorder_level,
+         1 if is_perishable else 0, 1 if is_staple else 0, 1 if child_target else 0, product_id),
+    )
+    conn.commit()
+
+
+def deactivate_product(conn: sqlite3.Connection, product_id: int) -> None:
+    """Take a product off the active catalog/Inventory list - WITHOUT ever
+    deleting its row. stock_batches and invoice_items reference a product
+    by id, so a real DELETE would either break those references or
+    silently orphan historical stock/sales figures against an item nobody
+    can look up anymore (the same reasoning staff.py already applies to
+    staff: deactivate, never delete). Also zeroes remaining quantity on
+    every stock batch rather than leaving stale "phantom" stock on hand for
+    an item nobody can sell anymore - the batch rows themselves stay
+    untouched otherwise, so received-stock/cost history is preserved.
+    Owner-only from the GUI (see gui/screens.py's InventoryScreen)."""
+    product = conn.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone()
+    if product is None:
+        raise ValueError("Product not found")
+    conn.execute("UPDATE products SET active=0 WHERE id=?", (product_id,))
+    conn.execute("UPDATE stock_batches SET qty_remaining=0 WHERE product_id=?", (product_id,))
+    conn.commit()
+
+
+def reactivate_product(conn: sqlite3.Connection, product_id: int) -> None:
+    """Undo deactivate_product - brings a removed item back onto the active
+    catalog/Inventory list. Stock stays at zero (it was zeroed on
+    deactivation, on purpose) - use Receive Stock (GRN) or the Add/Scan
+    Item dialog afterwards to bring in fresh stock, same as for any other
+    restock. Owner-only from the GUI."""
+    product = conn.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone()
+    if product is None:
+        raise ValueError("Product not found")
+    conn.execute("UPDATE products SET active=1 WHERE id=?", (product_id,))
+    conn.commit()
 
 
 def receive_stock(
