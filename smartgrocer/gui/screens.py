@@ -24,10 +24,10 @@ from . import theme
 from .theme import tree_clear, tree_insert
 
 
-def make_treeview(parent, columns: list[str], widths: dict[str, int] | None = None) -> ttk.Treeview:
+def make_treeview(parent, columns: list[str], widths: dict[str, int] | None = None, rows: int = 16) -> ttk.Treeview:
     widths = widths or {}
     frame = ctk.CTkFrame(parent, fg_color="transparent")
-    tree = ttk.Treeview(frame, columns=columns, show="headings", height=16)
+    tree = ttk.Treeview(frame, columns=columns, show="headings", height=rows)
     for col in columns:
         tree.heading(col, text=col)
         tree.column(col, width=widths.get(col, 120), anchor="w")
@@ -284,8 +284,17 @@ class POSScreen(BaseScreen):
         self.results_tree = make_treeview(
             results_frame, ["Code", "Name", "Cash Price", "Stock"],
             {"Code": 90, "Name": 300, "Cash Price": 100, "Stock": 80},
+            rows=5,
         )
+        # .configure(height=...) alone doesn't stick here: by default a
+        # frame resizes itself to fit whatever its own children ask for
+        # (grid_propagate defaults to True), so the treeview's own natural
+        # height silently overrode the 140px request - this box was meant
+        # to be a compact 5-row search-results list, not one stretching to
+        # fill most of the window. grid_propagate(False) makes the
+        # requested height actually stick.
         self.results_tree.master_frame.configure(height=140)
+        self.results_tree.master_frame.grid_propagate(False)
         self.results_tree.master_frame.pack(fill="x")
         self.results_tree.bind("<Double-1>", lambda e: self.add_selected_to_cart())
 
