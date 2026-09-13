@@ -22,6 +22,7 @@ import customtkinter as ctk
 
 from .. import cash_drawer
 from .. import db
+from .. import staff as staff_module
 from . import screens
 from . import theme
 
@@ -39,6 +40,7 @@ NAV_ITEMS = [
     ("🔗  Bundle Recommendations", "bundles", screens.BundlesScreen),
     ("🗺️  Store Layout", "layout", screens.LayoutScreen),
     ("📄  Reports", "reports", screens.ReportsScreen),
+    ("🧑‍💼  Staff", "staff", screens.StaffScreen),
 ]
 
 
@@ -164,7 +166,7 @@ class SmartGrocerApp(ctk.CTk):
         dialog.configure(fg_color=theme.BG_LIGHT)
         dialog.grab_set()
 
-        staff_names = [r["name"] for r in self.conn.execute("SELECT name FROM staff").fetchall()]
+        staff_names = [r["name"] for r in staff_module.list_staff(self.conn, active_only=True)]
         ctk.CTkLabel(dialog, text="Staff:").pack(anchor="w", padx=16, pady=(16, 0))
         staff_var = tk.StringVar(value=staff_names[0] if staff_names else "")
         ctk.CTkOptionMenu(dialog, values=staff_names, variable=staff_var, width=280).pack(padx=16)
@@ -184,7 +186,9 @@ class SmartGrocerApp(ctk.CTk):
             ctk.CTkEntry(dialog, textvariable=float_var, width=280).pack(padx=16)
 
         def submit():
-            row = self.conn.execute("SELECT * FROM staff WHERE name=?", (staff_var.get(),)).fetchone()
+            row = self.conn.execute(
+                "SELECT * FROM staff WHERE name=? AND active=1", (staff_var.get(),)
+            ).fetchone()
             if row is None or row["pin"] != pin_var.get().strip():
                 messagebox.showerror("Login failed", "Incorrect PIN.")
                 return

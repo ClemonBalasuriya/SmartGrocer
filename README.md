@@ -42,8 +42,10 @@ below) once you have one.
 - **Printed receipts** (`smartgrocer/receipts.py`) - every completed sale saves a printable receipt to `exports/receipts/` and opens it with your default text viewer so you can Ctrl+P it.
 - **Quick-item buttons** on the POS screen - your top ~12 best-selling items appear as one-tap buttons so the cashier doesn't have to search/type every single sale.
 - **Cash Sessions** report - the full history of day-open/day-close cycles with expected vs counted cash and variance.
+- **Barcode-scanner scan-to-cart** - the POS screen's search box auto-focuses the moment you open it, and typing/scanning an *exact* product code (any USB or Bluetooth barcode scanner just types the code + Enter into whatever field has focus - no driver/integration needed) adds it straight to the cart at one click's fewer effort than before. A phone running a free scanner app such as "Barcode to PC" (connected over the shop Wi-Fi) works the same way, including for QR codes, with zero code changes needed here.
+- **Performance fixes** - two real, measured causes of the app feeling slow as transaction history grows, both fixed this round: (1) several report/dashboard queries wrapped the `datetime`/`expiry_date` columns in `date(...)` in their `WHERE` clause, which stops SQLite from using the existing indexes and forces a full table scan - rewritten to compare against the raw ISO8601 strings directly (see `reports.py`'s and `promotions.py`'s module notes); (2) the Forecasting, Bundle Recommendations, and Store Layout screens ran their SARIMA/Apriori/clustering computation directly on the GUI thread, freezing the whole window - they now run on a background thread (`gui/screens.py`'s `run_in_background` helper) with their own database connection, so the window stays responsive while a spinner/status label shows progress.
 
-These last five (credit accounts through cash drawer/receipts/quick-items) were added because this system is meant for the shop's actual day-to-day operation, not only as a decision-support/analytics layer - the four analytics objectives from the proposal are still there underneath, but the POS itself now behaves like a till a cashier would use every day.
+These were added because this system is meant for the shop's actual day-to-day operation, not only as a decision-support/analytics layer - the four analytics objectives from the proposal are still there underneath, but the POS itself now behaves like a till a cashier would use every day.
 
 ## Project layout
 
@@ -101,8 +103,10 @@ python -m pytest tests/test_pipeline.py -v
 or, without pytest: `python tests/test_pipeline.py`. These build a temporary
 throwaway database and exercise every module (data generation reconciliation,
 POS checkout/void/oversell-guard, forecasting + anomaly detection, Apriori
-rule recovery, promotion scoring bounds, layout coverage, report KPIs) - all
-9 currently pass.
+rule recovery, promotion scoring bounds, layout coverage, report KPIs,
+customer credit/settlement/limit enforcement, item returns, hold/resume
+cart, split payment, supplier summary, cash drawer open/close/variance,
+receipt text, and exact-barcode lookup) - all 21 currently pass.
 
 ## A development note worth knowing for your viva
 

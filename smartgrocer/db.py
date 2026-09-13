@@ -72,7 +72,8 @@ CREATE TABLE IF NOT EXISTS staff (
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
     name    TEXT NOT NULL,
     role    TEXT NOT NULL DEFAULT 'cashier',    -- 'admin' | 'cashier'
-    pin     TEXT NOT NULL DEFAULT '0000'
+    pin     TEXT NOT NULL DEFAULT '0000',
+    active  INTEGER NOT NULL DEFAULT 1          -- 0 = deactivated (kept for invoice history, hidden from login)
 );
 
 CREATE TABLE IF NOT EXISTS invoices (
@@ -220,6 +221,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
     batch_cols = {r["name"] for r in conn.execute("PRAGMA table_info(stock_batches)")}
     if "supplier_id" not in batch_cols:
         conn.execute("ALTER TABLE stock_batches ADD COLUMN supplier_id INTEGER REFERENCES suppliers(id)")
+    staff_cols = {r["name"] for r in conn.execute("PRAGMA table_info(staff)")}
+    if "active" not in staff_cols:
+        conn.execute("ALTER TABLE staff ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
     conn.commit()
 
 

@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from smartgrocer import (
     association, cash_drawer, customers, data_generator, db, forecasting, layout, pos, promotions,
-    receipts, reports, suppliers,
+    receipts, reports, staff, suppliers,
 )
 
 
@@ -27,6 +27,30 @@ def _fresh_db():
     code_to_id = data_generator.insert_products(conn)
     data_generator.generate_history(conn, code_to_id, days=200, avg_invoices_per_day=40)
     return conn
+
+
+def _product_with_stock(conn, min_qty=10):
+    """Pick a product guaranteed to have at least min_qty on hand.
+
+    The 200-day synthetic history sells down every product's stock by a
+    different amount depending on how popular it is - a plain
+    'SELECT * FROM products LIMIT 1' can land on a staple that the
+    generator has (realistically) sold down to almost nothing, making a
+    checkout test fail on "insufficient stock" for a reason that has
+    nothing to do with what the test is actually checking. Ordering by
+    on-hand stock descending sidesteps that instead of hard-coding a
+    product id that might stop being true if the generator's parameters
+    ever change."""
+    row = conn.execute(
+        """SELECT p.*, COALESCE(SUM(b.qty_remaining),0) AS stock_on_hand
+           FROM products p LEFT JOIN stock_batches b ON b.product_id = p.id
+           WHERE p.active=1 GROUP BY p.id ORDER BY stock_on_hand DESC LIMIT 1"""
+    ).fetchone()
+    assert row["stock_on_hand"] >= min_qty, (
+        f"test fixture assumption broken: best-stocked product only has "
+        f"{row['stock_on_hand']} on hand, need at least {min_qty}"
+    )
+    return row
 
 
 def test_data_generation_reconciles():
@@ -48,7 +72,7 @@ def test_data_generation_reconciles():
 
 def test_pos_checkout_and_void():
     conn = _fresh_db()
-    p = conn.execute("SELECT * FROM products LIMIT 1").fetchone()
+    p = _product_with_stock(conn, min_qty=2)
     before = pos.get_stock_on_hand(conn, p["id"])
     result = pos.create_invoice(conn, staff_id=1, cart=[pos.CartLine(product_id=p["id"], qty=2)])
     assert result.net_total > 0
@@ -132,7 +156,7 @@ def test_demo_database_seeds_customers_and_suppliers():
 
 def test_credit_sale_and_settlement_track_customer_balance():
     conn = _fresh_db()
-    p = conn.execute("SELECT * FROM products LIMIT 1").fetchone()
+    p = _product_with_stock(conn, min_qty=3)
     cid = customers.add_customer(conn, "Credit Test Customer", credit_limit=100000)
     result = pos.create_invoice(
         conn, staff_id=1, cart=[pos.CartLine(product_id=p["id"], qty=3)],
@@ -151,7 +175,7 @@ def test_credit_sale_and_settlement_track_customer_balance():
 
 def test_credit_limit_is_enforced():
     conn = _fresh_db()
-    p = conn.execute("SELECT * FROM products LIMIT 1").fetchone()
+    p = _product_with_stock(conn, min_qty=50)
     cid = customers.add_customer(conn, "Low Limit Customer", credit_limit=1.0)
     try:
         pos.create_invoice(
@@ -165,7 +189,7 @@ def test_credit_limit_is_enforced():
 
 def test_item_return_restocks_and_refunds():
     conn = _fresh_db()
-    p = conn.execute("SELECT * FROM products LIMIT 1").fetchone()
+    p = _product_with_stock(conn, min_qty=4)
     before = pos.get_stock_on_hand(conn, p["id"])
     result = pos.create_invoice(conn, staff_id=1, cart=[pos.CartLine(product_id=p["id"], qty=4)])
     returnable = pos.returnable_items(conn, result.invoice_id)
@@ -193,7 +217,7 @@ def test_hold_and_resume_cart_round_trips():
 
 def test_split_payment_sums_and_records_methods():
     conn = _fresh_db()
-    p = conn.execute("SELECT * FROM products LIMIT 1").fetchone()
+    p = _product_with_stock(conn, min_qty=2)
     cid = customers.add_customer(conn, "Split Payer", credit_limit=1_000_000)
     cart = [pos.CartLine(product_id=p["id"], qty=2)]
     net_total = p["cash_price"] * 2
@@ -225,7 +249,7 @@ def test_supplier_summary_reflects_received_stock():
 
 def test_cash_drawer_day_open_sell_close_matches():
     conn = _fresh_db()
-    p = conn.execute("SELECT * FROM products LIMIT 1").fetchone()
+    p = _product_with_stock(conn, min_qty=2)
     session_id = cash_drawer.open_session(conn, staff_id=1, opening_float=1000.0)
 
     result = pos.create_invoice(conn, staff_id=1, cart=[pos.CartLine(product_id=p["id"], qty=2)])
@@ -260,9 +284,50 @@ def test_cash_drawer_flags_variance():
     assert abs(result["variance"] - (-50)) < 0.01
 
 
-def test_receipt_text_includes_key_fields():
+def test_staff_add_reset_pin_and_deactivate():
+    conn = _fresh_db()
+    starting = len(staff.list_staff(conn, active_only=True))
+
+    sid = staff.add_staff(conn, "Clemon", "cashier", "12345")
+    active = staff.list_staff(conn, active_only=True)
+    assert len(active) == starting + 1
+    row = conn.execute("SELECT * FROM staff WHERE id=?", (sid,)).fetchone()
+    assert row["name"] == "Clemon" and row["role"] == "cashier" and row["pin"] == "12345" and row["active"] == 1
+
+    staff.update_pin(conn, sid, "54321")
+    assert conn.execute("SELECT pin FROM staff WHERE id=?", (sid,)).fetchone()["pin"] == "54321"
+
+    staff.set_active(conn, sid, False)
+    assert len(staff.list_staff(conn, active_only=True)) == starting
+    assert conn.execute("SELECT active FROM staff WHERE id=?", (sid,)).fetchone()["active"] == 0
+
+    try:
+        staff.add_staff(conn, "Nobody", "manager", "1111")
+        assert False, "should have rejected an unknown role"
+    except ValueError:
+        pass
+
+
+def test_barcode_exact_match_lookup():
+    # This is what the POS screen's scan-to-cart shortcut relies on: a
+    # scanner "typing" a code into the search box should resolve to exactly
+    # one product so it can be auto-added without the cashier clicking
+    # anything. A partial/fuzzy match (what search_products is for) must
+    # NOT be returned here, or a barcode that happens to be a substring of
+    # another product's code could add the wrong item automatically.
     conn = _fresh_db()
     p = conn.execute("SELECT * FROM products LIMIT 1").fetchone()
+    exact = pos.get_product_by_code(conn, p["code"])
+    assert exact is not None and exact["id"] == p["id"]
+
+    partial_code = p["code"][:-1] if len(p["code"]) > 1 else p["code"]
+    assert pos.get_product_by_code(conn, partial_code) is None or partial_code == p["code"]
+    assert pos.get_product_by_code(conn, "no-such-barcode-xyz") is None
+
+
+def test_receipt_text_includes_key_fields():
+    conn = _fresh_db()
+    p = _product_with_stock(conn, min_qty=1)
     result = pos.create_invoice(conn, staff_id=1, cart=[pos.CartLine(product_id=p["id"], qty=1)])
     text = receipts.build_receipt_text(conn, result.invoice_id)
     assert result.invoice_no in text

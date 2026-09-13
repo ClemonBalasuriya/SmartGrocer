@@ -17,6 +17,7 @@ from .. import cash_drawer as cash_drawer_module
 from .. import customers as customers_module
 from .. import receipts as receipts_module
 from .. import suppliers as suppliers_module
+from .. import staff as staff_module
 from .. import db as db_module
 from . import theme
 from .theme import tree_clear, tree_insert
@@ -1334,3 +1335,157 @@ class SuppliersScreen(BaseScreen):
             self.refresh()
 
         styled_button(dialog, "Save", save, kind="primary", width=140).pack(pady=18)
+
+
+# --------------------------------------------------------------------------- #
+# Staff / cashiers
+# --------------------------------------------------------------------------- #
+
+class StaffScreen(BaseScreen):
+    """Add cashiers/admins and set their login PIN, without needing a
+    developer to reach into the database by hand every time someone new
+    joins the till. Managing staff (adding, deactivating, resetting a PIN)
+    is restricted to whoever is currently logged in as Admin - everyone can
+    still see the list, since a cashier glancing at who's on shift is
+    harmless, but only Admin can change it."""
+
+    def __init__(self, parent, app):
+        super().__init__(parent, app)
+        self.header("Staff / Cashiers")
+
+        self.hint = ctk.CTkLabel(
+            self, text="", font=ctk.CTkFont(size=12), text_color=theme.TEXT_MUTED, wraplength=700,
+        )
+        self.hint.pack(anchor="w", padx=24, pady=(0, 8))
+
+        top = ctk.CTkFrame(self, fg_color="transparent")
+        top.pack(fill="x", padx=24)
+        styled_button(top, "Refresh", self.refresh, kind="secondary").pack(side="left")
+        self.add_btn = styled_button(top, "Add Staff", self.open_add_dialog, kind="primary")
+        self.add_btn.pack(side="left", padx=8)
+        self.pin_btn = styled_button(top, "Reset PIN", self.open_reset_pin_dialog, kind="secondary")
+        self.pin_btn.pack(side="left", padx=8)
+        self.toggle_btn = styled_button(top, "Activate / Deactivate", self.toggle_active, kind="danger")
+        self.toggle_btn.pack(side="left", padx=8)
+
+        tree_frame = ctk.CTkFrame(self, fg_color="transparent")
+        tree_frame.pack(fill="both", expand=True, padx=24, pady=10)
+        self.tree = make_treeview(
+            tree_frame, ["Name", "Role", "Status"], {"Name": 220, "Role": 120, "Status": 120},
+        )
+        self.tree.master_frame.pack(fill="both", expand=True)
+
+    def on_show(self):
+        self.refresh()
+
+    def _is_admin(self) -> bool:
+        if not self.app.logged_in:
+            return False
+        row = self.conn.execute(
+            "SELECT role FROM staff WHERE id=?", (self.app.current_staff_id,)
+        ).fetchone()
+        return bool(row and row["role"] == "admin")
+
+    def refresh(self):
+        is_admin = self._is_admin()
+        self.hint.configure(
+            text="Logged in as Admin - you can add, deactivate, or reset PINs below."
+            if is_admin else
+            "Only Admin can add staff, reset PINs, or deactivate someone - log in as "
+            "Admin from the sidebar first. Anyone can view this list."
+        )
+        for btn in (self.add_btn, self.pin_btn, self.toggle_btn):
+            btn.configure(state="normal" if is_admin else "disabled")
+        tree_clear(self.tree)
+        for s in staff_module.list_staff(self.conn):
+            tree_insert(
+                self.tree,
+                (s["name"], s["role"].capitalize(), "Active" if s["active"] else "Inactive"),
+                iid=str(s["id"]),
+            )
+
+    def _require_admin(self) -> bool:
+        if self._is_admin():
+            return True
+        messagebox.showwarning("Admin required", "Log in as Admin (sidebar) to manage staff.")
+        return False
+
+    def open_add_dialog(self):
+        if not self._require_admin():
+            return
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Add Staff")
+        dialog.geometry("360x340")
+        dialog.configure(fg_color=theme.BG_LIGHT)
+        dialog.grab_set()
+
+        ctk.CTkLabel(dialog, text="Name:").pack(anchor="w", padx=16, pady=(16, 0))
+        name_var = tk.StringVar()
+        ctk.CTkEntry(dialog, textvariable=name_var, width=300).pack(padx=16)
+
+        ctk.CTkLabel(dialog, text="Role:").pack(anchor="w", padx=16, pady=(12, 0))
+        role_var = tk.StringVar(value="cashier")
+        ctk.CTkOptionMenu(dialog, values=["cashier", "admin"], variable=role_var, width=300).pack(padx=16)
+
+        ctk.CTkLabel(dialog, text="PIN (numbers, used to log in at the till):").pack(
+            anchor="w", padx=16, pady=(12, 0))
+        pin_var = tk.StringVar()
+        ctk.CTkEntry(dialog, textvariable=pin_var, width=300).pack(padx=16)
+
+        def save():
+            try:
+                staff_module.add_staff(self.conn, name_var.get(), role_var.get(), pin_var.get())
+            except ValueError as e:
+                messagebox.showerror("Cannot add staff", str(e))
+                return
+            dialog.destroy()
+            self.refresh()
+
+        styled_button(dialog, "Save", save, kind="primary", width=140).pack(pady=20)
+
+    def open_reset_pin_dialog(self):
+        if not self._require_admin():
+            return
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showwarning("No staff selected", "Select a staff member first.")
+            return
+        staff_id = int(sel[0])
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Reset PIN")
+        dialog.geometry("320x180")
+        dialog.configure(fg_color=theme.BG_LIGHT)
+        dialog.grab_set()
+
+        ctk.CTkLabel(dialog, text="New PIN:").pack(anchor="w", padx=16, pady=(16, 0))
+        pin_var = tk.StringVar()
+        ctk.CTkEntry(dialog, textvariable=pin_var, width=280).pack(padx=16)
+
+        def save():
+            try:
+                staff_module.update_pin(self.conn, staff_id, pin_var.get())
+            except ValueError as e:
+                messagebox.showerror("Cannot update PIN", str(e))
+                return
+            dialog.destroy()
+            messagebox.showinfo("PIN updated", "The PIN has been changed.")
+
+        styled_button(dialog, "Save", save, kind="primary", width=140).pack(pady=16)
+
+    def toggle_active(self):
+        if not self._require_admin():
+            return
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showwarning("No staff selected", "Select a staff member first.")
+            return
+        staff_id = int(sel[0])
+        row = self.conn.execute("SELECT * FROM staff WHERE id=?", (staff_id,)).fetchone()
+        if row is None:
+            return
+        if row["active"] and staff_id == self.app.current_staff_id:
+            messagebox.showerror("Cannot deactivate", "You cannot deactivate the account you're currently logged in as.")
+            return
+        staff_module.set_active(self.conn, staff_id, not row["active"])
+        self.refresh()
