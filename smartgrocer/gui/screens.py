@@ -795,16 +795,37 @@ class POSScreen(BaseScreen):
 # --------------------------------------------------------------------------- #
 
 class InventoryScreen(BaseScreen):
+    """Product catalog + stock levels. Everyone can view it; adding a new
+    item, receiving stock, and editing an item's details all need Admin or
+    Owner (a cashier rings up sales, but shouldn't be the one deciding what
+    goes in the catalog or how much stock is on hand). Removing an item
+    from the catalog is Owner-only and, like staff, never actually deletes
+    it - see pos.deactivate_product for why (stock_batches/invoice_items
+    reference it) - it's marked inactive and its stock is zeroed instead,
+    and the Owner can restore it (same button, it toggles) if it comes back
+    into stock later. All of these actions are written to the Activity Log."""
+
     def __init__(self, parent, app):
         super().__init__(parent, app)
         self.header("Inventory")
+
+        self.hint = ctk.CTkLabel(
+            self, text="", font=ctk.CTkFont(size=12), text_color=theme.TEXT_MUTED, wraplength=760, justify="left",
+        )
+        self.hint.pack(anchor="w", padx=24, pady=(0, 8))
 
         btn_row = ctk.CTkFrame(self, fg_color="transparent")
         btn_row.pack(fill="x", padx=24)
         styled_button(btn_row, "Refresh", self.refresh, kind="secondary").pack(side="left")
         styled_button(btn_row, "Export CSV", self.export, kind="secondary").pack(side="left", padx=8)
-        styled_button(btn_row, "Add / Scan Item", self.open_add_product_dialog, kind="primary").pack(side="left", padx=8)
-        styled_button(btn_row, "Receive Stock (GRN)", self.open_grn_dialog, kind="primary").pack(side="left", padx=8)
+        self.add_btn = styled_button(btn_row, "Add / Scan Item", self.open_add_product_dialog, kind="primary")
+        self.add_btn.pack(side="left", padx=8)
+        self.grn_btn = styled_button(btn_row, "Receive Stock (GRN)", self.open_grn_dialog, kind="primary")
+        self.grn_btn.pack(side="left", padx=8)
+        self.edit_btn = styled_button(btn_row, "Edit Item", self.open_edit_product_dialog, kind="secondary")
+        self.edit_btn.pack(side="left", padx=8)
+        self.remove_btn = styled_button(btn_row, "Remove / Restore Item", self.toggle_product_active, kind="danger")
+        self.remove_btn.pack(side="left", padx=8)
 
         tree_frame = ctk.CTkFrame(self, fg_color="transparent")
         tree_frame.pack(fill="both", expand=True, padx=24, pady=10)
@@ -817,13 +838,60 @@ class InventoryScreen(BaseScreen):
     def on_show(self):
         self.refresh()
 
+    def _current_role(self) -> str | None:
+        if not self.app.logged_in:
+            return None
+        row = self.conn.execute(
+            "SELECT role FROM staff WHERE id=?", (self.app.current_staff_id,)
+        ).fetchone()
+        return row["role"] if row else None
+
+    def _is_admin(self) -> bool:
+        return self._current_role() in ("admin", "owner")
+
+    def _is_owner(self) -> bool:
+        return self._current_role() == "owner"
+
+    def _actor_label(self) -> str:
+        row = self.conn.execute(
+            "SELECT name, role FROM staff WHERE id=?", (self.app.current_staff_id,)
+        ).fetchone()
+        return f"{row['role'].capitalize()} {row['name']}" if row else "Someone"
+
     def refresh(self):
-        self._rows = reports.stock_summary(self.conn)
+        is_admin = self._is_admin()
+        is_owner = self._is_owner()
+        self.hint.configure(
+            text="Logged in as " + ("Owner" if is_owner else "Admin")
+            + " - you can add/receive items and edit their details below; "
+            + ("you can also remove or restore an item." if is_owner else "removing/restoring one is Owner-only.")
+            if is_admin else
+            "Only Admin/Owner can add items, receive stock, or edit an item's details "
+            "(Owner-only to remove/restore one) - log in from the sidebar first. Anyone can view stock levels."
+        )
+        self.add_btn.configure(state="normal" if is_admin else "disabled")
+        self.grn_btn.configure(state="normal" if is_admin else "disabled")
+        self.edit_btn.configure(state="normal" if is_admin else "disabled")
+        self.remove_btn.configure(state="normal" if is_owner else "disabled")
+
+        raw = self.conn.execute(
+            """SELECT p.id, p.code, p.name_en, p.category, p.reorder_level, p.active,
+                      COALESCE(SUM(b.qty_remaining),0) on_hand
+               FROM products p LEFT JOIN stock_batches b ON b.product_id = p.id
+               GROUP BY p.id ORDER BY p.active DESC, p.category, p.name_en"""
+        ).fetchall()
+        self._rows = []
         tree_clear(self.tree)
-        for r in self._rows:
-            tag = "low" if r["below_reorder"] else None
+        for r in raw:
+            if not r["active"]:
+                status, tag = "REMOVED", "inactive"
+            elif r["on_hand"] < r["reorder_level"]:
+                status, tag = "LOW STOCK", "low"
+            else:
+                status, tag = "OK", None
+            self._rows.append(dict(r) | {"status": status})
             tree_insert(self.tree, (r["code"], r["name_en"], r["category"], f"{r['on_hand']:.0f}",
-                                     r["reorder_level"], "LOW STOCK" if r["below_reorder"] else "OK"), tag=tag)
+                                     r["reorder_level"], status), tag=tag, iid=str(r["id"]))
 
     def export(self):
         path = reports.export_csv(self._rows, db_module.ensure_output_dir() / "inventory_stock_summary.csv") \
@@ -831,7 +899,118 @@ class InventoryScreen(BaseScreen):
         if path:
             messagebox.showinfo("Exported", f"Saved to {path}")
 
+    def open_edit_product_dialog(self):
+        if not self._is_admin():
+            messagebox.showwarning("Admin required", "Log in as Admin or Owner (sidebar) to edit an item.")
+            return
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showwarning("No item selected", "Select an item in the list first.")
+            return
+        product_id = int(sel[0])
+        product = self.conn.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone()
+        if product is None:
+            return
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title(f"Edit Item - {product['code']}")
+        dialog.geometry("420x620")
+        dialog.configure(fg_color=theme.BG_LIGHT)
+        dialog.grab_set()
+
+        scroll = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=4, pady=4)
+
+        ctk.CTkLabel(
+            scroll, text=f"Barcode/code: {product['code']} (can't be changed here)",
+            font=ctk.CTkFont(size=11), text_color=theme.TEXT_MUTED,
+        ).pack(anchor="w", padx=12, pady=(12, 6))
+
+        def field(label, value):
+            ctk.CTkLabel(scroll, text=label).pack(anchor="w", padx=12, pady=(8, 0))
+            var = tk.StringVar(value=str(value))
+            ctk.CTkEntry(scroll, textvariable=var, width=360).pack(padx=12)
+            return var
+
+        name_var = field("Name:", product["name_en"])
+        name_si_var = field("Name (Sinhala, optional):", product["name_si"] or "")
+        category_var = field("Category:", product["category"])
+        unit_var = field("Unit:", product["unit"])
+        cost_var = field("Cost price:", product["cost_price"])
+        cash_var = field("Cash price:", product["cash_price"])
+        credit_var = field("Credit price:", product["credit_price"])
+        wholesale_var = field("Wholesale price:", product["wholesale_price"])
+        pack_var = field("Pack size:", product["pack_size"])
+        reorder_var = field("Reorder level:", product["reorder_level"])
+
+        flags_row = ctk.CTkFrame(scroll, fg_color="transparent")
+        flags_row.pack(anchor="w", padx=12, pady=(12, 0))
+        perishable_var = tk.BooleanVar(value=bool(product["is_perishable"]))
+        staple_var = tk.BooleanVar(value=bool(product["is_staple"]))
+        child_var = tk.BooleanVar(value=bool(product["child_target"]))
+        ctk.CTkCheckBox(flags_row, text="Perishable", variable=perishable_var).pack(side="left")
+        ctk.CTkCheckBox(flags_row, text="Staple item", variable=staple_var).pack(side="left", padx=12)
+        ctk.CTkCheckBox(flags_row, text="Child-target item", variable=child_var).pack(side="left")
+
+        def save():
+            try:
+                pos.update_product(
+                    self.conn, product_id,
+                    name_en=name_var.get(), name_si=name_si_var.get(), category=category_var.get(),
+                    unit=unit_var.get(), cost_price=float(cost_var.get()), cash_price=float(cash_var.get()),
+                    credit_price=float(credit_var.get()), wholesale_price=float(wholesale_var.get()),
+                    pack_size=int(float(pack_var.get())), reorder_level=int(float(reorder_var.get())),
+                    is_perishable=perishable_var.get(), is_staple=staple_var.get(), child_target=child_var.get(),
+                )
+            except ValueError as e:
+                messagebox.showerror("Cannot save", str(e))
+                return
+            audit.record(
+                self.conn, actor_staff_id=self.app.current_staff_id, action="product.edit",
+                details=f"{product['code']} - {name_var.get().strip()}",
+            )
+            dialog.destroy()
+            self.refresh()
+
+        styled_button(scroll, "Save", save, kind="primary", width=140).pack(pady=18)
+
+    def toggle_product_active(self):
+        if not self._is_owner():
+            messagebox.showwarning("Owner required", "Only the Owner can remove or restore an item (sidebar login).")
+            return
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showwarning("No item selected", "Select an item in the list first.")
+            return
+        product_id = int(sel[0])
+        product = self.conn.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone()
+        if product is None:
+            return
+
+        if product["active"]:
+            if not messagebox.askyesno(
+                "Remove item?",
+                f"Remove \"{product['name_en']}\" from the catalog? Its stock on hand will be set to 0 - "
+                "past sales/GRN history for it is kept, and you can restore it later from here.",
+            ):
+                return
+            pos.deactivate_product(self.conn, product_id)
+            audit.record(
+                self.conn, actor_staff_id=self.app.current_staff_id, action="product.deactivate",
+                details=f"{product['code']} - {product['name_en']}",
+            )
+        else:
+            pos.reactivate_product(self.conn, product_id)
+            audit.record(
+                self.conn, actor_staff_id=self.app.current_staff_id, action="product.reactivate",
+                details=f"{product['code']} - {product['name_en']}",
+            )
+        self.refresh()
+
     def open_grn_dialog(self):
+        if not self._is_admin():
+            messagebox.showwarning("Admin required", "Log in as Admin or Owner (sidebar) to receive stock.")
+            return
         dialog = ctk.CTkToplevel(self)
         dialog.title("Receive Stock (GRN)")
         dialog.geometry("420x340")
@@ -902,6 +1081,9 @@ class InventoryScreen(BaseScreen):
         whichever field has focus, so the field is auto-focused for that),
         or by scanning it with a phone via the same phone-scanner feature
         used at the till."""
+        if not self._is_admin():
+            messagebox.showwarning("Admin required", "Log in as Admin or Owner (sidebar) to add an item.")
+            return
         dialog = ctk.CTkToplevel(self)
         dialog.title("Add / Scan Item")
         dialog.geometry("440x780")
@@ -1744,15 +1926,21 @@ class SuppliersScreen(BaseScreen):
 class StaffScreen(BaseScreen):
     """Add cashiers/admins/owners and set their login PIN, without needing a
     developer to reach into the database by hand every time someone new
-    joins the till. Managing staff (adding, deactivating, resetting a PIN)
-    is restricted to whoever is currently logged in as Admin or Owner -
-    everyone can still see the list, since a cashier glancing at who's on
-    shift is harmless, but only Admin/Owner can change it.
+    joins the till. Everyone can see the list, since a cashier glancing at
+    who's on shift is harmless. Adding staff or activating/deactivating
+    someone needs Admin or Owner; resetting a PIN is Owner-only - a PIN is
+    how every account is protected, so only the Owner can hand out a new
+    one, rather than any Admin being able to lock a cashier out (or back
+    in) of their own account.
 
     Every sensitive change made here (adding staff, resetting a PIN,
     activating/deactivating) is written to the Activity Log (audit.py) with
     who did it, and a best-effort notification (notifications.py) is sent
-    to the Owner so nothing has to be discovered after the fact."""
+    to the Owner so nothing has to be discovered after the fact. Adding
+    staff or resetting a PIN also messages that PERSON directly (their new
+    PIN, by email/SMS/WhatsApp) if they have an email or phone on file -
+    the Owner's notification says who made the change, theirs tells them
+    what changed and what their new PIN is."""
 
     def __init__(self, parent, app):
         super().__init__(parent, app)
@@ -1818,15 +2006,19 @@ class StaffScreen(BaseScreen):
 
     def refresh(self):
         is_admin = self._is_admin()
-        self.hint.configure(
-            text="Logged in as " + ("Owner" if self._is_owner() else "Admin")
-            + " - you can add, deactivate, or reset PINs below."
-            if is_admin else
-            "Only Admin/Owner can add staff, reset PINs, or deactivate someone - log in as "
-            "Admin from the sidebar first. Anyone can view this list."
-        )
-        for btn in (self.add_btn, self.pin_btn, self.toggle_btn):
-            btn.configure(state="normal" if is_admin else "disabled")
+        is_owner = self._is_owner()
+        if is_owner:
+            hint_text = "Logged in as Owner - you can add staff, reset PINs, or deactivate someone below."
+        elif is_admin:
+            hint_text = ("Logged in as Admin - you can add staff or deactivate someone below. "
+                         "Only the Owner can reset a PIN.")
+        else:
+            hint_text = ("Only Admin/Owner can add staff or deactivate someone (Owner-only for PIN resets) - "
+                        "log in from the sidebar first. Anyone can view this list.")
+        self.hint.configure(text=hint_text)
+        self.add_btn.configure(state="normal" if is_admin else "disabled")
+        self.toggle_btn.configure(state="normal" if is_admin else "disabled")
+        self.pin_btn.configure(state="normal" if is_owner else "disabled")
         tree_clear(self.tree)
         for s in staff_module.list_staff(self.conn):
             tree_insert(
@@ -1839,6 +2031,12 @@ class StaffScreen(BaseScreen):
         if self._is_admin():
             return True
         messagebox.showwarning("Admin required", "Log in as Admin or Owner (sidebar) to manage staff.")
+        return False
+
+    def _require_owner(self) -> bool:
+        if self._is_owner():
+            return True
+        messagebox.showwarning("Owner required", "Only the Owner can reset a PIN - log in as Owner (sidebar).")
         return False
 
     def open_add_dialog(self):
@@ -1854,7 +2052,7 @@ class StaffScreen(BaseScreen):
 
         dialog = ctk.CTkToplevel(self)
         dialog.title("Add Staff")
-        dialog.geometry("360x340")
+        dialog.geometry("360x460")
         dialog.configure(fg_color=theme.BG_LIGHT)
         dialog.grab_set()
 
@@ -1876,6 +2074,16 @@ class StaffScreen(BaseScreen):
         pin_var = tk.StringVar()
         ctk.CTkEntry(dialog, textvariable=pin_var, width=300).pack(padx=16)
 
+        ctk.CTkLabel(dialog, text="Email (optional - lets us tell them their PIN directly):").pack(
+            anchor="w", padx=16, pady=(12, 0))
+        email_var = tk.StringVar()
+        ctk.CTkEntry(dialog, textvariable=email_var, width=300).pack(padx=16)
+
+        ctk.CTkLabel(dialog, text="Phone (optional - for SMS/WhatsApp, needs Twilio set up):").pack(
+            anchor="w", padx=16, pady=(12, 0))
+        phone_var = tk.StringVar()
+        ctk.CTkEntry(dialog, textvariable=phone_var, width=300).pack(padx=16)
+
         def save():
             role = role_var.get()
             if role == "owner" and not can_offer_owner:
@@ -1883,8 +2091,12 @@ class StaffScreen(BaseScreen):
                 # even offered in this case, but never trust client state.
                 messagebox.showerror("Not allowed", "Only an existing Owner can create another Owner.")
                 return
+            pin_saved = pin_var.get().strip()
             try:
-                new_id = staff_module.add_staff(self.conn, name_var.get(), role, pin_var.get())
+                new_id = staff_module.add_staff(
+                    self.conn, name_var.get(), role, pin_saved,
+                    email=email_var.get(), phone=phone_var.get(),
+                )
             except ValueError as e:
                 messagebox.showerror("Cannot add staff", str(e))
                 return
@@ -1897,21 +2109,32 @@ class StaffScreen(BaseScreen):
                 "SmartGrocer: staff added",
                 f"{self._actor_label()} added a new {role} account: {name_saved}.",
             )
+            target_email = email_var.get().strip() or None
+            target_phone = phone_var.get().strip() or None
+            if target_email or target_phone:
+                notifications.send(
+                    "SmartGrocer: welcome",
+                    f"You've been added to SmartGrocer as {role} by {self._actor_label()}. "
+                    f"Your login PIN is: {pin_saved}",
+                    to_email=target_email, to_phone=target_phone,
+                )
             dialog.destroy()
             self.refresh()
 
         styled_button(dialog, "Save", save, kind="primary", width=140).pack(pady=20)
 
     def open_reset_pin_dialog(self):
-        if not self._require_admin():
+        if not self._require_owner():
             return
         sel = self.tree.selection()
         if not sel:
             messagebox.showwarning("No staff selected", "Select a staff member first.")
             return
         staff_id = int(sel[0])
-        target = self.conn.execute("SELECT name FROM staff WHERE id=?", (staff_id,)).fetchone()
+        target = self.conn.execute("SELECT name, email, phone FROM staff WHERE id=?", (staff_id,)).fetchone()
         target_name = target["name"] if target else f"staff#{staff_id}"
+        target_email = (target["email"] if target else None) or None
+        target_phone = (target["phone"] if target else None) or None
 
         dialog = ctk.CTkToplevel(self)
         dialog.title("Reset PIN")
@@ -1924,8 +2147,9 @@ class StaffScreen(BaseScreen):
         ctk.CTkEntry(dialog, textvariable=pin_var, width=280).pack(padx=16)
 
         def save():
+            new_pin = pin_var.get().strip()
             try:
-                staff_module.update_pin(self.conn, staff_id, pin_var.get())
+                staff_module.update_pin(self.conn, staff_id, new_pin)
             except ValueError as e:
                 messagebox.showerror("Cannot update PIN", str(e))
                 return
@@ -1933,10 +2157,21 @@ class StaffScreen(BaseScreen):
                 self.conn, actor_staff_id=self.app.current_staff_id, action="staff.pin_reset",
                 target_staff_id=staff_id,
             )
+            # Two different messages: the Owner's own copy says WHO changed
+            # it (there's only one Owner, so this is really a self-record,
+            # but it still lands in their inbox/phone as a live alert); the
+            # target's copy says WHAT changed and gives them the new PIN.
             notifications.send(
                 "SmartGrocer: PIN changed",
                 f"{self._actor_label()} changed the PIN for {target_name}.",
             )
+            if target_email or target_phone:
+                notifications.send(
+                    "SmartGrocer: your PIN was changed",
+                    f"Your SmartGrocer PIN was changed by {self._actor_label()}. Your new PIN is: {new_pin}\n\n"
+                    "If you didn't expect this, tell the shop owner.",
+                    to_email=target_email, to_phone=target_phone,
+                )
             dialog.destroy()
             messagebox.showinfo("PIN updated", "The PIN has been changed.")
 
@@ -2162,19 +2397,26 @@ class NetworkScreen(BaseScreen):
 # --------------------------------------------------------------------------- #
 
 class ActivityLogScreen(BaseScreen):
-    """Owner-only view of every sensitive staff/account action ever taken -
-    who added a cashier, who reset whose PIN, who deactivated whom, and
-    when. This is the shop owner's answer to "who did that" without having
-    to ask around. Also hosts the Notification Settings dialog, since
-    deciding who gets pinged about these actions is naturally the same
-    Owner-only screen."""
+    """View of every sensitive staff/account action ever taken - who added a
+    cashier, who reset whose PIN, who deactivated whom or edited/removed an
+    item, and when. This is the "who did that" answer without having to ask
+    around - open to Admin as well as Owner, since an Admin managing staff
+    day to day benefits from being able to check the same history. Deciding
+    who gets NOTIFIED about these actions (the Notification Settings dialog,
+    with the SMTP/Twilio credentials in it) stays Owner-only, though - that's
+    a higher-trust configuration action than just reading the log."""
 
     COLUMNS = ["When", "Who", "Role", "Action", "Target", "Details"]
     ACTION_LABELS = {
         "staff.add": "Added staff",
         "staff.pin_reset": "Reset PIN",
+        "staff.pin_self_change": "Changed own PIN",
+        "staff.pin_forgot_reset": "Reset PIN (forgot)",
         "staff.activate": "Activated staff",
         "staff.deactivate": "Deactivated staff",
+        "product.edit": "Edited item",
+        "product.deactivate": "Removed item",
+        "product.reactivate": "Restored item",
     }
 
     def __init__(self, parent, app):
@@ -2204,25 +2446,32 @@ class ActivityLogScreen(BaseScreen):
     def on_show(self):
         self.refresh()
 
-    def _is_owner(self) -> bool:
+    def _current_role(self) -> str | None:
         if not self.app.logged_in:
-            return False
+            return None
         row = self.conn.execute(
             "SELECT role FROM staff WHERE id=?", (self.app.current_staff_id,)
         ).fetchone()
-        return bool(row and row["role"] == "owner")
+        return row["role"] if row else None
+
+    def _is_owner(self) -> bool:
+        return self._current_role() == "owner"
+
+    def _can_view(self) -> bool:
+        return self._current_role() in ("admin", "owner")
 
     def refresh(self):
+        can_view = self._can_view()
         is_owner = self._is_owner()
         self.hint.configure(
-            text="Every add/deactivate/PIN-reset action taken by an Admin or Owner, newest first."
-            if is_owner else
-            "Only the Owner can view the Activity Log - log in as Owner from the sidebar first."
+            text="Every add/deactivate/PIN-reset staff action and item edit/removal, newest first."
+            if can_view else
+            "Only Admin/Owner can view the Activity Log - log in from the sidebar first."
         )
-        self.refresh_btn.configure(state="normal" if is_owner else "disabled")
+        self.refresh_btn.configure(state="normal" if can_view else "disabled")
         self.notify_btn.configure(state="normal" if is_owner else "disabled")
         tree_clear(self.tree)
-        if not is_owner:
+        if not can_view:
             return
         for row in audit.list_log(self.conn):
             tree_insert(

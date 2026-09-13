@@ -20,10 +20,12 @@ from tkinter import messagebox
 
 import customtkinter as ctk
 
+from .. import audit
 from .. import cash_drawer
 from .. import db
 from .. import netclient
 from .. import netserver
+from .. import notifications
 from .. import staff as staff_module
 from .. import till_config
 from . import screens
@@ -148,6 +150,17 @@ class SmartGrocerApp(ctk.CTk):
         ctk.CTkButton(status_btn_row, text="Close Day", height=28, font=ctk.CTkFont(size=11),
                       fg_color=theme.DANGER_RED, hover_color=theme.DANGER_RED_HOVER,
                       command=self.open_close_day_dialog).pack(fill="x", pady=2)
+        # Anyone logged in - cashier, admin, or owner - can change their OWN
+        # PIN here, without needing an Admin/Owner to do it for them. This
+        # is separate from Staff screen's Owner-only "Reset PIN" (which
+        # changes someone ELSE's PIN); this only ever touches whoever is
+        # currently logged in, so it isn't role-gated.
+        self.change_pin_btn = ctk.CTkButton(
+            status_btn_row, text="Change My PIN", height=28, font=ctk.CTkFont(size=11),
+            fg_color="transparent", border_width=1, border_color="#3A4D78", text_color="#D6DEEC",
+            hover_color=theme.NAVY_DARKER, command=self.open_change_my_pin_dialog,
+        )
+        self.change_pin_btn.pack(fill="x", pady=2)
 
         divider = ctk.CTkFrame(self.sidebar, height=1, fg_color="#1E2D52")
         divider.pack(fill="x", padx=16, pady=(0, 12))
@@ -282,6 +295,7 @@ class SmartGrocerApp(ctk.CTk):
             self.cashier_label.configure(text=f"🔓 {staff['name']}")
         else:
             self.cashier_label.configure(text="🔒 Not logged in")
+        self.change_pin_btn.configure(state="normal" if self.logged_in else "disabled")
         session = cash_drawer.get_open_session(self.conn)
         if session:
             self.day_label.configure(text=f"Day: OPEN (since {session['opened_at'][11:16]})",
@@ -292,7 +306,7 @@ class SmartGrocerApp(ctk.CTk):
     def open_login_dialog(self):
         dialog = ctk.CTkToplevel(self)
         dialog.title("Login")
-        dialog.geometry("340x360")
+        dialog.geometry("340x420")
         dialog.configure(fg_color=theme.BG_LIGHT)
         dialog.grab_set()
 
@@ -336,7 +350,142 @@ class SmartGrocerApp(ctk.CTk):
             dialog.destroy()
 
         ctk.CTkButton(dialog, text="Login", command=submit, fg_color=theme.SUCCESS_GREEN,
-                      hover_color=theme.SUCCESS_GREEN_HOVER).pack(pady=20)
+                      hover_color=theme.SUCCESS_GREEN_HOVER).pack(pady=(20, 4))
+        ctk.CTkButton(
+            dialog, text="Forgot PIN?", fg_color="transparent", text_color=theme.ACCENT_BLUE,
+            hover_color=theme.BG_LIGHT, height=24,
+            command=lambda: self.open_forgot_pin_dialog(staff_var.get()),
+        ).pack()
+
+    def open_forgot_pin_dialog(self, preselected_name: str = ""):
+        """Self-service PIN recovery for ANY role (cashier, admin, owner) -
+        no login needed, since the whole point is they're locked out. Only
+        works for an account with an email on file (see staff.add_staff's
+        optional email field): a random new PIN is generated and emailed to
+        THAT address - never shown on screen - so recovering someone else's
+        PIN this way still requires access to their actual inbox. The Owner
+        also gets a notification that this happened, same as any other PIN
+        change, so a forgot-PIN reset can't quietly go unnoticed."""
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Forgot PIN")
+        dialog.geometry("340x260")
+        dialog.configure(fg_color=theme.BG_LIGHT)
+        dialog.grab_set()
+
+        ctk.CTkLabel(
+            dialog, text="We'll email a new PIN to the address saved for this account. "
+                        "If none is saved, ask an Admin/Owner to reset it for you instead.",
+            wraplength=300, justify="left", text_color=theme.TEXT_MUTED, font=ctk.CTkFont(size=11),
+        ).pack(anchor="w", padx=16, pady=(16, 10))
+
+        staff_names = [r["name"] for r in staff_module.list_staff(self.conn, active_only=True)]
+        ctk.CTkLabel(dialog, text="Staff:").pack(anchor="w", padx=16)
+        default_name = preselected_name if preselected_name in staff_names else (staff_names[0] if staff_names else "")
+        staff_var = tk.StringVar(value=default_name)
+        ctk.CTkOptionMenu(dialog, values=staff_names, variable=staff_var, width=280).pack(padx=16, pady=(0, 12))
+
+        status_label = ctk.CTkLabel(dialog, text="", font=ctk.CTkFont(size=11), text_color=theme.TEXT_MUTED, wraplength=300)
+        status_label.pack(anchor="w", padx=16)
+
+        def send_reset():
+            row = self.conn.execute(
+                "SELECT * FROM staff WHERE name=? AND active=1", (staff_var.get(),)
+            ).fetchone()
+            if row is None:
+                status_label.configure(text="Account not found.")
+                return
+            if not row["email"] and not row["phone"]:
+                status_label.configure(
+                    text="No email or phone is saved for this account - ask an Admin/Owner to reset your PIN."
+                )
+                return
+            new_pin = staff_module.generate_temp_pin()
+            staff_module.update_pin(self.conn, row["id"], new_pin)
+            audit.record(
+                self.conn, actor_staff_id=row["id"], action="staff.pin_forgot_reset",
+                target_staff_id=row["id"], details="self-service forgot-PIN reset",
+            )
+            sent = notifications.send(
+                "SmartGrocer: your new PIN",
+                f"You requested a PIN reset for your SmartGrocer account. Your new PIN is: {new_pin}\n\n"
+                "If you didn't request this, tell the shop owner right away.",
+                to_email=row["email"] or None, to_phone=row["phone"] or None,
+            )
+            notifications.send(
+                "SmartGrocer: PIN reset via Forgot PIN",
+                f"{row['name']} ({row['role']}) used Forgot PIN to reset their own PIN.",
+            )
+            if sent:
+                status_label.configure(text=f"Sent via: {', '.join(sent)}. Check your inbox/phone.")
+            else:
+                status_label.configure(
+                    text="Couldn't deliver it (email/SMS not set up or unreachable) - ask an Admin/Owner instead."
+                )
+
+        ctk.CTkButton(dialog, text="Send New PIN", command=send_reset, fg_color=theme.ACCENT_BLUE,
+                      hover_color=theme.ACCENT_BLUE_HOVER).pack(pady=16)
+
+    def open_change_my_pin_dialog(self):
+        """Anyone currently logged in can change their OWN PIN here,
+        without needing an Admin/Owner - they just have to know their
+        current one. Unlike Staff screen's Owner-only "Reset PIN" (which
+        changes someone ELSE's PIN with no old-PIN check), this always
+        acts on whoever is logged in right now, so it needs no role
+        check of its own."""
+        if not self.logged_in:
+            messagebox.showwarning("Not logged in", "Log in first (sidebar) to change your PIN.")
+            return
+        staff_id = self.current_staff_id
+        row = self.conn.execute("SELECT * FROM staff WHERE id=?", (staff_id,)).fetchone()
+        if row is None:
+            return
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Change My PIN")
+        dialog.geometry("320x260")
+        dialog.configure(fg_color=theme.BG_LIGHT)
+        dialog.grab_set()
+
+        ctk.CTkLabel(dialog, text=f"Changing PIN for {row['name']}", font=ctk.CTkFont(weight="bold")).pack(
+            anchor="w", padx=16, pady=(16, 10))
+
+        ctk.CTkLabel(dialog, text="Current PIN:").pack(anchor="w", padx=16)
+        current_var = tk.StringVar()
+        ctk.CTkEntry(dialog, textvariable=current_var, width=280, show="*").pack(padx=16)
+
+        ctk.CTkLabel(dialog, text="New PIN:").pack(anchor="w", padx=16, pady=(10, 0))
+        new_var = tk.StringVar()
+        ctk.CTkEntry(dialog, textvariable=new_var, width=280, show="*").pack(padx=16)
+
+        ctk.CTkLabel(dialog, text="Confirm new PIN:").pack(anchor="w", padx=16, pady=(10, 0))
+        confirm_var = tk.StringVar()
+        ctk.CTkEntry(dialog, textvariable=confirm_var, width=280, show="*").pack(padx=16)
+
+        def save():
+            if current_var.get().strip() != row["pin"]:
+                messagebox.showerror("Incorrect PIN", "Your current PIN doesn't match.")
+                return
+            if new_var.get().strip() != confirm_var.get().strip():
+                messagebox.showerror("PINs don't match", "New PIN and confirmation don't match.")
+                return
+            try:
+                staff_module.update_pin(self.conn, staff_id, new_var.get())
+            except ValueError as e:
+                messagebox.showerror("Cannot change PIN", str(e))
+                return
+            audit.record(
+                self.conn, actor_staff_id=staff_id, action="staff.pin_self_change",
+                target_staff_id=staff_id, details="changed their own PIN",
+            )
+            notifications.send(
+                "SmartGrocer: PIN changed",
+                f"{row['role'].capitalize()} {row['name']} changed their own PIN.",
+            )
+            dialog.destroy()
+            messagebox.showinfo("PIN changed", "Your PIN has been updated.")
+
+        ctk.CTkButton(dialog, text="Save", command=save, fg_color=theme.ACCENT_BLUE,
+                      hover_color=theme.ACCENT_BLUE_HOVER).pack(pady=18)
 
     def open_close_day_dialog(self):
         session = cash_drawer.get_open_session(self.conn)

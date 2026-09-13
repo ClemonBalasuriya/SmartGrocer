@@ -336,6 +336,36 @@ def test_staff_add_reset_pin_and_deactivate():
     except ValueError:
         pass
 
+    # Optional email/phone, used by notifications.py to message this
+    # person directly (e.g. their new PIN) rather than only the Owner.
+    with_contact_id = staff.add_staff(conn, "Nimal", "cashier", "2222",
+                                       email="nimal@example.com", phone="+94771234567")
+    contact_row = conn.execute("SELECT * FROM staff WHERE id=?", (with_contact_id,)).fetchone()
+    assert contact_row["email"] == "nimal@example.com"
+    assert contact_row["phone"] == "+94771234567"
+
+    # Blank contact fields stay NULL, not empty strings.
+    no_contact_id = staff.add_staff(conn, "Saman", "cashier", "3333")
+    no_contact_row = conn.execute("SELECT * FROM staff WHERE id=?", (no_contact_id,)).fetchone()
+    assert no_contact_row["email"] is None and no_contact_row["phone"] is None
+
+    try:
+        staff.add_staff(conn, "Bad Email", "cashier", "4444", email="not-an-email")
+        assert False, "should have rejected a malformed email"
+    except ValueError:
+        pass
+
+
+def test_generate_temp_pin_is_numeric_and_varies():
+    # Used by gui/app.py's "Forgot PIN?" self-service reset - a random PIN
+    # emailed to the account's saved address, never shown on screen.
+    pins = {staff.generate_temp_pin() for _ in range(20)}
+    assert len(pins) > 1, "should not generate the same PIN every time"
+    for pin in pins:
+        assert len(pin) == 6
+        assert pin.isdigit()
+    assert len(staff.generate_temp_pin(length=4)) == 4
+
 
 def test_audit_log_records_who_did_what_to_whom():
     from smartgrocer import audit
@@ -383,6 +413,37 @@ def test_notifications_config_round_trips_and_send_is_a_safe_noop_when_unconfigu
     assert notifications.send("Test", "hello") == []
 
     notifications.save(dict(notifications._DEFAULT))  # leave shared test state clean
+
+
+def test_notifications_send_targets_the_right_recipient():
+    from smartgrocer import notifications
+
+    cfg = dict(notifications._DEFAULT)
+    cfg.update(email_enabled=True, smtp_user="shop@example.com", smtp_app_password="x",
+               owner_email="owner@example.com")
+    notifications.save(cfg)
+
+    sent_to = []
+    original = notifications._send_email
+    notifications._send_email = lambda config, subject, message, to_addr: sent_to.append(to_addr)
+    try:
+        # Not passing to_email at all -> defaults to the Owner's address.
+        assert notifications.send("Subject", "msg") == ["email"]
+        assert sent_to == ["owner@example.com"]
+
+        # Passing a real address -> that person, not the Owner.
+        sent_to.clear()
+        assert notifications.send("Subject", "msg", to_email="cashier@example.com") == ["email"]
+        assert sent_to == ["cashier@example.com"]
+
+        # Passing None explicitly (this staff member has no email on file)
+        # -> skip the email channel entirely, do NOT fall back to Owner.
+        sent_to.clear()
+        assert notifications.send("Subject", "msg", to_email=None) == []
+        assert sent_to == []
+    finally:
+        notifications._send_email = original
+        notifications.save(dict(notifications._DEFAULT))
 
 
 def test_mobile_scan_server_end_to_end():
@@ -666,6 +727,74 @@ def test_receive_stock_tops_up_existing_product():
         pass
     try:
         pos.receive_stock(conn, product_id=999999, qty=5)
+        assert False, "expected ValueError for unknown product"
+    except ValueError:
+        pass
+
+
+def test_update_product_edits_details_without_touching_stock():
+    conn = _fresh_db()
+    p = conn.execute("SELECT * FROM products LIMIT 1").fetchone()
+    before_stock = pos.get_stock_on_hand(conn, p["id"])
+
+    pos.update_product(
+        conn, p["id"], name_en="Renamed Item", category="New Category", unit="pcs",
+        cost_price=p["cost_price"], cash_price=99.5, pack_size=2, reorder_level=7,
+        is_perishable=True,
+    )
+    updated = conn.execute("SELECT * FROM products WHERE id=?", (p["id"],)).fetchone()
+    assert updated["name_en"] == "Renamed Item"
+    assert updated["category"] == "New Category"
+    assert updated["cash_price"] == 99.5
+    assert updated["pack_size"] == 2
+    assert updated["reorder_level"] == 7
+    assert updated["is_perishable"] == 1
+    assert updated["code"] == p["code"]  # barcode is not editable through update_product
+    assert pos.get_stock_on_hand(conn, p["id"]) == before_stock  # untouched
+
+    # Bad input is rejected the same way add_product rejects it.
+    try:
+        pos.update_product(conn, p["id"], name_en="", category="X", cost_price=1, cash_price=2)
+        assert False, "expected ValueError for blank name"
+    except ValueError:
+        pass
+    try:
+        pos.update_product(conn, 999999, name_en="X", category="Y", cost_price=1, cash_price=2)
+        assert False, "expected ValueError for unknown product"
+    except ValueError:
+        pass
+
+
+def test_deactivate_and_reactivate_product_zeroes_and_restores_visibility():
+    # Mirrors staff.py's "deactivate, never delete" pattern: removing an
+    # item must not delete its row (stock_batches/invoice_items reference
+    # it) and, per how this shop wants it, should zero its stock rather
+    # than leaving stale phantom quantity behind.
+    conn = _fresh_db()
+    p = conn.execute("SELECT * FROM products LIMIT 1").fetchone()
+    assert pos.get_stock_on_hand(conn, p["id"]) > 0  # sanity check on the seeded demo data
+
+    pos.deactivate_product(conn, p["id"])
+    row = conn.execute("SELECT * FROM products WHERE id=?", (p["id"],)).fetchone()
+    assert row["active"] == 0
+    assert pos.get_stock_on_hand(conn, p["id"]) == 0
+    # It disappears from the active catalog lookup used at checkout...
+    assert pos.get_product_by_code(conn, p["code"]) is None
+    # ...but the row itself, and its stock batch history, still exist.
+    assert pos.get_product_by_code_any(conn, p["code"]) is not None
+    batches_still_present = conn.execute(
+        "SELECT COUNT(*) c FROM stock_batches WHERE product_id=?", (p["id"],)
+    ).fetchone()["c"]
+    assert batches_still_present > 0
+
+    pos.reactivate_product(conn, p["id"])
+    row_after = conn.execute("SELECT * FROM products WHERE id=?", (p["id"],)).fetchone()
+    assert row_after["active"] == 1
+    assert pos.get_product_by_code(conn, p["code"]) is not None
+    assert pos.get_stock_on_hand(conn, p["id"]) == 0  # stays zero until restocked, doesn't come back on its own
+
+    try:
+        pos.deactivate_product(conn, 999999)
         assert False, "expected ValueError for unknown product"
     except ValueError:
         pass
