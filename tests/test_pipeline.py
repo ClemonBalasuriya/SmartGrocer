@@ -401,6 +401,42 @@ def test_barcode_exact_match_lookup():
     assert pos.get_product_by_code(conn, "no-such-barcode-xyz") is None
 
 
+def test_barcode_matches_upc_a_and_ean_13_forms_of_the_same_code():
+    # The phone-scanner camera decode doesn't always agree on whether a
+    # barcode is UPC-A (12 digits) or its EAN-13-equivalent (13 digits,
+    # same number with a leading zero) - a product saved from one reading
+    # must still be found when a later scan reports the other form,
+    # otherwise "add it once, scan it again at checkout" can wrongly say
+    # the item isn't in the catalog even though it plainly is.
+    conn = _fresh_db()
+    pos.add_product(conn, code="012345678905", name_en="UPC Test Item", category="Snacks",
+                     cost_price=10, cash_price=20)
+    # Saved as 12-digit UPC-A; must also be found by its 13-digit EAN-13 form.
+    found = pos.get_product_by_code(conn, "0012345678905")
+    assert found is not None and found["name_en"] == "UPC Test Item"
+
+    pos.add_product(conn, code="0098765432109", name_en="EAN Test Item", category="Snacks",
+                     cost_price=10, cash_price=20)
+    # Saved as 13-digit EAN-13; must also be found by its 12-digit UPC-A form.
+    found2 = pos.get_product_by_code(conn, "098765432109")
+    assert found2 is not None and found2["name_en"] == "EAN Test Item"
+
+    # Short PLU-style codes are untouched by this - no false matches.
+    pos.add_product(conn, code="4821", name_en="Loose Bananas", category="Produce",
+                     cost_price=1, cash_price=2)
+    assert pos.get_product_by_code(conn, "04821") is None
+    assert pos.get_product_by_code(conn, "482") is None
+
+    # Adding the same barcode again under its other numeral form is
+    # rejected as a duplicate, not created as a second product record.
+    try:
+        pos.add_product(conn, code="0012345678905", name_en="Dup", category="Snacks",
+                         cost_price=1, cash_price=2)
+        assert False, "expected ValueError for a duplicate barcode in its other numeral form"
+    except ValueError as e:
+        assert "already exists" in str(e)
+
+
 def test_add_product_creates_catalog_entry_with_opening_stock():
     # This is the "add a brand-new product to the store" flow (Inventory
     # screen's "Add New Product" dialog), distinct from the GRN dialog
