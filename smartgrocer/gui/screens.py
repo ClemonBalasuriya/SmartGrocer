@@ -63,6 +63,37 @@ def styled_button(parent, text, command, kind="primary", **kwargs):
     return ctk.CTkButton(parent, text=text, command=command, **{**style, **kwargs})
 
 
+def fit_dialog(dialog, width: int, height: int) -> None:
+    """Size a popup dialog, but never larger than the screen actually is,
+    and centered on it.
+
+    Every dialog in this file used to just call dialog.geometry("WxH") with
+    a fixed size chosen to comfortably fit its content - fine on a big
+    monitor, but on a common laptop screen (1366x768 is typical) a dialog
+    taller than roughly 650px (after the Windows taskbar and title bar eat
+    into that 768) opens with its BOTTOM - almost always exactly where the
+    Save/Submit button lives - rendered off the bottom of the screen.
+    Tkinter doesn't reposition or shrink a Toplevel to keep it on-screen by
+    itself, so the only way to reach that button was to manually maximize
+    or drag the window up. Clamping the requested size to what's visible
+    (minus a margin for the taskbar/title bar) and centering it fixes that
+    for every dialog at once. Dialogs whose body is a CTkScrollableFrame
+    packed with expand=True (with the button packed after it, not inside
+    it) still show their button in full - a shorter window just means more
+    of the form scrolls, the button itself never gets less room."""
+    dialog.update_idletasks()
+    screen_w = dialog.winfo_screenwidth()
+    screen_h = dialog.winfo_screenheight()
+    max_w = max(300, screen_w - 80)
+    max_h = max(300, screen_h - 120)  # leaves room for the taskbar + title bar
+    w = min(width, max_w)
+    h = min(height, max_h)
+    x = max(0, (screen_w - w) // 2)
+    y = max(0, (screen_h - h) // 2 - 20)
+    dialog.geometry(f"{w}x{h}+{x}+{y}")
+    dialog.minsize(min(w, 300), min(h, 300))
+
+
 def run_in_background(widget: ctk.CTkBaseClass, work_fn, on_done, on_error=None):
     """Run a slow, DB-heavy computation (forecasting, association-rule
     mining, layout optimisation - anything that can take seconds over a
@@ -189,7 +220,7 @@ def prompt_split_payment(parent, total: float) -> list[tuple[str, float]] | None
     result: dict = {"payments": None}
     dialog = ctk.CTkToplevel(parent)
     dialog.title("Split / Mixed Payment")
-    dialog.geometry("360x340")
+    fit_dialog(dialog, 360, 340)
     dialog.configure(fg_color=theme.BG_LIGHT)
     dialog.grab_set()
 
@@ -450,7 +481,7 @@ class POSScreen(BaseScreen):
 
         dialog = ctk.CTkToplevel(self)
         dialog.title("Phone Scanner")
-        dialog.geometry("400x700")
+        fit_dialog(dialog, 400, 700)
         dialog.configure(fg_color=theme.BG_LIGHT)
         dialog.grab_set()
 
@@ -677,7 +708,7 @@ class POSScreen(BaseScreen):
 
         dialog = ctk.CTkToplevel(self)
         dialog.title("Resume Held Invoice")
-        dialog.geometry("460x320")
+        fit_dialog(dialog, 460, 320)
         dialog.configure(fg_color=theme.BG_LIGHT)
         dialog.grab_set()
 
@@ -717,7 +748,7 @@ class POSScreen(BaseScreen):
     def open_return_dialog(self):
         dialog = ctk.CTkToplevel(self)
         dialog.title("Return / Refund")
-        dialog.geometry("500x460")
+        fit_dialog(dialog, 500, 460)
         dialog.configure(fg_color=theme.BG_LIGHT)
         dialog.grab_set()
 
@@ -914,7 +945,7 @@ class InventoryScreen(BaseScreen):
 
         dialog = ctk.CTkToplevel(self)
         dialog.title(f"Edit Item - {product['code']}")
-        dialog.geometry("420x620")
+        fit_dialog(dialog, 420, 620)
         dialog.configure(fg_color=theme.BG_LIGHT)
         dialog.grab_set()
 
@@ -1013,7 +1044,7 @@ class InventoryScreen(BaseScreen):
             return
         dialog = ctk.CTkToplevel(self)
         dialog.title("Receive Stock (GRN)")
-        dialog.geometry("420x340")
+        fit_dialog(dialog, 420, 340)
         dialog.configure(fg_color=theme.BG_LIGHT)
 
         products = self.conn.execute("SELECT id, code, name_en FROM products WHERE active=1 ORDER BY name_en").fetchall()
@@ -1086,7 +1117,7 @@ class InventoryScreen(BaseScreen):
             return
         dialog = ctk.CTkToplevel(self)
         dialog.title("Add / Scan Item")
-        dialog.geometry("440x780")
+        fit_dialog(dialog, 440, 780)
         dialog.configure(fg_color=theme.BG_LIGHT)
         dialog.grab_set()
 
@@ -1277,7 +1308,7 @@ class InventoryScreen(BaseScreen):
 
         dialog = ctk.CTkToplevel(self)
         dialog.title("Scan Barcode with Phone")
-        dialog.geometry("400x620")
+        fit_dialog(dialog, 400, 620)
         dialog.configure(fg_color=theme.BG_LIGHT)
         dialog.grab_set()
         dialog.protocol("WM_DELETE_WINDOW", lambda: (restore(), dialog.destroy()))
@@ -1768,7 +1799,7 @@ class CustomersScreen(BaseScreen):
     def open_add_dialog(self):
         dialog = ctk.CTkToplevel(self)
         dialog.title("Add Customer")
-        dialog.geometry("380x340")
+        fit_dialog(dialog, 380, 340)
         dialog.configure(fg_color=theme.BG_LIGHT)
         dialog.grab_set()
 
@@ -1810,7 +1841,7 @@ class CustomersScreen(BaseScreen):
 
         dialog = ctk.CTkToplevel(self)
         dialog.title("Settle Credit")
-        dialog.geometry("360x260")
+        fit_dialog(dialog, 360, 260)
         dialog.configure(fg_color=theme.BG_LIGHT)
         dialog.grab_set()
 
@@ -1850,7 +1881,7 @@ class CustomersScreen(BaseScreen):
 
         dialog = ctk.CTkToplevel(self)
         dialog.title(f"Credit Statement — {c['name'] if c else ''}")
-        dialog.geometry("560x420")
+        fit_dialog(dialog, 560, 420)
         dialog.configure(fg_color=theme.BG_LIGHT)
         dialog.grab_set()
 
@@ -1896,7 +1927,7 @@ class SuppliersScreen(BaseScreen):
     def open_add_dialog(self):
         dialog = ctk.CTkToplevel(self)
         dialog.title("Add Supplier")
-        dialog.geometry("380x280")
+        fit_dialog(dialog, 380, 280)
         dialog.configure(fg_color=theme.BG_LIGHT)
         dialog.grab_set()
 
@@ -1927,8 +1958,11 @@ class StaffScreen(BaseScreen):
     """Add cashiers/admins and set them up, without needing a developer to
     reach into the database by hand every time someone new joins the till.
     Everyone can see the list, since a cashier glancing at who's on shift is
-    harmless. Adding staff, editing someone's saved contact info, or
-    activating/deactivating someone needs Admin or Owner.
+    harmless. Adding staff or editing someone's saved contact info needs
+    Admin or Owner. Activating/deactivating someone (this app's version of
+    "removing" a staff member - see staff.py's docstring for why it's
+    deactivate-not-delete) is Owner-only, same as removing an item in
+    Inventory - a bigger call than Admin's day-to-day account upkeep.
 
     Nobody manages anyone else's PIN here anymore - not even the Owner.
     Every account only ever changes its OWN PIN, either directly ("Change
@@ -1999,6 +2033,13 @@ class StaffScreen(BaseScreen):
         privileges, so anywhere Admin can manage staff, Owner can too."""
         return self._current_role() in ("admin", "owner")
 
+    def _is_owner(self) -> bool:
+        """Removing (deactivating) a staff member is Owner-only, same as
+        removing an item in Inventory - Admin can add staff and fix their
+        contact info, but taking someone off the roster is a bigger call
+        reserved for the Owner."""
+        return self._current_role() == "owner"
+
     def _actor_label(self) -> str:
         row = self.conn.execute(
             "SELECT name, role FROM staff WHERE id=?", (self.app.current_staff_id,)
@@ -2009,15 +2050,19 @@ class StaffScreen(BaseScreen):
 
     def refresh(self):
         is_admin = self._is_admin()
+        is_owner = self._is_owner()
         self.hint.configure(
-            text="Logged in as " + ("Owner" if self._current_role() == "owner" else "Admin")
-            + " - you can add staff, edit contact info, or deactivate someone below."
+            text="Logged in as " + ("Owner" if is_owner else "Admin")
+            + (" - you can add staff, edit contact info, or activate/deactivate someone below."
+               if is_owner else
+               " - you can add staff or edit contact info. Only the Owner can activate/deactivate a staff member.")
             if is_admin else
-            "Only Admin/Owner can add staff, edit contact info, or deactivate someone - "
-            "log in from the sidebar first. Anyone can view this list."
+            "Only Admin/Owner can add staff or edit contact info, and only the Owner can "
+            "activate/deactivate someone - log in from the sidebar first. Anyone can view this list."
         )
-        for btn in (self.add_btn, self.contact_btn, self.toggle_btn):
+        for btn in (self.add_btn, self.contact_btn):
             btn.configure(state="normal" if is_admin else "disabled")
+        self.toggle_btn.configure(state="normal" if is_owner else "disabled")
         tree_clear(self.tree)
         for s in staff_module.list_staff(self.conn):
             tree_insert(
@@ -2041,7 +2086,7 @@ class StaffScreen(BaseScreen):
         # dropdown were somehow bypassed.
         dialog = ctk.CTkToplevel(self)
         dialog.title("Add Staff")
-        dialog.geometry("360x460")
+        fit_dialog(dialog, 360, 460)
         dialog.configure(fg_color=theme.BG_LIGHT)
         dialog.grab_set()
 
@@ -2122,7 +2167,7 @@ class StaffScreen(BaseScreen):
 
         dialog = ctk.CTkToplevel(self)
         dialog.title(f"Edit Contact Info - {row['name']}")
-        dialog.geometry("360x260")
+        fit_dialog(dialog, 360, 260)
         dialog.configure(fg_color=theme.BG_LIGHT)
         dialog.grab_set()
 
@@ -2173,7 +2218,10 @@ class StaffScreen(BaseScreen):
         styled_button(dialog, "Save", save, kind="primary", width=140).pack(pady=18)
 
     def toggle_active(self):
-        if not self._require_admin():
+        if not self._is_owner():
+            messagebox.showwarning(
+                "Owner required", "Only the Owner can activate or deactivate a staff member."
+            )
             return
         sel = self.tree.selection()
         if not sel:
@@ -2353,7 +2401,7 @@ class NetworkScreen(BaseScreen):
     def open_connect_dialog(self):
         dialog = ctk.CTkToplevel(self)
         dialog.title("Connect to Another Till")
-        dialog.geometry("380x340")
+        fit_dialog(dialog, 380, 340)
         dialog.configure(fg_color=theme.BG_LIGHT)
         dialog.grab_set()
 
@@ -2512,7 +2560,7 @@ class ActivityLogScreen(BaseScreen):
 
         dialog = ctk.CTkToplevel(self)
         dialog.title("Notification Settings")
-        dialog.geometry("460x620")
+        fit_dialog(dialog, 460, 620)
         dialog.configure(fg_color=theme.BG_LIGHT)
         dialog.grab_set()
 
