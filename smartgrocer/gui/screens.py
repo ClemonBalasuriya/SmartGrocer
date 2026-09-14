@@ -150,6 +150,83 @@ class BaseScreen(ctk.CTkFrame):
                             text_color=theme.NAVY_DARK)
         lbl.pack(anchor="w", padx=24, pady=(20, 12))
 
+    def _open_phone_capture_dialog(self, on_captured):
+        """Open a small phone-scanner dialog whose only job is to capture
+        one barcode/QR code and hand the decoded text to on_captured(code)
+        - used to fill in a text field (like the new-product barcode field
+        in Inventory, or the search box in POS) from the phone's camera.
+        Reuses the same background server the till's own Phone Scanner
+        feature uses (POSScreen.open_phone_scanner_dialog), so if that's
+        already running for cart scanning, this borrows it for one scan
+        and hands it back exactly as it was - the till keeps working
+        normally either way. Lives on BaseScreen (not just one screen)
+        since any screen with a barcode-ish field can use it."""
+        if getattr(self.app, "mobile_scan_server", None) is None:
+            self.app.mobile_scan_server = mobile_scan.MobileScanServer(lambda code: {"unknown": True})
+        server = self.app.mobile_scan_server
+        if not server.running:
+            try:
+                server.start()
+            except OSError as e:
+                messagebox.showerror("Could not start phone scanner", str(e))
+                return
+
+        previous_on_scan = server.on_scan
+        state = {"restored": False}
+
+        def restore():
+            if not state["restored"]:
+                state["restored"] = True
+                server.on_scan = previous_on_scan
+
+        def captured(code):
+            restore()
+            self.after(0, lambda: (on_captured(code), dialog.destroy()))
+            return {"name": code, "added": True}
+
+        server.on_scan = captured
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Scan Barcode with Phone")
+        fit_dialog(dialog, 400, 620)
+        dialog.configure(fg_color=theme.BG_LIGHT)
+        dialog.grab_set()
+        dialog.protocol("WM_DELETE_WINDOW", lambda: (restore(), dialog.destroy()))
+
+        body = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
+        body.pack(fill="both", expand=True)
+
+        ctk.CTkLabel(body, text="Scan the product's barcode", font=ctk.CTkFont(size=14, weight="bold"),
+                     text_color=theme.NAVY_DARK).pack(pady=(16, 6))
+
+        try:
+            from PIL import Image
+            import io
+            png_bytes = mobile_scan.generate_qr_png_bytes(server.url)
+            qr_img = Image.open(io.BytesIO(png_bytes))
+            ctk_qr = ctk.CTkImage(light_image=qr_img, dark_image=qr_img, size=(200, 200))
+            ctk.CTkLabel(body, image=ctk_qr, text="").pack(pady=6)
+        except Exception:
+            pass
+
+        ctk.CTkLabel(body, text="Open this address on the phone (or scan the QR above):",
+                     text_color=theme.TEXT_MUTED, font=ctk.CTkFont(size=11)).pack(pady=(6, 0))
+        ctk.CTkLabel(body, text=server.url, font=ctk.CTkFont(size=13, weight="bold"),
+                     text_color=theme.ACCENT_BLUE).pack(pady=(0, 12))
+        ctk.CTkLabel(body, text="Pairing code:", text_color=theme.TEXT_MUTED, font=ctk.CTkFont(size=11)).pack()
+        ctk.CTkLabel(body, text=server.pairing_code, font=ctk.CTkFont(size=28, weight="bold"),
+                     text_color=theme.NAVY_DARK).pack(pady=(2, 12))
+        ctk.CTkLabel(
+            body,
+            text="Point the camera at the barcode - it fills in the field automatically as "
+                 "soon as it's read, and this window closes on its own. (First-time on a new "
+                 "phone: it'll show a one-time \"Connection not private\" warning - tap "
+                 "Advanced/Show Details then Proceed/visit this website.)",
+            text_color=theme.TEXT_MUTED, font=ctk.CTkFont(size=11), wraplength=340, justify="left",
+        ).pack(padx=20, pady=(0, 14))
+
+        styled_button(dialog, "Cancel", lambda: (restore(), dialog.destroy()), kind="secondary", width=140).pack(pady=(0, 16))
+
 
 # --------------------------------------------------------------------------- #
 # Dashboard
@@ -324,27 +401,43 @@ class POSScreen(BaseScreen):
                                           placeholder_text="barcode / name (English or Sinhala)")
         self.search_entry.grid(row=1, column=0, padx=(0, 10), pady=6)
         self.search_entry.bind("<Return>", lambda e: self.do_search())
-        styled_button(top, "Search", self.do_search, width=90).grid(row=1, column=1)
+        styled_button(top, "Search", self.do_search, width=90).grid(row=1, column=1, padx=(0, 6))
+        # The label above the box says "Scan barcode or search item", but
+        # until now the only way to actually scan into it was a physical
+        # USB/Bluetooth scanner (those just type into whatever field has
+        # focus, like a keyboard) - there was no on-screen scan option at
+        # all, unlike the Add/Scan Item dialog in Inventory which has a
+        # "Scan with Phone" button right next to its barcode field. This is
+        # the same feature here: one tap opens the phone-camera scanner,
+        # and the single code it captures goes straight into this box and
+        # triggers the same search - which, for an exact barcode match,
+        # already skips straight to the cart (see do_search below). The
+        # full continuous "Phone Scanner" session further down (which adds
+        # every scan straight to the cart without needing this box at all)
+        # is still there too, for ringing up a whole basket hands-free.
+        styled_button(top, "Scan with Phone",
+                      lambda: self._open_phone_capture_dialog(self._on_phone_scan_into_search),
+                      kind="secondary", width=140).grid(row=1, column=2, padx=(0, 6))
 
-        ctk.CTkLabel(top, text="Price tier:", text_color=theme.TEXT_DARK).grid(row=0, column=2, padx=(20, 0), sticky="w")
+        ctk.CTkLabel(top, text="Price tier:", text_color=theme.TEXT_DARK).grid(row=0, column=3, padx=(20, 0), sticky="w")
         self.tier_var = tk.StringVar(value="cash")
         ctk.CTkOptionMenu(top, values=["cash", "credit", "wholesale"], variable=self.tier_var).grid(
-            row=1, column=2, padx=(20, 0))
+            row=1, column=3, padx=(20, 0))
 
-        ctk.CTkLabel(top, text="Payment:", text_color=theme.TEXT_DARK).grid(row=0, column=3, padx=(16, 0), sticky="w")
+        ctk.CTkLabel(top, text="Payment:", text_color=theme.TEXT_DARK).grid(row=0, column=4, padx=(16, 0), sticky="w")
         self.payment_var = tk.StringVar(value="cash")
         ctk.CTkOptionMenu(top, values=["cash", "card", "cheque", "credit", "split"],
-                           variable=self.payment_var).grid(row=1, column=3, padx=(16, 0))
+                           variable=self.payment_var).grid(row=1, column=4, padx=(16, 0))
 
-        ctk.CTkLabel(top, text="Customer:", text_color=theme.TEXT_DARK).grid(row=0, column=4, padx=(16, 0), sticky="w")
+        ctk.CTkLabel(top, text="Customer:", text_color=theme.TEXT_DARK).grid(row=0, column=5, padx=(16, 0), sticky="w")
         self.customer_var = tk.StringVar(value="Walk-in")
         self.customer_menu = ctk.CTkOptionMenu(top, values=["Walk-in"], variable=self.customer_var, width=160)
-        self.customer_menu.grid(row=1, column=4, padx=(16, 0))
+        self.customer_menu.grid(row=1, column=5, padx=(16, 0))
 
-        ctk.CTkLabel(top, text="Cashier:", text_color=theme.TEXT_DARK).grid(row=0, column=5, padx=(16, 0), sticky="w")
+        ctk.CTkLabel(top, text="Cashier:", text_color=theme.TEXT_DARK).grid(row=0, column=6, padx=(16, 0), sticky="w")
         self.cashier_label = ctk.CTkLabel(top, text="Not logged in", font=ctk.CTkFont(weight="bold"),
                                            text_color=theme.DANGER_RED)
-        self.cashier_label.grid(row=1, column=5, padx=(16, 0), sticky="w")
+        self.cashier_label.grid(row=1, column=6, padx=(16, 0), sticky="w")
 
         results_frame = ctk.CTkFrame(body, fg_color="transparent")
         results_frame.pack(fill="x", padx=24, pady=(6, 0))
@@ -576,6 +669,15 @@ class POSScreen(BaseScreen):
             dialog.destroy()
 
         styled_button(dialog, "Stop Phone Scanner", stop_server, kind="danger", width=200).pack(pady=(0, 16))
+
+    def _on_phone_scan_into_search(self, code: str) -> None:
+        """Callback for the "Scan with Phone" button next to the search
+        box: drop the one code that dialog captured into the search box
+        and run the same search do_search() already runs for a scanner or
+        typed code - which, for an exact barcode match, skips straight to
+        the cart."""
+        self.search_var.set(code)
+        self.do_search()
 
     def do_search(self):
         query = self.search_var.get().strip()
@@ -1316,80 +1418,8 @@ class InventoryScreen(BaseScreen):
         save_btn.configure(state="disabled")
         dialog.after(150, code_entry.focus_set)
 
-    def _open_phone_capture_dialog(self, on_captured):
-        """Open a small phone-scanner dialog whose only job is to capture
-        one barcode/QR code and hand the decoded text to on_captured(code)
-        - used to fill in a text field (like the new-product barcode
-        field above) from the phone's camera. Reuses the same background
-        server the till's own Phone Scanner feature uses (POSScreen.
-        open_phone_scanner_dialog), so if that's already running for cart
-        scanning, this borrows it for one scan and hands it back exactly
-        as it was - the till keeps working normally either way."""
-        if getattr(self.app, "mobile_scan_server", None) is None:
-            self.app.mobile_scan_server = mobile_scan.MobileScanServer(lambda code: {"unknown": True})
-        server = self.app.mobile_scan_server
-        if not server.running:
-            try:
-                server.start()
-            except OSError as e:
-                messagebox.showerror("Could not start phone scanner", str(e))
-                return
-
-        previous_on_scan = server.on_scan
-        state = {"restored": False}
-
-        def restore():
-            if not state["restored"]:
-                state["restored"] = True
-                server.on_scan = previous_on_scan
-
-        def captured(code):
-            restore()
-            self.after(0, lambda: (on_captured(code), dialog.destroy()))
-            return {"name": code, "added": True}
-
-        server.on_scan = captured
-
-        dialog = ctk.CTkToplevel(self)
-        dialog.title("Scan Barcode with Phone")
-        fit_dialog(dialog, 400, 620)
-        dialog.configure(fg_color=theme.BG_LIGHT)
-        dialog.grab_set()
-        dialog.protocol("WM_DELETE_WINDOW", lambda: (restore(), dialog.destroy()))
-
-        body = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
-        body.pack(fill="both", expand=True)
-
-        ctk.CTkLabel(body, text="Scan the product's barcode", font=ctk.CTkFont(size=14, weight="bold"),
-                     text_color=theme.NAVY_DARK).pack(pady=(16, 6))
-
-        try:
-            from PIL import Image
-            import io
-            png_bytes = mobile_scan.generate_qr_png_bytes(server.url)
-            qr_img = Image.open(io.BytesIO(png_bytes))
-            ctk_qr = ctk.CTkImage(light_image=qr_img, dark_image=qr_img, size=(200, 200))
-            ctk.CTkLabel(body, image=ctk_qr, text="").pack(pady=6)
-        except Exception:
-            pass
-
-        ctk.CTkLabel(body, text="Open this address on the phone (or scan the QR above):",
-                     text_color=theme.TEXT_MUTED, font=ctk.CTkFont(size=11)).pack(pady=(6, 0))
-        ctk.CTkLabel(body, text=server.url, font=ctk.CTkFont(size=13, weight="bold"),
-                     text_color=theme.ACCENT_BLUE).pack(pady=(0, 12))
-        ctk.CTkLabel(body, text="Pairing code:", text_color=theme.TEXT_MUTED, font=ctk.CTkFont(size=11)).pack()
-        ctk.CTkLabel(body, text=server.pairing_code, font=ctk.CTkFont(size=28, weight="bold"),
-                     text_color=theme.NAVY_DARK).pack(pady=(2, 12))
-        ctk.CTkLabel(
-            body,
-            text="Point the camera at the barcode - it fills in the field automatically as "
-                 "soon as it's read, and this window closes on its own. (First-time on a new "
-                 "phone: it'll show a one-time \"Connection not private\" warning - tap "
-                 "Advanced/Show Details then Proceed/visit this website.)",
-            text_color=theme.TEXT_MUTED, font=ctk.CTkFont(size=11), wraplength=340, justify="left",
-        ).pack(padx=20, pady=(0, 14))
-
-        styled_button(dialog, "Cancel", lambda: (restore(), dialog.destroy()), kind="secondary", width=140).pack(pady=(0, 16))
+    # _open_phone_capture_dialog moved to BaseScreen - POSScreen's search box
+    # uses it too now, not just this dialog's barcode field.
 
 
 # --------------------------------------------------------------------------- #
