@@ -394,52 +394,50 @@ class POSScreen(BaseScreen):
         top = ctk.CTkFrame(body, fg_color="transparent")
         top.pack(fill="x", padx=24)
 
-        # Label + "Scan with Phone" share one small row-frame, packed
-        # tightly left-to-right, instead of each being its own grid cell -
-        # a plain grid cell here would size to the WIDEST thing ever put in
-        # that column (the 260px-wide search entry sits in the same column,
-        # one row down), so the button ended up stranded far to the right
-        # of the label's actual text instead of sitting right next to it.
-        # Packing them together in their own frame keeps them exactly as
-        # wide as their own content, wherever that frame gets placed.
-        label_row = ctk.CTkFrame(top, fg_color="transparent")
-        label_row.grid(row=0, column=0, sticky="w")
-        ctk.CTkLabel(label_row, text="Scan barcode or search item:",
-                     text_color=theme.TEXT_DARK).pack(side="left")
-        # The label was promising a scan option that wasn't actually on
-        # screen anywhere until now (only a physical USB/Bluetooth scanner
-        # worked) - this opens the same phone-camera scanner used
-        # elsewhere in the app; see do_search/_on_phone_scan_into_search
-        # for what happens once a code is captured.
-        styled_button(label_row, "Scan with Phone",
-                      lambda: self._open_phone_capture_dialog(self._on_phone_scan_into_search),
-                      kind="secondary", width=140).pack(side="left", padx=(10, 0))
+        ctk.CTkLabel(top, text="Scan barcode or search item:", text_color=theme.TEXT_DARK).grid(
+            row=0, column=0, sticky="w")
         self.search_var = tk.StringVar()
         self.search_entry = ctk.CTkEntry(top, textvariable=self.search_var, width=260,
                                           placeholder_text="barcode / name (English or Sinhala)")
         self.search_entry.grid(row=1, column=0, padx=(0, 10), pady=6)
         self.search_entry.bind("<Return>", lambda e: self.do_search())
         styled_button(top, "Search", self.do_search, width=90).grid(row=1, column=1, padx=(0, 6))
+        # The label above the box says "Scan barcode or search item", but
+        # until now the only way to actually scan into it was a physical
+        # USB/Bluetooth scanner (those just type into whatever field has
+        # focus, like a keyboard) - there was no on-screen scan option at
+        # all, unlike the Add/Scan Item dialog in Inventory which has a
+        # "Scan with Phone" button right next to its barcode field. This is
+        # the same feature here: one tap opens the phone-camera scanner,
+        # and the single code it captures goes straight into this box and
+        # triggers the same search - which, for an exact barcode match,
+        # already skips straight to the cart (see do_search below). The
+        # full continuous "Phone Scanner" session further down (which adds
+        # every scan straight to the cart without needing this box at all)
+        # is still there too, for ringing up a whole basket hands-free.
+        styled_button(top, "Scan with Phone",
+                      lambda: self._open_phone_capture_dialog(self._on_phone_scan_into_search),
+                      kind="secondary", width=140).grid(row=1, column=2, padx=(0, 6))
 
-        ctk.CTkLabel(top, text="Price tier:", text_color=theme.TEXT_DARK).grid(row=0, column=2, padx=(20, 0), sticky="w")
+        ctk.CTkLabel(top, text="Price tier:", text_color=theme.TEXT_DARK).grid(row=0, column=3, padx=(20, 0), sticky="w")
         self.tier_var = tk.StringVar(value="cash")
         ctk.CTkOptionMenu(top, values=["cash", "credit", "wholesale"], variable=self.tier_var).grid(
-            row=1, column=2, padx=(20, 0))
+            row=1, column=3, padx=(20, 0))
 
-        ctk.CTkLabel(top, text="Payment:", text_color=theme.TEXT_DARK).grid(row=0, column=3, padx=(16, 0), sticky="w")
+        ctk.CTkLabel(top, text="Payment:", text_color=theme.TEXT_DARK).grid(row=0, column=4, padx=(16, 0), sticky="w")
         self.payment_var = tk.StringVar(value="cash")
         ctk.CTkOptionMenu(top, values=["cash", "card", "cheque", "credit", "split"],
-                           variable=self.payment_var).grid(row=1, column=3, padx=(16, 0))
+                           variable=self.payment_var).grid(row=1, column=4, padx=(16, 0))
 
-        ctk.CTkLabel(top, text="Customer:", text_color=theme.TEXT_DARK).grid(row=0, column=4, padx=(16, 0), sticky="w")
+        ctk.CTkLabel(top, text="Customer:", text_color=theme.TEXT_DARK).grid(row=0, column=5, padx=(16, 0), sticky="w")
         self.customer_var = tk.StringVar(value="Walk-in")
         self.customer_menu = ctk.CTkOptionMenu(top, values=["Walk-in"], variable=self.customer_var, width=160)
-        self.customer_menu.grid(row=1, column=4, padx=(16, 0))
+        self.customer_menu.grid(row=1, column=5, padx=(16, 0))
 
-        ctk.CTkLabel(top, text="Cashier:", text_color=theme.TEXT_DARK).grid(row=0, column=5, padx=(16, 0), sticky="w")
+        ctk.CTkLabel(top, text="Cashier:", text_color=theme.TEXT_DARK).grid(row=0, column=6, padx=(16, 0), sticky="w")
         self.cashier_label = ctk.CTkLabel(top, text="Not logged in", font=ctk.CTkFont(weight="bold"),
                                            text_color=theme.DANGER_RED)
-        self.cashier_label.grid(row=1, column=5, padx=(16, 0), sticky="w")
+        self.cashier_label.grid(row=1, column=6, padx=(16, 0), sticky="w")
 
         results_frame = ctk.CTkFrame(body, fg_color="transparent")
         results_frame.pack(fill="x", padx=24, pady=(6, 0))

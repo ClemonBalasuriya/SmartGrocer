@@ -241,21 +241,22 @@ internet access (couldn't `pip install` anything) and no display/`tkinter`
      overflow with genuinely no way to reach whatever got cut off (not
      even a scrollbar to try). Fixed the same way as POS/every dialog
      above: their content now packs into a `CTkScrollableFrame`.
-   - The mousewheel/trackpad fix above (a single global bind_all) turned
-     out to not be reliable enough by itself - bind_all is one shared,
-     app-wide slot per event, not additive, so anything else that touches
-     it (CustomTkinter's own internals included) can silently replace or
-     wipe it out, leaving scrolling dead until something rebinds it. The
-     fix that can't be stolen out from under us: walk the entire live
-     widget tree - every screen and every open dialog - on a repeating
-     timer, and bind the scroll handler DIRECTLY to every individual
-     widget inside each `CTkScrollableFrame`, instead of relying only on
-     the shared global slot. A plain widget's own binding is a completely
-     separate thing from that shared slot, so nothing else in the app can
-     touch or clobber it - and re-walking on a timer picks up newly
-     created widgets (a rebuilt list of quick-item buttons, a freshly
-     opened dialog) automatically. The original global binding is kept
-     too, as a harmless extra safety net.
+   - A follow-up attempt at the mousewheel/trackpad fix tried binding the
+     scroll handler directly to every individual widget in the app,
+     re-walking the entire widget tree on a repeating timer to catch
+     newly-created widgets too. That made the whole window visibly
+     stutter ("every screen going and coming"), and a next attempt to fix
+     *that* by narrowing the walk still didn't resolve things reliably.
+     Both were reverted - back to the simpler single global `bind_all` +
+     ancestor-walk from the point above, re-applied on a repeating timer
+     (just re-claiming one binding, nothing recursive) as the known-stable
+     version. The **Scan with Phone** button next to POS's search box
+     (see "Barcode-scanner scan-to-cart" above) was also reverted from
+     sitting beside the "Scan barcode or search item" label back to
+     sitting next to the Search button - that repositioning shipped in
+     the same round as the mousewheel regression, so it went back too.
+     Touchpad scrolling being intermittently unreliable in some spots is
+     a known open issue, not fully solved as of this note.
 
 ## Packaging as a standalone Windows .exe
 

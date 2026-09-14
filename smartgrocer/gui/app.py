@@ -231,74 +231,28 @@ class SmartGrocerApp(ctk.CTk):
         # essentially the whole sidebar list with barely any bare background
         # left to hover over, and the same shape shows up elsewhere too
         # (the POS screen's body is mostly search results/buttons/cart).
+        # Binding the wheel globally (bind_all reaches every widget, buttons
+        # included, since "wheel" isn't a button-native event they
+        # intercept) and, in _on_global_mousewheel, walking up from whatever
+        # widget is actually under the cursor to find its nearest
+        # CTkScrollableFrame ancestor fixes scrolling everywhere in the app
+        # with this one binding, not just the nav list. Re-applying it on a
+        # repeating timer (instead of once at startup) guards against
+        # anything else in the app touching the same shared global slot and
+        # silently overwriting it.
         #
-        # Attempt 1 was a single global bind_all("<MouseWheel>", ...) plus
-        # walking up from whatever's under the cursor to find its nearest
-        # CTkScrollableFrame ancestor. That still wasn't reliable in
-        # practice - bind_all is one shared, app-wide slot per event, not
-        # additive, and CustomTkinter's own internals (or simply everything
-        # else in a big app that might touch the same global slot) can
-        # silently replace or wipe it out from under us, leaving scrolling
-        # dead until something rebinds it.
-        #
-        # The fix that can't be stolen out from under us: bind the handler
-        # DIRECTLY to every individual widget inside each CTkScrollableFrame
-        # (a plain .bind() on that one widget's own bindtag, completely
-        # separate from the shared "all" tag), instead of relying on a
-        # global catch-all. Nothing else in the app has any reason to touch
-        # a plain CTkButton or CTkLabel's own bindtag, so once bound there
-        # it stays bound. _rewire_all_scroll_wheels walks the ENTIRE live
-        # widget tree - every screen and every open dialog - and does this
-        # for every CTkScrollableFrame found, then reschedules itself, so
-        # newly-created widgets (a rebuilt list of quick-item buttons, a
-        # freshly opened dialog) get wired up automatically within a
-        # fraction of a second of appearing, without every screen/dialog
-        # needing to remember to do it themselves. The original bind_all is
-        # kept too, purely as a harmless extra safety net.
+        # (A more aggressive fix was tried here - directly binding every
+        # individual widget inside every scrollable area, everywhere in the
+        # app, re-walked on a timer - but it caused a worse, visible bug
+        # (the whole window stuttering/flashing) and was reverted. This
+        # simpler version is the known-stable one.)
         self._reassert_scroll_binding()
 
     def _reassert_scroll_binding(self) -> None:
         self.bind_all("<MouseWheel>", self._on_global_mousewheel)
         self.bind_all("<Button-4>", self._on_global_mousewheel)  # Linux scroll up
         self.bind_all("<Button-5>", self._on_global_mousewheel)  # Linux scroll down
-        self._rewire_all_scroll_wheels(self)
-        self.after(200, self._reassert_scroll_binding)
-
-    def _rewire_all_scroll_wheels(self, widget) -> None:
-        """Walk `widget` and every descendant (screens, and any currently
-        open dialogs - Toplevels created with a screen as their master show
-        up here too), and directly wire up wheel/trackpad scrolling on
-        every CTkScrollableFrame found. Safe to call repeatedly: rebinding
-        the same widget just replaces its own handler, it doesn't stack,
-        so this can never cause one scroll to move the view by more than
-        one step."""
-        for child in widget.winfo_children():
-            if isinstance(child, ctk.CTkScrollableFrame):
-                self._wire_one_scrollable(child)
-            self._rewire_all_scroll_wheels(child)
-
-    def _wire_one_scrollable(self, scrollable_frame) -> None:
-        canvas = getattr(scrollable_frame, "_parent_canvas", None)
-        if canvas is None:
-            return
-
-        def scroll(event):
-            if event.num == 4:
-                delta = -1
-            elif event.num == 5:
-                delta = 1
-            else:
-                delta = -1 if event.delta > 0 else 1
-            canvas.yview_scroll(delta, "units")
-
-        def bind_recursive(w):
-            w.bind("<MouseWheel>", scroll)
-            w.bind("<Button-4>", scroll)
-            w.bind("<Button-5>", scroll)
-            for c in w.winfo_children():
-                bind_recursive(c)
-
-        bind_recursive(scrollable_frame)
+        self.after(500, self._reassert_scroll_binding)
 
         self.container = ctk.CTkFrame(self, corner_radius=0, fg_color=theme.BG_LIGHT)
         self.container.grid(row=0, column=1, sticky="nsew")
