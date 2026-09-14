@@ -158,9 +158,19 @@ class BaseScreen(ctk.CTkFrame):
 class DashboardScreen(BaseScreen):
     def __init__(self, parent, app):
         super().__init__(parent, app)
-        self.header("Dashboard")
+        self.header("Dashboard")  # stays fixed at the top, outside the scrollable area below
 
-        self.cards_frame = ctk.CTkFrame(self, fg_color="transparent")
+        # Everything below goes in a scrollable frame, not straight into
+        # `self` - on a smaller screen, a laptop with the taskbar/title bar
+        # eating into the usable height, or Windows display scaling above
+        # 100%, the 6 KPI cards + top-seller card + button row don't all
+        # fit, and without a scrollbar there was literally no way to reach
+        # whatever got cut off (unlike the POS screen, which already had
+        # this same fix - see its own __init__ for the fuller explanation).
+        body = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        body.pack(fill="both", expand=True)
+
+        self.cards_frame = ctk.CTkFrame(body, fg_color="transparent")
         self.cards_frame.pack(fill="x", padx=24, pady=10)
         self.card_labels: dict[str, ctk.CTkLabel] = {}
         specs = [
@@ -183,14 +193,14 @@ class DashboardScreen(BaseScreen):
             value_lbl.pack(anchor="w", padx=16, pady=(0, 14))
             self.card_labels[key] = value_lbl
 
-        top_seller_frame = ctk.CTkFrame(self, corner_radius=10, fg_color=theme.CARD_BG,
+        top_seller_frame = ctk.CTkFrame(body, corner_radius=10, fg_color=theme.CARD_BG,
                                          border_width=1, border_color=theme.BORDER)
         top_seller_frame.pack(fill="x", padx=24, pady=(0, 10))
         self.top_seller_label = ctk.CTkLabel(top_seller_frame, text="Top seller (30d): -",
                                               font=ctk.CTkFont(size=14), text_color=theme.TEXT_DARK)
         self.top_seller_label.pack(anchor="w", padx=16, pady=12)
 
-        btn_row = ctk.CTkFrame(self, fg_color="transparent")
+        btn_row = ctk.CTkFrame(body, fg_color="transparent")
         btn_row.pack(fill="x", padx=24, pady=10)
         styled_button(btn_row, "Refresh", self.refresh, kind="secondary").pack(side="left", padx=(0, 10))
         styled_button(btn_row, "Rebuild synthetic demo data", self.rebuild_demo_data,
@@ -1025,6 +1035,7 @@ class InventoryScreen(BaseScreen):
             dialog.destroy()
             self.refresh()
 
+        dialog.bind("<Return>", lambda e: save())
         # On `dialog`, not `scroll` - so Save is always visible without
         # having to scroll all the way down through a long form to reach it.
         styled_button(dialog, "Save", save, kind="primary", width=140).pack(pady=18)
@@ -1122,6 +1133,7 @@ class InventoryScreen(BaseScreen):
             except ValueError as e:
                 messagebox.showerror("Invalid input", str(e))
 
+        dialog.bind("<Return>", lambda e: save())
         styled_button(dialog, "Save", save, kind="primary", width=140).pack(pady=18)
 
     def open_add_product_dialog(self):
@@ -1865,6 +1877,7 @@ class CustomersScreen(BaseScreen):
             dialog.destroy()
             self.refresh()
 
+        dialog.bind("<Return>", lambda e: save())
         styled_button(dialog, "Save", save, kind="primary", width=140).pack(pady=18)
 
     def open_settle_dialog(self):
@@ -1912,6 +1925,7 @@ class CustomersScreen(BaseScreen):
             dialog.destroy()
             self.refresh()
 
+        dialog.bind("<Return>", lambda e: save())
         styled_button(dialog, "Record Payment", save, kind="success", width=160).pack(pady=18)
 
     def open_statement_dialog(self):
@@ -1996,6 +2010,7 @@ class SuppliersScreen(BaseScreen):
             dialog.destroy()
             self.refresh()
 
+        dialog.bind("<Return>", lambda e: save())
         styled_button(dialog, "Save", save, kind="primary", width=140).pack(pady=18)
 
 
@@ -2201,6 +2216,7 @@ class StaffScreen(BaseScreen):
             dialog.destroy()
             self.refresh()
 
+        dialog.bind("<Return>", lambda e: save())
         styled_button(dialog, "Save", save, kind="primary", width=140).pack(pady=20)
 
     def open_edit_contact_dialog(self):
@@ -2276,6 +2292,7 @@ class StaffScreen(BaseScreen):
             dialog.destroy()
             self.refresh()
 
+        dialog.bind("<Return>", lambda e: save())
         styled_button(dialog, "Save", save, kind="primary", width=140).pack(pady=18)
 
     def toggle_active(self):
@@ -2344,15 +2361,25 @@ class NetworkScreen(BaseScreen):
 
     def __init__(self, parent, app):
         super().__init__(parent, app)
-        self.header("Network / Multi-Till")
+        self.header("Network / Multi-Till")  # stays fixed at the top, outside the scrollable area below
+
+        # Everything below goes in a scrollable frame, not straight into
+        # `self` - this screen has no treeview or other expanding widget to
+        # absorb extra space, so on a smaller screen or with Windows display
+        # scaling above 100% its content could overflow with no way at all
+        # to reach the rest (see DashboardScreen/POSScreen for the fuller
+        # explanation of this same fix).
+        body = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        body.pack(fill="both", expand=True)
+
         self.hint = ctk.CTkLabel(
-            self, text="Connect more than one till to the same stock and sales data - wired Ethernet "
+            body, text="Connect more than one till to the same stock and sales data - wired Ethernet "
                        "or Wi-Fi both work, this only cares that the tills are on the same network.",
             font=ctk.CTkFont(size=12), text_color=theme.TEXT_MUTED, wraplength=760, justify="left",
         )
         self.hint.pack(anchor="w", padx=24, pady=(0, 10))
 
-        self.status_card = ctk.CTkFrame(self, fg_color=theme.CARD_BG_ALT, corner_radius=10)
+        self.status_card = ctk.CTkFrame(body, fg_color=theme.CARD_BG_ALT, corner_radius=10)
         self.status_card.pack(fill="x", padx=24, pady=(0, 14))
         self.status_label = ctk.CTkLabel(
             self.status_card, text="", font=ctk.CTkFont(size=14, weight="bold"),
@@ -2365,7 +2392,7 @@ class NetworkScreen(BaseScreen):
         )
         self.status_detail.pack(anchor="w", padx=16, pady=(0, 14))
 
-        btn_row = ctk.CTkFrame(self, fg_color="transparent")
+        btn_row = ctk.CTkFrame(body, fg_color="transparent")
         btn_row.pack(fill="x", padx=24)
         self.share_btn = styled_button(btn_row, "Share This Till's Data", self.start_sharing, kind="primary")
         self.share_btn.pack(side="left")
@@ -2378,7 +2405,7 @@ class NetworkScreen(BaseScreen):
                                              self.disconnect, kind="danger")
         self.disconnect_btn.pack(side="left", padx=8)
 
-        warning_card = ctk.CTkFrame(self, fg_color=theme.CARD_BG_ALT, corner_radius=8)
+        warning_card = ctk.CTkFrame(body, fg_color=theme.CARD_BG_ALT, corner_radius=8)
         warning_card.pack(fill="x", padx=24, pady=(16, 0))
         ctk.CTkLabel(
             warning_card,
@@ -2508,6 +2535,7 @@ class NetworkScreen(BaseScreen):
             self.refresh()
             messagebox.showinfo("Connected", "This till is now using the Main Till's shared data.")
 
+        dialog.bind("<Return>", lambda e: connect())
         styled_button(dialog, "Connect", connect, kind="primary", width=140).pack(pady=18)
 
     def disconnect(self):

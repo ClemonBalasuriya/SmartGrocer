@@ -233,6 +233,14 @@ internet access (couldn't `pip install` anything) and no display/`tkinter`
      already uses Enter for something else - checking the scanned code -
      so adding a second meaning would make one Enter press both check the
      code and submit the whole form before there's anything to review).
+   - One more: the Dashboard and Network screens packed all their content
+     straight into the screen itself with no scrollable frame and no
+     treeview or other expanding widget to absorb extra space - unlike
+     every other screen, which has one or the other. On a smaller screen
+     or with Windows display scaling above 100%, their content could
+     overflow with genuinely no way to reach whatever got cut off (not
+     even a scrollbar to try). Fixed the same way as POS/every dialog
+     above: their content now packs into a `CTkScrollableFrame`.
 
 ## Packaging as a standalone Windows .exe
 
