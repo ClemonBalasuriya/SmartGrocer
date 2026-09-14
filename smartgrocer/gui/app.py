@@ -212,7 +212,6 @@ class SmartGrocerApp(ctk.CTk):
             scrollbar_button_color=theme.ACCENT_BLUE, scrollbar_button_hover_color=theme.ACCENT_BLUE_HOVER,
         )
         nav_scroll.pack(side="top", fill="both", expand=True, padx=0, pady=(0, 0))
-        self._nav_scroll = nav_scroll
 
         self.nav_buttons: dict[str, ctk.CTkButton] = {}
         for label, key, _cls in NAV_ITEMS:
@@ -226,18 +225,18 @@ class SmartGrocerApp(ctk.CTk):
             btn.pack(fill="x", padx=14, pady=3)
             self.nav_buttons[key] = btn
 
-        # CTkScrollableFrame only wires up mouse-wheel scrolling for its own
-        # bare background, not for widgets packed inside it - a
-        # widely-reported CustomTkinter limitation, and a real problem here
-        # since nav buttons fill essentially the whole list with barely any
-        # bare background left to hover over. Binding the wheel globally
-        # (bind_all reaches every widget, buttons included, since "wheel"
-        # isn't a button-native event they intercept) and only acting on it
-        # when the pointer is actually over this list - checked by walking
-        # up from whatever widget is under the cursor - makes it scroll
-        # from anywhere over the nav list, and does nothing everywhere else
-        # so it can't interfere with scrolling elsewhere in the app (e.g.
-        # the POS screen's own scrollable body).
+        # CTkScrollableFrame only wires up mouse-wheel/trackpad scrolling for
+        # its own bare background, not for widgets packed inside it - a
+        # widely-reported CustomTkinter limitation. Nav buttons fill
+        # essentially the whole sidebar list with barely any bare background
+        # left to hover over, and the same shape shows up elsewhere too
+        # (the POS screen's body is mostly search results/buttons/cart).
+        # Binding the wheel globally (bind_all reaches every widget, buttons
+        # included, since "wheel" isn't a button-native event they
+        # intercept) and, in _on_global_mousewheel, walking up from whatever
+        # widget is actually under the cursor to find its nearest
+        # CTkScrollableFrame ancestor fixes scrolling everywhere in the app
+        # with this one binding, not just the nav list.
         self.bind_all("<MouseWheel>", self._on_global_mousewheel)
         self.bind_all("<Button-4>", self._on_global_mousewheel)  # Linux scroll up
         self.bind_all("<Button-5>", self._on_global_mousewheel)  # Linux scroll down
@@ -310,24 +309,34 @@ class SmartGrocerApp(ctk.CTk):
         dialog.configure(fg_color=theme.BG_LIGHT)
         dialog.grab_set()
 
-        staff_names = [r["name"] for r in staff_module.list_staff(self.conn, active_only=True)]
-        ctk.CTkLabel(dialog, text="Staff:").pack(anchor="w", padx=16, pady=(16, 0))
-        staff_var = tk.StringVar(value=staff_names[0] if staff_names else "")
-        ctk.CTkOptionMenu(dialog, values=staff_names, variable=staff_var, width=280).pack(padx=16)
+        # Fields go in a scrollable body, packed BEFORE the buttons below -
+        # this guarantees the buttons always get their needed space (Tk
+        # only ever gives a scrollable frame packed with expand=True the
+        # space left AFTER every other packed child's own requested size is
+        # satisfied), regardless of how much taller Windows display scaling
+        # (125%/150%/etc.) renders this content compared to the pixel guess
+        # above - a shorter window just means more of the form scrolls.
+        body = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
+        body.pack(fill="both", expand=True)
 
-        ctk.CTkLabel(dialog, text="PIN:").pack(anchor="w", padx=16, pady=(12, 0))
+        staff_names = [r["name"] for r in staff_module.list_staff(self.conn, active_only=True)]
+        ctk.CTkLabel(body, text="Staff:").pack(anchor="w", padx=16, pady=(16, 0))
+        staff_var = tk.StringVar(value=staff_names[0] if staff_names else "")
+        ctk.CTkOptionMenu(body, values=staff_names, variable=staff_var, width=280).pack(padx=16)
+
+        ctk.CTkLabel(body, text="PIN:").pack(anchor="w", padx=16, pady=(12, 0))
         pin_var = tk.StringVar()
-        ctk.CTkEntry(dialog, textvariable=pin_var, width=280, show="*").pack(padx=16)
+        ctk.CTkEntry(body, textvariable=pin_var, width=280, show="*").pack(padx=16)
 
         already_open = cash_drawer.get_open_session(self.conn) is not None
         float_var = tk.StringVar(value="0")
         if already_open:
-            ctk.CTkLabel(dialog, text="The day is already open - this just logs you in.",
+            ctk.CTkLabel(body, text="The day is already open - this just logs you in.",
                          text_color=theme.TEXT_MUTED, wraplength=280).pack(padx=16, pady=(14, 0))
         else:
-            ctk.CTkLabel(dialog, text="Opening cash float (starting the day):").pack(
+            ctk.CTkLabel(body, text="Opening cash float (starting the day):").pack(
                 anchor="w", padx=16, pady=(12, 0))
-            ctk.CTkEntry(dialog, textvariable=float_var, width=280).pack(padx=16)
+            ctk.CTkEntry(body, textvariable=float_var, width=280).pack(padx=16)
 
         def submit():
             row = self.conn.execute(
@@ -349,6 +358,13 @@ class SmartGrocerApp(ctk.CTk):
             self.refresh_current_frame()
             dialog.destroy()
 
+        # Pressing Enter from any field (staff dropdown, PIN, opening
+        # float) submits the same as clicking "Login" - a cashier typing
+        # their PIN and hitting Enter shouldn't have to reach for the
+        # mouse. Bound on the whole dialog, not just one entry, since
+        # focus could be on any of the fields above when Enter is pressed.
+        dialog.bind("<Return>", lambda e: submit())
+
         ctk.CTkButton(dialog, text="Login", command=submit, fg_color=theme.SUCCESS_GREEN,
                       hover_color=theme.SUCCESS_GREEN_HOVER).pack(pady=(20, 4))
         ctk.CTkButton(
@@ -368,24 +384,29 @@ class SmartGrocerApp(ctk.CTk):
         change, so a forgot-PIN reset can't quietly go unnoticed."""
         dialog = ctk.CTkToplevel(self)
         dialog.title("Forgot PIN")
-        screens.fit_dialog(dialog, 340, 260)
+        screens.fit_dialog(dialog, 340, 320)
         dialog.configure(fg_color=theme.BG_LIGHT)
         dialog.grab_set()
 
+        # See open_login_dialog's comment above on why fields live in a
+        # scrollable body while the button stays directly on `dialog`.
+        body = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
+        body.pack(fill="both", expand=True)
+
         ctk.CTkLabel(
-            dialog, text="We'll email a new PIN to the address saved for this account. If none is "
+            body, text="We'll email a new PIN to the address saved for this account. If none is "
                         "saved, ask an Admin/Owner to add one (Staff screen > Edit Contact Info), "
                         "then try again - nobody, Owner included, can set your PIN for you directly.",
             wraplength=300, justify="left", text_color=theme.TEXT_MUTED, font=ctk.CTkFont(size=11),
         ).pack(anchor="w", padx=16, pady=(16, 10))
 
         staff_names = [r["name"] for r in staff_module.list_staff(self.conn, active_only=True)]
-        ctk.CTkLabel(dialog, text="Staff:").pack(anchor="w", padx=16)
+        ctk.CTkLabel(body, text="Staff:").pack(anchor="w", padx=16)
         default_name = preselected_name if preselected_name in staff_names else (staff_names[0] if staff_names else "")
         staff_var = tk.StringVar(value=default_name)
-        ctk.CTkOptionMenu(dialog, values=staff_names, variable=staff_var, width=280).pack(padx=16, pady=(0, 12))
+        ctk.CTkOptionMenu(body, values=staff_names, variable=staff_var, width=280).pack(padx=16, pady=(0, 12))
 
-        status_label = ctk.CTkLabel(dialog, text="", font=ctk.CTkFont(size=11), text_color=theme.TEXT_MUTED, wraplength=300)
+        status_label = ctk.CTkLabel(body, text="", font=ctk.CTkFont(size=11), text_color=theme.TEXT_MUTED, wraplength=300)
         status_label.pack(anchor="w", padx=16)
 
         def send_reset():
@@ -432,6 +453,7 @@ class SmartGrocerApp(ctk.CTk):
             )
             status_label.configure(text=f"Sent via: {', '.join(sent)}. Check your inbox/phone - your PIN is updated.")
 
+        dialog.bind("<Return>", lambda e: send_reset())
         ctk.CTkButton(dialog, text="Send New PIN", command=send_reset, fg_color=theme.ACCENT_BLUE,
                       hover_color=theme.ACCENT_BLUE_HOVER).pack(pady=16)
 
@@ -452,24 +474,34 @@ class SmartGrocerApp(ctk.CTk):
 
         dialog = ctk.CTkToplevel(self)
         dialog.title("Change My PIN")
-        screens.fit_dialog(dialog, 320, 260)
+        screens.fit_dialog(dialog, 340, 360)
         dialog.configure(fg_color=theme.BG_LIGHT)
         dialog.grab_set()
 
-        ctk.CTkLabel(dialog, text=f"Changing PIN for {row['name']}", font=ctk.CTkFont(weight="bold")).pack(
+        # See open_login_dialog's comment above on why fields live in a
+        # scrollable body while the Save button stays directly on `dialog` -
+        # this is the fix for the Save button being cut off under Windows
+        # display scaling, which a fixed pixel height alone couldn't solve
+        # (that only guarded against the window being taller than the
+        # screen, not against the content itself rendering bigger than
+        # guessed).
+        body = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
+        body.pack(fill="both", expand=True)
+
+        ctk.CTkLabel(body, text=f"Changing PIN for {row['name']}", font=ctk.CTkFont(weight="bold")).pack(
             anchor="w", padx=16, pady=(16, 10))
 
-        ctk.CTkLabel(dialog, text="Current PIN:").pack(anchor="w", padx=16)
+        ctk.CTkLabel(body, text="Current PIN:").pack(anchor="w", padx=16)
         current_var = tk.StringVar()
-        ctk.CTkEntry(dialog, textvariable=current_var, width=280, show="*").pack(padx=16)
+        ctk.CTkEntry(body, textvariable=current_var, width=280, show="*").pack(padx=16)
 
-        ctk.CTkLabel(dialog, text="New PIN:").pack(anchor="w", padx=16, pady=(10, 0))
+        ctk.CTkLabel(body, text="New PIN:").pack(anchor="w", padx=16, pady=(10, 0))
         new_var = tk.StringVar()
-        ctk.CTkEntry(dialog, textvariable=new_var, width=280, show="*").pack(padx=16)
+        ctk.CTkEntry(body, textvariable=new_var, width=280, show="*").pack(padx=16)
 
-        ctk.CTkLabel(dialog, text="Confirm new PIN:").pack(anchor="w", padx=16, pady=(10, 0))
+        ctk.CTkLabel(body, text="Confirm new PIN:").pack(anchor="w", padx=16, pady=(10, 0))
         confirm_var = tk.StringVar()
-        ctk.CTkEntry(dialog, textvariable=confirm_var, width=280, show="*").pack(padx=16)
+        ctk.CTkEntry(body, textvariable=confirm_var, width=280, show="*").pack(padx=16)
 
         def save():
             if current_var.get().strip() != row["pin"]:
@@ -507,6 +539,7 @@ class SmartGrocerApp(ctk.CTk):
             dialog.destroy()
             messagebox.showinfo("PIN changed", "Your PIN has been updated.")
 
+        dialog.bind("<Return>", lambda e: save())
         ctk.CTkButton(dialog, text="Save", command=save, fg_color=theme.ACCENT_BLUE,
                       hover_color=theme.ACCENT_BLUE_HOVER).pack(pady=18)
 
@@ -553,29 +586,42 @@ class SmartGrocerApp(ctk.CTk):
                       hover_color=theme.DANGER_RED_HOVER).pack(pady=20)
 
     def _on_global_mousewheel(self, event) -> None:
-        """Scroll the sidebar's nav list when the mouse wheel turns over
-        it - see the long comment where this is bound for why a global
-        binding, checked against the pointer position, is needed instead
-        of relying on CTkScrollableFrame's own (button-blind) wheel
-        handling. Does nothing at all when the pointer isn't over the nav
-        list, so it can't steal scroll events meant for anything else."""
-        nav_scroll = getattr(self, "_nav_scroll", None)
-        if nav_scroll is None:
-            return
+        """Scroll whichever CTkScrollableFrame the mouse/trackpad is
+        currently over - anywhere in the app, not just the sidebar's nav
+        list this was originally written for.
+
+        CTkScrollableFrame only wires up wheel/trackpad scrolling for its
+        own bare background, not for any widget packed inside it - a
+        widely-reported CustomTkinter limitation. That's a real problem
+        anywhere a scrollable area is mostly filled with buttons, entries,
+        or a treeview and has little bare background left to hover over -
+        the sidebar's nav list (buttons wall-to-wall) and the POS screen's
+        body (search results, quick items, cart, action buttons) are both
+        exactly this shape, which is why scrolling "sometimes" didn't work
+        there.
+
+        Binding the wheel globally and walking up from whatever widget is
+        actually under the cursor to find its nearest CTkScrollableFrame
+        ancestor - then scrolling THAT one's inner canvas directly - fixes
+        every scrollable area in the app with one handler, instead of
+        needing a separate special case per screen/dialog. Does nothing at
+        all when the pointer isn't over any scrollable area, so it can't
+        steal a scroll event meant for something else (e.g. a plain,
+        already-fully-visible dialog)."""
+        if event.num == 4:
+            delta = -1
+        elif event.num == 5:
+            delta = 1
+        else:
+            delta = -1 if event.delta > 0 else 1
         widget = self.winfo_containing(event.x_root, event.y_root)
         while widget is not None:
-            if widget is nav_scroll:
-                canvas = getattr(nav_scroll, "_parent_canvas", None)
+            if isinstance(widget, ctk.CTkScrollableFrame):
+                canvas = getattr(widget, "_parent_canvas", None)
                 if canvas is not None:
-                    if event.num == 4:
-                        delta = -1
-                    elif event.num == 5:
-                        delta = 1
-                    else:
-                        delta = -1 if event.delta > 0 else 1
                     canvas.yview_scroll(delta, "units")
                 return
-            widget = widget.master
+            widget = getattr(widget, "master", None)
 
     def is_client_till(self) -> bool:
         """True when this till has no database of its own and is talking

@@ -187,17 +187,52 @@ internet access (couldn't `pip install` anything) and no display/`tkinter`
    run `python main.py` early and tell me about anything that looks wrong
    layout-wise - that's the one part of this codebase that hasn't been
    executed yet.
-   - One real bug this caused: every popup dialog had a fixed size chosen
-     to fit its content comfortably, with no regard for how tall the
-     actual screen is. On a laptop with a shorter screen (1366x768 is a
-     common Windows resolution) some of the taller dialogs opened with
-     their bottom - almost always where the Save button lives - rendered
-     past the bottom of the screen, needing the whole window maximized
-     just to reach it. Fixed with a shared `fit_dialog()` helper
-     (`smartgrocer/gui/screens.py`) that every dialog now goes through -
-     it caps a dialog's size to the actual screen and centers it, so the
-     button is always on-screen without needing to move or resize
-     anything.
+   - One real bug this caused, found across a few rounds of testing on a
+     real Windows machine: every popup dialog had a fixed pixel size
+     chosen to fit its content comfortably, with no regard for (a) how
+     tall the actual screen is - a common 1366x768 laptop screen, minus
+     the taskbar and title bar, is shorter than some of the taller
+     dialogs - or (b) Windows **display scaling** (125%/150%/175%, common
+     on real, especially high-DPI, laptop screens) - CustomTkinter renders
+     every label/entry/button that much bigger to match it, so a dialog
+     sized to fit its content at 100% scaling can genuinely no longer fit
+     the same pixel box once Windows is scaling everything up. Either way
+     the symptom was the same: the Save button, almost always the last
+     thing packed into the dialog, ended up rendered past the bottom of
+     the window - needing the whole thing maximized just to reach it.
+     Fixed two ways, together: a shared `fit_dialog()` helper
+     (`smartgrocer/gui/screens.py`) caps every dialog's size to the actual
+     screen and centers it (handles (a)); and every dialog's fields are
+     now packed into a `CTkScrollableFrame` body, with its Save/action
+     button(s) packed directly onto the dialog window itself, OUTSIDE that
+     scrollable area (handles (b), and (a) again as a backstop) - Tkinter's
+     layout rules always give a plain, non-scrolling widget its full
+     requested size first, and only let the scrollable body grow into
+     whatever space is left over, so the button can never lose its slot no
+     matter how much taller the fields above it render. A shorter window
+     just means more of the form scrolls to reach the fields; the button
+     itself is unaffected either way.
+   - Two smaller GUI bugs found the same way: (1) `CTkScrollableFrame`
+     only wires up mouse-wheel/trackpad scrolling for its own bare
+     background, not for widgets packed inside it - a widely-reported
+     CustomTkinter limitation. That made scrolling work only when the
+     cursor happened to be over empty space, which is most of the sidebar
+     nav list and the POS screen's body (both mostly buttons/entries with
+     little bare background). Fixed with one global mouse-wheel handler
+     (`SmartGrocerApp._on_global_mousewheel` in `smartgrocer/gui/app.py`)
+     that finds whichever `CTkScrollableFrame` the pointer is actually
+     over and scrolls that one directly - covers every scrollable area in
+     the app, not just the sidebar it was first written for. (2) Popup
+     dialogs (Login, Add Staff, etc.) only submitted when you clicked
+     their button - pressing Enter after typing did nothing. Fixed by
+     binding Enter, on the dialog itself, to the same action as its
+     primary button, for every simple single-purpose dialog in the app
+     (deliberately NOT done for Close Day, since accidentally confirming
+     a cash-drawer close with a stray Enter press is worse than typing
+     one extra click; and not for Add/Scan Item's barcode field, which
+     already uses Enter for something else - checking the scanned code -
+     so adding a second meaning would make one Enter press both check the
+     code and submit the whole form before there's anything to review).
 
 ## Packaging as a standalone Windows .exe
 

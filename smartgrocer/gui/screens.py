@@ -64,35 +64,31 @@ def styled_button(parent, text, command, kind="primary", **kwargs):
 
 
 def fit_dialog(dialog, width: int, height: int) -> None:
-    """Size a popup dialog, but never larger than the screen actually is,
-    and centered on it.
+    """Size a popup dialog to fit the screen, and center it.
 
-    Every dialog in this file used to just call dialog.geometry("WxH") with
-    a fixed size chosen to comfortably fit its content - fine on a big
-    monitor, but on a common laptop screen (1366x768 is typical) a dialog
-    taller than roughly 650px (after the Windows taskbar and title bar eat
-    into that 768) opens with its BOTTOM - almost always exactly where the
-    Save/Submit button lives - rendered off the bottom of the screen.
-    Tkinter doesn't reposition or shrink a Toplevel to keep it on-screen by
-    itself, so the only way to reach that button was to manually maximize
-    or drag the window up. Clamping the requested size to what's visible
-    (minus a margin for the taskbar/title bar) and centering it fixes that
-    for every dialog at once. Dialogs whose body is a CTkScrollableFrame
-    packed with expand=True (with the button packed after it, not inside
-    it) still show their button in full - a shorter window just means more
-    of the form scrolls, the button itself never gets less room.
+    Clamps the width/height guessed at each call site below to the actual
+    screen size (minus room for the taskbar/title bar) so a dialog can
+    never open taller or wider than the screen itself - the original bug
+    report here ("need to maximize to see the Save button").
 
-    Deliberately does NOT call update_idletasks() here: winfo_screenwidth/
-    winfo_screenheight read the physical screen, not this widget's own
-    drawn size, so no idle-task flush is needed to get them right - and
-    forcing one on a CTkToplevel this early (before its own content exists
-    yet, and before CustomTkinter's own delayed Windows setup, e.g. its
-    titlebar-color fix, has run) is exactly what caused a real regression:
-    on real Windows machines the dialog would render blank and then lose
-    focus back to the main window a moment later, looking like it "popped
-    up and went back to the screen". lift()/focus_force() below (plus a
-    delayed re-lift) is what actually keeps a freshly-opened dialog on top
-    and focused, without needing to touch idle tasks at all."""
+    This does NOT try to measure or compensate for Windows display scaling
+    (125%/150%/175%, common on real laptops) making CustomTkinter render
+    every label/entry/button bigger than the pixel guess below assumes -
+    an earlier version of this function tried to fix that by measuring the
+    dialog's rendered size after the fact and resizing again, which turned
+    out to be unreliable in practice. The real, reliable fix for that is
+    structural instead: every dialog's fields are packed into a
+    CTkScrollableFrame (`body`/`scroll` in each call site below) with
+    fill="both", expand=True, while its Save/action button(s) are packed
+    directly onto `dialog` afterwards, OUTSIDE that scrollable frame.
+    Tkinter's pack() always gives a plain (non-expanding) widget its full
+    requested size first and only lets an expand=True widget grow into
+    whatever's left over - so the button is always fully visible no matter
+    how tall Windows renders the fields above it; a shorter window (from
+    a small screen, high scaling, or both at once) just means more of the
+    form scrolls, never that the button loses its space. See
+    open_login_dialog in app.py for the first, most-commented example of
+    this pattern."""
     screen_w = dialog.winfo_screenwidth()
     screen_h = dialog.winfo_screenheight()
     max_w = max(300, screen_w - 80)
@@ -108,10 +104,10 @@ def fit_dialog(dialog, width: int, height: int) -> None:
     # CustomTkinter does some of its own window setup a few milliseconds
     # after a CTkToplevel is created (e.g. fixing the titlebar color on
     # Windows), which can steal focus/stacking back to the main window
-    # right after this dialog opens - re-lifting it once that's had time to
+    # right after this dialog opens - re-asserting once that's had time to
     # run keeps it on top and focused instead of appearing to vanish.
-    dialog.after(60, dialog.lift)
-    dialog.after(60, dialog.focus_force)
+    dialog.after(120, dialog.lift)
+    dialog.after(120, dialog.focus_force)
 
 
 def run_in_background(widget: ctk.CTkBaseClass, work_fn, on_done, on_error=None):
@@ -244,12 +240,18 @@ def prompt_split_payment(parent, total: float) -> list[tuple[str, float]] | None
     dialog.configure(fg_color=theme.BG_LIGHT)
     dialog.grab_set()
 
-    ctk.CTkLabel(dialog, text=f"Total to collect: LKR {total:,.2f}",
+    # Fields go in a scrollable body, packed BEFORE the button row below -
+    # guarantees the buttons their own space regardless of Windows display
+    # scaling; see open_login_dialog in app.py for the full reasoning.
+    body = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
+    body.pack(fill="both", expand=True)
+
+    ctk.CTkLabel(body, text=f"Total to collect: LKR {total:,.2f}",
                  font=ctk.CTkFont(size=14, weight="bold"), text_color=theme.NAVY_DARK).pack(pady=(16, 10))
 
     method_vars: dict[str, tk.StringVar] = {}
     for method in ["cash", "card", "cheque", "credit"]:
-        row = ctk.CTkFrame(dialog, fg_color="transparent")
+        row = ctk.CTkFrame(body, fg_color="transparent")
         row.pack(fill="x", padx=24, pady=4)
         ctk.CTkLabel(row, text=method.capitalize() + ":", width=70, anchor="w",
                      text_color=theme.TEXT_DARK).pack(side="left")
@@ -1023,7 +1025,9 @@ class InventoryScreen(BaseScreen):
             dialog.destroy()
             self.refresh()
 
-        styled_button(scroll, "Save", save, kind="primary", width=140).pack(pady=18)
+        # On `dialog`, not `scroll` - so Save is always visible without
+        # having to scroll all the way down through a long form to reach it.
+        styled_button(dialog, "Save", save, kind="primary", width=140).pack(pady=18)
 
     def toggle_product_active(self):
         if not self._is_owner():
@@ -1066,31 +1070,39 @@ class InventoryScreen(BaseScreen):
         dialog.title("Receive Stock (GRN)")
         fit_dialog(dialog, 420, 340)
         dialog.configure(fg_color=theme.BG_LIGHT)
+        dialog.grab_set()  # wasn't modal before - the Inventory screen behind it was still clickable
+
+        # Fields go in a scrollable body, packed BEFORE the Save button -
+        # guarantees the button its own space regardless of how much taller
+        # Windows display scaling renders this content than the pixel guess
+        # above; see open_login_dialog in app.py for the full reasoning.
+        body = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
+        body.pack(fill="both", expand=True)
 
         products = self.conn.execute("SELECT id, code, name_en FROM products WHERE active=1 ORDER BY name_en").fetchall()
         names = [f"{p['code']} - {p['name_en']}" for p in products]
 
-        ctk.CTkLabel(dialog, text="Product:").pack(anchor="w", padx=16, pady=(16, 0))
+        ctk.CTkLabel(body, text="Product:").pack(anchor="w", padx=16, pady=(16, 0))
         product_var = tk.StringVar(value=names[0] if names else "")
-        ctk.CTkOptionMenu(dialog, values=names, variable=product_var, width=360).pack(padx=16)
+        ctk.CTkOptionMenu(body, values=names, variable=product_var, width=360).pack(padx=16)
 
         suppliers_list = suppliers_module.list_suppliers(self.conn)
         supplier_names = ["(none)"] + [s["name"] for s in suppliers_list]
-        ctk.CTkLabel(dialog, text="Supplier:").pack(anchor="w", padx=16, pady=(12, 0))
+        ctk.CTkLabel(body, text="Supplier:").pack(anchor="w", padx=16, pady=(12, 0))
         supplier_var = tk.StringVar(value=supplier_names[0])
-        ctk.CTkOptionMenu(dialog, values=supplier_names, variable=supplier_var, width=360).pack(padx=16)
+        ctk.CTkOptionMenu(body, values=supplier_names, variable=supplier_var, width=360).pack(padx=16)
 
-        ctk.CTkLabel(dialog, text="Quantity received:").pack(anchor="w", padx=16, pady=(12, 0))
+        ctk.CTkLabel(body, text="Quantity received:").pack(anchor="w", padx=16, pady=(12, 0))
         qty_var = tk.StringVar(value="10")
-        ctk.CTkEntry(dialog, textvariable=qty_var).pack(fill="x", padx=16)
+        ctk.CTkEntry(body, textvariable=qty_var).pack(fill="x", padx=16)
 
-        ctk.CTkLabel(dialog, text="Cost price (per unit):").pack(anchor="w", padx=16, pady=(12, 0))
+        ctk.CTkLabel(body, text="Cost price (per unit):").pack(anchor="w", padx=16, pady=(12, 0))
         cost_var = tk.StringVar()
-        ctk.CTkEntry(dialog, textvariable=cost_var).pack(fill="x", padx=16)
+        ctk.CTkEntry(body, textvariable=cost_var).pack(fill="x", padx=16)
 
-        ctk.CTkLabel(dialog, text="Expiry date (YYYY-MM-DD, blank if none):").pack(anchor="w", padx=16, pady=(12, 0))
+        ctk.CTkLabel(body, text="Expiry date (YYYY-MM-DD, blank if none):").pack(anchor="w", padx=16, pady=(12, 0))
         expiry_var = tk.StringVar()
-        ctk.CTkEntry(dialog, textvariable=expiry_var).pack(fill="x", padx=16)
+        ctk.CTkEntry(body, textvariable=expiry_var).pack(fill="x", padx=16)
 
         def save():
             try:
@@ -1823,12 +1835,18 @@ class CustomersScreen(BaseScreen):
         dialog.configure(fg_color=theme.BG_LIGHT)
         dialog.grab_set()
 
+        # Fields go in a scrollable body, packed BEFORE the Save button -
+        # guarantees the button its own space regardless of Windows display
+        # scaling; see open_login_dialog in app.py for the full reasoning.
+        body = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
+        body.pack(fill="both", expand=True)
+
         fields = {}
         for label, key, default in [("Name:", "name", ""), ("Phone:", "phone", ""),
                                      ("Address:", "address", ""), ("Credit Limit:", "credit_limit", "0")]:
-            ctk.CTkLabel(dialog, text=label).pack(anchor="w", padx=16, pady=(12, 0))
+            ctk.CTkLabel(body, text=label).pack(anchor="w", padx=16, pady=(12, 0))
             v = tk.StringVar(value=default)
-            ctk.CTkEntry(dialog, textvariable=v, width=320).pack(padx=16)
+            ctk.CTkEntry(body, textvariable=v, width=320).pack(padx=16)
             fields[key] = v
 
         def save():
@@ -1865,16 +1883,21 @@ class CustomersScreen(BaseScreen):
         dialog.configure(fg_color=theme.BG_LIGHT)
         dialog.grab_set()
 
-        ctk.CTkLabel(dialog, text=f"{c['name']} owes LKR {c['credit_balance']:,.2f}",
+        # See open_add_dialog above (Add Customer) for why fields live in a
+        # scrollable body while the button stays directly on `dialog`.
+        body = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
+        body.pack(fill="both", expand=True)
+
+        ctk.CTkLabel(body, text=f"{c['name']} owes LKR {c['credit_balance']:,.2f}",
                      font=ctk.CTkFont(size=14, weight="bold"), text_color=theme.NAVY_DARK).pack(pady=(16, 10))
 
-        ctk.CTkLabel(dialog, text="Amount received:").pack(anchor="w", padx=20)
+        ctk.CTkLabel(body, text="Amount received:").pack(anchor="w", padx=20)
         amount_var = tk.StringVar(value=f"{c['credit_balance']:.2f}")
-        ctk.CTkEntry(dialog, textvariable=amount_var, width=300).pack(padx=20)
+        ctk.CTkEntry(body, textvariable=amount_var, width=300).pack(padx=20)
 
-        ctk.CTkLabel(dialog, text="Method:").pack(anchor="w", padx=20, pady=(10, 0))
+        ctk.CTkLabel(body, text="Method:").pack(anchor="w", padx=20, pady=(10, 0))
         method_var = tk.StringVar(value="cash")
-        ctk.CTkOptionMenu(dialog, values=["cash", "card", "cheque"], variable=method_var, width=300).pack(padx=20)
+        ctk.CTkOptionMenu(body, values=["cash", "card", "cheque"], variable=method_var, width=300).pack(padx=20)
 
         def save():
             try:
@@ -1951,11 +1974,17 @@ class SuppliersScreen(BaseScreen):
         dialog.configure(fg_color=theme.BG_LIGHT)
         dialog.grab_set()
 
+        # Fields go in a scrollable body, packed BEFORE the Save button -
+        # guarantees the button its own space regardless of Windows display
+        # scaling; see open_login_dialog in app.py for the full reasoning.
+        body = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
+        body.pack(fill="both", expand=True)
+
         fields = {}
         for label, key in [("Name:", "name"), ("Phone:", "phone"), ("Address:", "address")]:
-            ctk.CTkLabel(dialog, text=label).pack(anchor="w", padx=16, pady=(12, 0))
+            ctk.CTkLabel(body, text=label).pack(anchor="w", padx=16, pady=(12, 0))
             v = tk.StringVar(value="")
-            ctk.CTkEntry(dialog, textvariable=v, width=320).pack(padx=16)
+            ctk.CTkEntry(body, textvariable=v, width=320).pack(padx=16)
             fields[key] = v
 
         def save():
@@ -2110,28 +2139,34 @@ class StaffScreen(BaseScreen):
         dialog.configure(fg_color=theme.BG_LIGHT)
         dialog.grab_set()
 
-        ctk.CTkLabel(dialog, text="Name:").pack(anchor="w", padx=16, pady=(16, 0))
+        # Fields go in a scrollable body, packed BEFORE the Save button -
+        # guarantees the button its own space regardless of Windows display
+        # scaling; see open_login_dialog in app.py for the full reasoning.
+        body = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
+        body.pack(fill="both", expand=True)
+
+        ctk.CTkLabel(body, text="Name:").pack(anchor="w", padx=16, pady=(16, 0))
         name_var = tk.StringVar()
-        ctk.CTkEntry(dialog, textvariable=name_var, width=300).pack(padx=16)
+        ctk.CTkEntry(body, textvariable=name_var, width=300).pack(padx=16)
 
-        ctk.CTkLabel(dialog, text="Role:").pack(anchor="w", padx=16, pady=(12, 0))
+        ctk.CTkLabel(body, text="Role:").pack(anchor="w", padx=16, pady=(12, 0))
         role_var = tk.StringVar(value="cashier")
-        ctk.CTkOptionMenu(dialog, values=["cashier", "admin"], variable=role_var, width=300).pack(padx=16)
+        ctk.CTkOptionMenu(body, values=["cashier", "admin"], variable=role_var, width=300).pack(padx=16)
 
-        ctk.CTkLabel(dialog, text="PIN (numbers, used to log in at the till):").pack(
+        ctk.CTkLabel(body, text="PIN (numbers, used to log in at the till):").pack(
             anchor="w", padx=16, pady=(12, 0))
         pin_var = tk.StringVar()
-        ctk.CTkEntry(dialog, textvariable=pin_var, width=300).pack(padx=16)
+        ctk.CTkEntry(body, textvariable=pin_var, width=300).pack(padx=16)
 
-        ctk.CTkLabel(dialog, text="Email (optional - needed for them to use \"Forgot PIN?\" later):").pack(
+        ctk.CTkLabel(body, text="Email (optional - needed for them to use \"Forgot PIN?\" later):").pack(
             anchor="w", padx=16, pady=(12, 0))
         email_var = tk.StringVar()
-        ctk.CTkEntry(dialog, textvariable=email_var, width=300).pack(padx=16)
+        ctk.CTkEntry(body, textvariable=email_var, width=300).pack(padx=16)
 
-        ctk.CTkLabel(dialog, text="Phone (optional - for SMS/WhatsApp, needs Twilio set up):").pack(
+        ctk.CTkLabel(body, text="Phone (optional - for SMS/WhatsApp, needs Twilio set up):").pack(
             anchor="w", padx=16, pady=(12, 0))
         phone_var = tk.StringVar()
-        ctk.CTkEntry(dialog, textvariable=phone_var, width=300).pack(padx=16)
+        ctk.CTkEntry(body, textvariable=phone_var, width=300).pack(padx=16)
 
         def save():
             role = role_var.get()
@@ -2187,20 +2222,26 @@ class StaffScreen(BaseScreen):
 
         dialog = ctk.CTkToplevel(self)
         dialog.title(f"Edit Contact Info - {row['name']}")
-        fit_dialog(dialog, 360, 260)
+        fit_dialog(dialog, 360, 320)
         dialog.configure(fg_color=theme.BG_LIGHT)
         dialog.grab_set()
 
-        ctk.CTkLabel(dialog, text="Email:").pack(anchor="w", padx=16, pady=(16, 0))
-        email_var = tk.StringVar(value=row["email"] or "")
-        ctk.CTkEntry(dialog, textvariable=email_var, width=300).pack(padx=16)
+        # Fields go in a scrollable body, packed BEFORE the Save button -
+        # guarantees the button its own space regardless of Windows display
+        # scaling; see open_login_dialog in app.py for the full reasoning.
+        body = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
+        body.pack(fill="both", expand=True)
 
-        ctk.CTkLabel(dialog, text="Phone:").pack(anchor="w", padx=16, pady=(12, 0))
+        ctk.CTkLabel(body, text="Email:").pack(anchor="w", padx=16, pady=(16, 0))
+        email_var = tk.StringVar(value=row["email"] or "")
+        ctk.CTkEntry(body, textvariable=email_var, width=300).pack(padx=16)
+
+        ctk.CTkLabel(body, text="Phone:").pack(anchor="w", padx=16, pady=(12, 0))
         phone_var = tk.StringVar(value=row["phone"] or "")
-        ctk.CTkEntry(dialog, textvariable=phone_var, width=300).pack(padx=16)
+        ctk.CTkEntry(body, textvariable=phone_var, width=300).pack(padx=16)
 
         ctk.CTkLabel(
-            dialog, text="This doesn't change their PIN - only they can do that, themselves, from "
+            body, text="This doesn't change their PIN - only they can do that, themselves, from "
                         "\"Change My PIN\" or \"Forgot PIN?\".",
             font=ctk.CTkFont(size=10), text_color=theme.TEXT_MUTED, wraplength=320, justify="left",
         ).pack(anchor="w", padx=16, pady=(12, 0))
@@ -2425,22 +2466,28 @@ class NetworkScreen(BaseScreen):
         dialog.configure(fg_color=theme.BG_LIGHT)
         dialog.grab_set()
 
+        # Fields go in a scrollable body, packed BEFORE the Connect button -
+        # guarantees the button its own space regardless of Windows display
+        # scaling; see open_login_dialog in app.py for the full reasoning.
+        body = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
+        body.pack(fill="both", expand=True)
+
         ctk.CTkLabel(
-            dialog, text="Enter the address and pairing code shown on the Main Till's Network screen:",
+            body, text="Enter the address and pairing code shown on the Main Till's Network screen:",
             wraplength=340, justify="left",
         ).pack(anchor="w", padx=16, pady=(16, 10))
 
-        ctk.CTkLabel(dialog, text="Main Till address (e.g. 192.168.1.5):").pack(anchor="w", padx=16)
+        ctk.CTkLabel(body, text="Main Till address (e.g. 192.168.1.5):").pack(anchor="w", padx=16)
         host_var = tk.StringVar()
-        ctk.CTkEntry(dialog, textvariable=host_var).pack(fill="x", padx=16)
+        ctk.CTkEntry(body, textvariable=host_var).pack(fill="x", padx=16)
 
-        ctk.CTkLabel(dialog, text="Port (leave as shown on the Main Till):").pack(anchor="w", padx=16, pady=(10, 0))
+        ctk.CTkLabel(body, text="Port (leave as shown on the Main Till):").pack(anchor="w", padx=16, pady=(10, 0))
         port_var = tk.StringVar(value=str(netserver.DEFAULT_PORT))
-        ctk.CTkEntry(dialog, textvariable=port_var).pack(fill="x", padx=16)
+        ctk.CTkEntry(body, textvariable=port_var).pack(fill="x", padx=16)
 
-        ctk.CTkLabel(dialog, text="Pairing code:").pack(anchor="w", padx=16, pady=(10, 0))
+        ctk.CTkLabel(body, text="Pairing code:").pack(anchor="w", padx=16, pady=(10, 0))
         code_var = tk.StringVar()
-        ctk.CTkEntry(dialog, textvariable=code_var).pack(fill="x", padx=16)
+        ctk.CTkEntry(body, textvariable=code_var).pack(fill="x", padx=16)
 
         def connect():
             host = host_var.get().strip()
@@ -2623,11 +2670,14 @@ class ActivityLogScreen(BaseScreen):
         from_wa_var = field("Twilio WhatsApp sender (e.g. whatsapp:+14155238886):", "twilio_from_whatsapp")
         owner_phone_var = field("Owner's phone (receives SMS/WhatsApp, e.g. +94771234567):", "owner_phone")
 
+        # On `dialog`, not `scroll` - same as btn_row below - so both the
+        # buttons and the result text are always visible without having to
+        # scroll all the way down through this (fairly long) settings form.
         status_label = ctk.CTkLabel(
-            scroll, text="", font=ctk.CTkFont(size=11), text_color=theme.TEXT_MUTED,
+            dialog, text="", font=ctk.CTkFont(size=11), text_color=theme.TEXT_MUTED,
             wraplength=400, justify="left",
         )
-        status_label.pack(anchor="w", padx=12, pady=(10, 0))
+        status_label.pack(anchor="w", padx=12, pady=(6, 0))
 
         def collect() -> dict:
             return {
@@ -2673,7 +2723,7 @@ class ActivityLogScreen(BaseScreen):
                     "Nothing is filled in above yet."
                 status_label.configure(text=f"Saved, but nothing sent - {reason}", text_color=theme.TEXT_MUTED)
 
-        btn_row = ctk.CTkFrame(scroll, fg_color="transparent")
-        btn_row.pack(fill="x", padx=12, pady=16)
+        btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        btn_row.pack(fill="x", padx=12, pady=(4, 12))
         styled_button(btn_row, "Save", save, kind="primary").pack(side="left")
         styled_button(btn_row, "Save & Send Test", send_test, kind="secondary").pack(side="left", padx=8)
