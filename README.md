@@ -241,15 +241,21 @@ internet access (couldn't `pip install` anything) and no display/`tkinter`
      overflow with genuinely no way to reach whatever got cut off (not
      even a scrollbar to try). Fixed the same way as POS/every dialog
      above: their content now packs into a `CTkScrollableFrame`.
-   - And a fix to the mousewheel/trackpad fix above: it turns out every
-     CTkScrollableFrame quietly does its own version of the same trick
-     internally (bind_all when the mouse enters its bare background,
-     unbind_all when it leaves) - and bind_all is one shared app-wide slot,
-     not additive, so crossing any scrollable area's bare background
-     anywhere in the app could silently steal or wipe out our own global
-     binding, breaking wheel/trackpad scrolling everywhere until something
-     rebound it. Fixed by re-claiming the binding on a repeating timer
-     (every 200ms) instead of once at startup, so it can never stay lost.
+   - The mousewheel/trackpad fix above (a single global bind_all) turned
+     out to not be reliable enough by itself - bind_all is one shared,
+     app-wide slot per event, not additive, so anything else that touches
+     it (CustomTkinter's own internals included) can silently replace or
+     wipe it out, leaving scrolling dead until something rebinds it. The
+     fix that can't be stolen out from under us: walk the entire live
+     widget tree - every screen and every open dialog - on a repeating
+     timer, and bind the scroll handler DIRECTLY to every individual
+     widget inside each `CTkScrollableFrame`, instead of relying only on
+     the shared global slot. A plain widget's own binding is a completely
+     separate thing from that shared slot, so nothing else in the app can
+     touch or clobber it - and re-walking on a timer picks up newly
+     created widgets (a rebuilt list of quick-item buttons, a freshly
+     opened dialog) automatically. The original global binding is kept
+     too, as a harmless extra safety net.
 
 ## Packaging as a standalone Windows .exe
 
