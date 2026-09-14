@@ -40,7 +40,6 @@ NAV_ITEMS = [
     ("📦  Inventory", "inventory", screens.InventoryScreen),
     ("👥  Customers", "customers", screens.CustomersScreen),
     ("🚚  Suppliers", "suppliers", screens.SuppliersScreen),
-    ("🏷️  Offers", "offers", screens.OffersScreen),
     ("⏰  Promotions & Expiry", "promotions", screens.PromotionsScreen),
     ("📈  Forecasting", "forecasting", screens.ForecastingScreen),
     ("🔗  Bundle Recommendations", "bundles", screens.BundlesScreen),
@@ -50,31 +49,6 @@ NAV_ITEMS = [
     ("🌐  Network", "network", screens.NetworkScreen),
     ("🛡️  Activity Log", "audit", screens.ActivityLogScreen),
 ]
-
-
-def _find_scroll_canvas(container) -> tk.Canvas | None:
-    """CTkScrollableFrame does its actual scrolling through a plain
-    tkinter Canvas it creates for itself internally - there's no public,
-    guaranteed-stable way to reach it, and the private attribute name
-    CustomTkinter uses for it has differed across releases (this app was
-    written against `_parent_canvas`, seen in most versions). Used by the
-    sidebar's ▲/▼ click-to-scroll arrow buttons, a guaranteed fallback
-    that doesn't depend on wheel/trackpad events at all - CustomTkinter's
-    own CTkScrollableFrame handles the actual wheel/trackpad scrolling
-    itself now (see the note in `__init__` above where this app's own,
-    since-removed attempt at that used to live). Tries every name this
-    has been known to go by, then falls back to just looking for a
-    Canvas among the container's own direct children, so this can't
-    quietly stop working just because a different CustomTkinter version
-    than expected ends up installed."""
-    for attr in ("_parent_canvas", "_canvas", "canvas"):
-        canvas = getattr(container, attr, None)
-        if isinstance(canvas, tk.Canvas):
-            return canvas
-    for child in container.winfo_children():
-        if isinstance(child, tk.Canvas):
-            return child
-    return None
 
 
 class SmartGrocerApp(ctk.CTk):
@@ -218,7 +192,7 @@ class SmartGrocerApp(ctk.CTk):
         # first and nav_scroll's fill="both", expand=True only fills
         # whatever's left between them.
         def _scroll_nav(units: int):
-            canvas = _find_scroll_canvas(nav_scroll)
+            canvas = getattr(nav_scroll, "_parent_canvas", None)
             if canvas is not None:
                 canvas.yview_scroll(units, "units")
 
@@ -251,38 +225,28 @@ class SmartGrocerApp(ctk.CTk):
             btn.pack(fill="x", padx=14, pady=3)
             self.nav_buttons[key] = btn
 
-        # NOTE ON MOUSE-WHEEL SCROLLING: no custom wiring here on purpose.
-        # CustomTkinter's own CTkScrollableFrame (nav_scroll above, the POS
-        # screen's body, every dialog's body) already registers its own
-        # app-wide `bind_all("<MouseWheel>", ..., add=True)` in its own
-        # __init__, and its handler walks up from whatever widget the event
-        # landed on (stopping at a CTkScrollbar/CTkSlider/CTkTextbox, which
-        # scroll themselves) to work out whether IT should react - which
-        # already covers scrolling over a button or any other child widget
-        # packed inside it, not just bare background. That's confirmed
-        # straight from CustomTkinter's own source (`ctk_scrollable_frame.py`,
-        # `_mouse_wheel_all`/`_check_if_valid_scroll`), not assumed.
+        # CTkScrollableFrame only wires up mouse-wheel/trackpad scrolling for
+        # its own bare background, not for widgets packed inside it - a
+        # widely-reported CustomTkinter limitation. Nav buttons fill
+        # essentially the whole sidebar list with barely any bare background
+        # left to hover over, and the same shape shows up elsewhere too
+        # (the POS screen's body is mostly search results/buttons/cart).
+        # Binding the wheel globally (bind_all reaches every widget, buttons
+        # included, since "wheel" isn't a button-native event they
+        # intercept) and, in _on_global_mousewheel, walking up from whatever
+        # widget is actually under the cursor to find its nearest
+        # CTkScrollableFrame ancestor fixes scrolling everywhere in the app
+        # with this one binding, not just the nav list. Re-applying it on a
+        # repeating timer (instead of once at startup) guards against
+        # anything else in the app touching the same shared global slot and
+        # silently overwriting it.
         #
-        # An earlier version of this app didn't know that, believed
-        # CTkScrollableFrame COULDN'T scroll over its own child widgets, and
-        # "fixed" that with its own app-wide mousewheel handler re-applied on
-        # a repeating timer - every 500ms, calling `self.bind_all("<MouseWheel>", ...)`
-        # with no `add=True`. Tkinter's `bind_all` without `add` REPLACES
-        # the entire list of scripts registered for that event on the "all"
-        # bindtag - which silently wiped out every CTkScrollableFrame's own
-        # already-correct registration each time it fired, over and over,
-        # for as long as the app ran. The replacement handler it installed
-        # (see `_find_scroll_canvas`, still used below for the sidebar's
-        # click-to-scroll arrows) wasn't itself broken - the real bug was
-        # that it kept destroying CustomTkinter's own native scrolling
-        # faster than anything could rely on it. Removing it entirely,
-        # rather than trying to patch it to coexist (e.g. with `add=True`),
-        # is the correct fix, not just the simplest one: CustomTkinter's
-        # own mechanism already does the exact ancestor-walk this app was
-        # reimplementing, more precisely (it also knows to leave a
-        # CTkScrollbar/CTkSlider/CTkTextbox to scroll itself), and letting
-        # it run unimpeded is strictly better than running a second,
-        # cruder copy of the same idea alongside it.
+        # (A more aggressive fix was tried here - directly binding every
+        # individual widget inside every scrollable area, everywhere in the
+        # app, re-walked on a timer - but it caused a worse, visible bug
+        # (the whole window stuttering/flashing) and was reverted. This
+        # simpler version is the known-stable one.)
+        self._reassert_scroll_binding()
 
         self.container = ctk.CTkFrame(self, corner_radius=0, fg_color=theme.BG_LIGHT)
         self.container.grid(row=0, column=1, sticky="nsew")
@@ -304,6 +268,12 @@ class SmartGrocerApp(ctk.CTk):
             # Till already configured to connect here doesn't need to be
             # re-paired after every restart of the Main Till.
             self.start_sharing(pairing_code=self.till_config.get("pairing_code"))
+
+    def _reassert_scroll_binding(self) -> None:
+        self.bind_all("<MouseWheel>", self._on_global_mousewheel)
+        self.bind_all("<Button-4>", self._on_global_mousewheel)  # Linux scroll up
+        self.bind_all("<Button-5>", self._on_global_mousewheel)  # Linux scroll down
+        self.after(500, self._reassert_scroll_binding)
 
     def show_frame(self, key: str):
         self.current_frame_key = key
@@ -365,8 +335,7 @@ class SmartGrocerApp(ctk.CTk):
         staff_names = [r["name"] for r in staff_module.list_staff(self.conn, active_only=True)]
         ctk.CTkLabel(body, text="Staff:").pack(anchor="w", padx=16, pady=(16, 0))
         staff_var = tk.StringVar(value=staff_names[0] if staff_names else "")
-        screens.SearchableDropdown(body, values=staff_names, variable=staff_var, width=280, label="Staff").pack(
-            padx=16)
+        ctk.CTkOptionMenu(body, values=staff_names, variable=staff_var, width=280).pack(padx=16)
 
         ctk.CTkLabel(body, text="PIN:").pack(anchor="w", padx=16, pady=(12, 0))
         pin_var = tk.StringVar()
@@ -448,9 +417,7 @@ class SmartGrocerApp(ctk.CTk):
         ctk.CTkLabel(body, text="Staff:").pack(anchor="w", padx=16)
         default_name = preselected_name if preselected_name in staff_names else (staff_names[0] if staff_names else "")
         staff_var = tk.StringVar(value=default_name)
-        screens.SearchableDropdown(
-            body, values=staff_names, variable=staff_var, width=280, label="Staff",
-        ).pack(padx=16, pady=(0, 12))
+        ctk.CTkOptionMenu(body, values=staff_names, variable=staff_var, width=280).pack(padx=16, pady=(0, 12))
 
         status_label = ctk.CTkLabel(body, text="", font=ctk.CTkFont(size=11), text_color=theme.TEXT_MUTED, wraplength=300)
         status_label.pack(anchor="w", padx=16)
@@ -630,6 +597,44 @@ class SmartGrocerApp(ctk.CTk):
 
         ctk.CTkButton(dialog, text="Close Day", command=submit, fg_color=theme.DANGER_RED,
                       hover_color=theme.DANGER_RED_HOVER).pack(pady=20)
+
+    def _on_global_mousewheel(self, event) -> None:
+        """Scroll whichever CTkScrollableFrame the mouse/trackpad is
+        currently over - anywhere in the app, not just the sidebar's nav
+        list this was originally written for.
+
+        CTkScrollableFrame only wires up wheel/trackpad scrolling for its
+        own bare background, not for any widget packed inside it - a
+        widely-reported CustomTkinter limitation. That's a real problem
+        anywhere a scrollable area is mostly filled with buttons, entries,
+        or a treeview and has little bare background left to hover over -
+        the sidebar's nav list (buttons wall-to-wall) and the POS screen's
+        body (search results, quick items, cart, action buttons) are both
+        exactly this shape, which is why scrolling "sometimes" didn't work
+        there.
+
+        Binding the wheel globally and walking up from whatever widget is
+        actually under the cursor to find its nearest CTkScrollableFrame
+        ancestor - then scrolling THAT one's inner canvas directly - fixes
+        every scrollable area in the app with one handler, instead of
+        needing a separate special case per screen/dialog. Does nothing at
+        all when the pointer isn't over any scrollable area, so it can't
+        steal a scroll event meant for something else (e.g. a plain,
+        already-fully-visible dialog)."""
+        if event.num == 4:
+            delta = -1
+        elif event.num == 5:
+            delta = 1
+        else:
+            delta = -1 if event.delta > 0 else 1
+        widget = self.winfo_containing(event.x_root, event.y_root)
+        while widget is not None:
+            if isinstance(widget, ctk.CTkScrollableFrame):
+                canvas = getattr(widget, "_parent_canvas", None)
+                if canvas is not None:
+                    canvas.yview_scroll(delta, "units")
+                return
+            widget = getattr(widget, "master", None)
 
     def is_client_till(self) -> bool:
         """True when this till has no database of its own and is talking

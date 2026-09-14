@@ -194,6 +194,8 @@ class MobileScanServer:
         self._qr_detector = cv2.QRCodeDetector()
         self._last_code: Optional[str] = None
         self._last_code_at: float = 0.0
+        self._pending_code: Optional[str] = None
+        self._pending_count: int = 0
         self._lock = threading.Lock()
 
     @property
@@ -291,10 +293,43 @@ class MobileScanServer:
         if not decoded:
             return {"ok": True, "found": False}
 
+        # Only the continuous live-camera loop (sgCaptureLiveFrame, posting
+        # every ~400ms) sets "live": true. A one-shot capture - the photo
+        # fallback for phones/browsers without live camera access, a test,
+        # or any other caller that only ever sends ONE frame for a given
+        # scan - has no second frame to confirm against, so it must be
+        # accepted on the first (and only) decode, exactly as before.
+        is_live = bool(payload.get("live"))
+
         with self._lock:
             now = time.time()
             if decoded == self._last_code and (now - self._last_code_at) < _DUPLICATE_WINDOW_SECONDS:
                 return {"ok": True, "found": True, "code": decoded, "duplicate": True}
+
+            if is_live:
+                # Require the SAME decoded text on two frames in a row
+                # before accepting it, rather than acting on the very first
+                # decode. A barcode read is very reliable across two
+                # consecutive reads, but any ONE frame (motion blur, glare,
+                # the barcode half out of frame) can occasionally decode to
+                # a different, wrong string for the same physical barcode -
+                # without this, that looked like scanning one item and
+                # having two different products land in the cart. Frames
+                # arrive ~2/second, so this costs at most a fraction of a
+                # second before a genuinely new item is accepted, and
+                # resets immediately if a different code shows up (so it
+                # never gets "stuck" waiting to confirm a misread that
+                # never repeats).
+                if decoded != self._pending_code:
+                    self._pending_code = decoded
+                    self._pending_count = 1
+                    return {"ok": True, "found": False}
+                self._pending_count += 1
+                if self._pending_count < 2:
+                    return {"ok": True, "found": False}
+                self._pending_code = None
+                self._pending_count = 0
+
             self._last_code = decoded
             self._last_code_at = now
 
@@ -451,7 +486,7 @@ function sgCaptureLiveFrame() {
   fetch('/scan', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ code: pairingCode, image: dataUrl })
+    body: JSON.stringify({ code: pairingCode, image: dataUrl, live: true })
   })
     .then(function (r) { return r.json(); })
     .then(function (r) { busy = false; sgHandleResult(r); })

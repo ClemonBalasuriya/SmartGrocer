@@ -104,6 +104,21 @@ def best_sellers(conn: sqlite3.Connection, days: int = 30, top_n: int = 15) -> l
     ).fetchall()
 
 
+def customer_top_items(conn: sqlite3.Connection, customer_id: int, top_n: int = 12) -> list[sqlite3.Row]:
+    """A loyalty customer's own most-bought products, all-time (by
+    quantity, not revenue - "what do they usually buy", not "what did
+    they spend the most on"). Used by the POS screen's Quick Items panel
+    once that customer is identified at checkout, in place of the
+    shop-wide best_sellers list above."""
+    return conn.execute(
+        """SELECT p.id AS product_id, p.name_en, p.category, SUM(ii.qty) qty, SUM(ii.line_total) revenue
+           FROM invoice_items ii JOIN invoices i ON i.id=ii.invoice_id JOIN products p ON p.id=ii.product_id
+           WHERE i.voided=0 AND i.customer_id=?
+           GROUP BY p.id ORDER BY qty DESC LIMIT ?""",
+        (customer_id, top_n),
+    ).fetchall()
+
+
 def stock_summary(conn: sqlite3.Connection) -> list[dict]:
     rows = conn.execute(
         """SELECT p.id, p.code, p.name_en, p.category, p.reorder_level,

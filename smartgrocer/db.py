@@ -144,12 +144,32 @@ CREATE TABLE IF NOT EXISTS layout_assignments (
 CREATE TABLE IF NOT EXISTS customers (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     name            TEXT NOT NULL,
-    phone           TEXT,
+    phone           TEXT,                      -- also this customer's loyalty ID - see customers.py;
+                                                -- kept unique among real (non-"Walk-in") customers
+                                                -- when set, enforced in customers.add_customer
     address         TEXT,
     credit_limit    REAL NOT NULL DEFAULT 0,   -- 0 = no credit sales allowed
     credit_balance  REAL NOT NULL DEFAULT 0,   -- currently owed by this customer
     active          INTEGER NOT NULL DEFAULT 1
 );
+
+-- Manual, staff-created promotional offers ("some items only for loyalty
+-- members, some for everyone") - separate from promotions.py, which only
+-- ever *suggests* expiry/waste discounts and never applies anything to a
+-- sale on its own. See offers.py.
+CREATE TABLE IF NOT EXISTS offers (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    name          TEXT NOT NULL,
+    product_id    INTEGER REFERENCES products(id),  -- one of product_id/category is set, not both
+    category      TEXT,
+    discount_pct  REAL NOT NULL,               -- 0-100
+    scope         TEXT NOT NULL DEFAULT 'all',  -- 'all' | 'loyalty'
+    start_date    TEXT,                         -- ISO date, NULL = no start bound
+    end_date      TEXT,                         -- ISO date, NULL = no end bound
+    active        INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_offers_product ON offers(product_id);
+CREATE INDEX IF NOT EXISTS idx_offers_category ON offers(category);
 
 CREATE TABLE IF NOT EXISTS suppliers (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -29,6 +29,7 @@ from datetime import date, datetime, timedelta
 
 import numpy as np
 
+from . import customers as customers_module
 from . import db
 from .calendar_sl import festival_multiplier
 from .catalog import AFFINITY_GROUPS, CATALOG, COLUMNS
@@ -309,12 +310,12 @@ def _seed_demo_customers_and_suppliers(conn: sqlite3.Connection, rng: random.Ran
     """Attach a handful of realistic customer/supplier records to the
     synthetic history, so the Customers/Suppliers screens and the credit
     settlement report have something meaningful to show out of the box."""
-    customer_ids = []
-    for name, phone, limit in DEMO_CUSTOMERS:
-        cur = conn.execute(
-            "INSERT INTO customers (name, phone, credit_limit) VALUES (?,?,?)", (name, phone, limit)
-        )
-        customer_ids.append(cur.lastrowid)
+    # Goes through customers.add_customer (not a raw INSERT) so these demo
+    # customers get the same phone-uniqueness check as any real customer
+    # registered through the Customers screen - their phone number IS
+    # their loyalty ID (see customers.py).
+    customer_ids = [customers_module.add_customer(conn, name, phone=phone, credit_limit=limit)
+                    for name, phone, limit in DEMO_CUSTOMERS]
 
     supplier_ids = []
     for name, phone, address in DEMO_SUPPLIERS:

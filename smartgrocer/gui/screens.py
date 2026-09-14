@@ -12,7 +12,7 @@ from tkinter import messagebox, ttk
 
 import customtkinter as ctk
 
-from .. import association, forecasting, layout, pos, promotions, reports
+from .. import association, forecasting, layout, offers as offers_module, pos, promotions, reports
 from .. import cash_drawer as cash_drawer_module
 from .. import customers as customers_module
 from .. import receipts as receipts_module
@@ -110,6 +110,308 @@ def fit_dialog(dialog, width: int, height: int) -> None:
     dialog.after(120, dialog.focus_force)
 
 
+class SearchableDropdown(ctk.CTkButton):
+    """Drop-in replacement for `ctk.CTkOptionMenu(values=[...], variable=a_var,
+    width=...)` for any list that can grow past a screenful - a category
+    list, the customer list, a product/supplier picker, the staff list.
+    CTkOptionMenu's own dropdown has no scrollbar: past a certain length it
+    just becomes a stack of buttons taller than the screen, with no way to
+    reach whatever doesn't fit. This opens a small popup instead with its
+    own scrollable list AND a search box that filters it as you type -
+    which also makes picking one item out of a long list faster than
+    scanning it by eye.
+
+    Supports enough of CTkOptionMenu's interface to swap in directly at
+    any of this app's call sites: construct with the same `values`/
+    `variable`/`width` arguments, `.pack()`/`.grid()` it the same way, and
+    `.configure(values=new_list)` still works afterwards (e.g. when
+    on_show() repopulates it from the database)."""
+
+    _ARROW = "  ▾"
+
+    def __init__(self, parent, values: list[str], variable: tk.StringVar,
+                 width: int = 200, placeholder: str = "(none)", label: str | None = None, **kwargs):
+        self._values: list[str] = list(values)
+        self._variable = variable
+        self._placeholder = placeholder
+        # What this list IS (e.g. "Category", "Staff") - shown as a bold
+        # header inside the popup, so it doesn't open as a nameless box.
+        self._label = label or placeholder
+        self._popup: ctk.CTkFrame | None = None
+        self._global_click_bound = False
+        super().__init__(
+            parent, text=self._display_text(), width=width, anchor="w",
+            fg_color=theme.CARD_BG, hover_color=theme.CARD_BG_ALT, text_color=theme.NAVY_DARK,
+            border_width=1, border_color=theme.BORDER, corner_radius=8,
+            command=self._toggle_popup, **kwargs,
+        )
+        self._variable.trace_add("write", lambda *_a: self._sync_label())
+
+    def _display_text(self) -> str:
+        return (self._variable.get() or self._placeholder) + self._ARROW
+
+    def _sync_label(self) -> None:
+        # Guard against firing after the underlying Tk widget is gone (the
+        # variable can outlive it briefly during dialog teardown).
+        if self.winfo_exists():
+            super().configure(text=self._display_text())
+
+    def configure(self, **kwargs):
+        if "values" in kwargs:
+            self._values = list(kwargs.pop("values"))
+            if self._popup is not None and self._popup.winfo_exists():
+                self._populate_list(self._filter_var.get())
+        return super().configure(**kwargs)
+
+    def _toggle_popup(self) -> None:
+        if self._popup is not None and self._popup.winfo_exists():
+            self._close_popup()
+        else:
+            self._open_popup()
+
+    def _open_popup(self) -> None:
+        # A real CTkToplevel, positioned under the button - a plain child
+        # widget placed on top of the main window (an earlier version of
+        # this) turned out to render behind/under the rest of the screen
+        # in practice, so back to its own small window, which is guaranteed
+        # to draw on top of everything regardless of the app's own widget
+        # stacking. What actually needed fixing (see the click-outside
+        # handling further down) was WHEN it closes, not WHAT it is: a
+        # plain "close this on focus-out" used before could destroy the
+        # popup as a side effect of the very click that was selecting an
+        # item in it, before that item's own click had a chance to
+        # register - which is what made clicking a list item look like it
+        # silently did nothing.
+        popup = ctk.CTkToplevel(self)
+        popup.withdraw()
+        # No OS title-bar text - the bold header packed into the popup
+        # below (self._label) is the one and only name shown for this
+        # list. An earlier version also set this to self._label, which on
+        # Windows drew the same word a second time in the title bar right
+        # above that header - two labels for the same thing on screen.
+        popup.title("")
+        # NOT overrideredirect(True) (an earlier version of this used it,
+        # for a cleaner borderless "dropdown" look) - on Windows, a
+        # window shown that way is never handed proper window-manager
+        # focus/activation, which turned out to be why mouse-wheel
+        # scrolling never reached anything inside it no matter which
+        # widget or binding was tried (clicks still worked, because
+        # Windows routes those by cursor position regardless; wheel
+        # input is routed by which window actually has focus, and this
+        # kind of window can never really get it). "-toolwindow" is the
+        # closest fully-window-manager-owned equivalent: a slim title
+        # bar and no taskbar entry, still not overrideredirect - Windows
+        # only, so it's wrapped in case this ever runs elsewhere.
+        try:
+            popup.wm_attributes("-toolwindow", True)
+        except tk.TclError:
+            pass
+        popup.attributes("-topmost", True)
+        # Same background the app's other popup dialogs (Login, Receive
+        # Stock, ...) use directly on the dialog window itself, rather
+        # than a separate white bordered "card" floating on some other
+        # background - so this reads as one more dialog in the same
+        # family as those, not a visually different kind of popup.
+        popup.configure(fg_color=theme.BG_LIGHT)
+        self._popup = popup
+        # Windows' own native title-bar close button doesn't run any of
+        # this app's code by default - Tk just destroys the window
+        # directly, bypassing _close_popup() entirely. That left a stale
+        # reference in self._popup (harmless - _toggle_popup and
+        # _on_global_click both check winfo_exists(), which correctly
+        # reports a destroyed widget as gone) but ALSO left the app-wide
+        # "<Button-1>" click-outside binding (below) permanently attached
+        # with self._global_click_bound stuck True, since the cleanup
+        # that unbinds it only lives in _close_popup(). Routing the
+        # window's close button through the same _close_popup() this
+        # app's own controls already use - instead of Tk's default
+        # handling - makes every way of closing this popup go through
+        # exactly one path, so nothing gets left stuck behind.
+        popup.protocol("WM_DELETE_WINDOW", self._close_popup)
+
+        x = self.winfo_rootx()
+        y = self.winfo_rooty() + self.winfo_height()
+        popup_w = max(self.winfo_width(), 240)
+        popup_h = 280
+        screen_h = self.winfo_screenheight()
+        if y + popup_h > screen_h - 40:  # flip above the button rather than run off the bottom
+            y = max(0, self.winfo_rooty() - popup_h)
+        popup.geometry(f"{popup_w}x{popup_h}+{x}+{y}")
+
+        # The title bar (above) has no text - this bold header naming the
+        # list is the one and only name shown, the same way every other
+        # dialog in this app opens with a name for what it is. Closing the
+        # popup itself is left to Windows' own native title-bar close
+        # button (above) plus clicking away/Escape (below) - an earlier
+        # version also drew a second, plain "x" as ordinary app content
+        # right here, which just meant two close buttons doing the same
+        # thing side by side; removing Windows' native one instead was
+        # tried and reverted (see README), since reaching past Tk into the
+        # raw Win32 API for that risked corrupting how the popup itself
+        # rendered - so this one was the one to drop instead.
+        ctk.CTkLabel(popup, text=self._label, font=ctk.CTkFont(size=13, weight="bold"),
+                     text_color=theme.NAVY_DARK).pack(anchor="w", padx=10, pady=(10, 0))
+
+        self._filter_var = tk.StringVar()
+        search_entry = ctk.CTkEntry(popup, textvariable=self._filter_var, placeholder_text="Type to filter...")
+        search_entry.pack(fill="x", padx=10, pady=(4, 6))
+        self._filter_var.trace_add("write", lambda *_a: self._populate_list(self._filter_var.get()))
+        search_entry.bind("<Escape>", lambda e: self._close_popup())
+        search_entry.bind("<Return>", lambda e: self._select_first_match())
+
+        # A plain ttk.Treeview instead of a CTkScrollableFrame full of
+        # buttons - CustomTkinter's scrollable frame reimplements
+        # scrolling on its own canvas, which (as documented elsewhere in
+        # this file/README) only ever reliably wires up wheel/trackpad
+        # scrolling for its own bare background, and reaching it from
+        # outside a popup window like this one turned out not to work
+        # either. A ttk.Treeview is a native, standard Tk widget with
+        # mousewheel scrolling built in by Tk itself - no custom event
+        # wiring needed at all, which is exactly what every OTHER
+        # scrollable list in this app (make_treeview) already relies on.
+        list_holder = ctk.CTkFrame(popup, fg_color="transparent")
+        list_holder.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        list_holder.grid_rowconfigure(0, weight=1)
+        list_holder.grid_columnconfigure(0, weight=1)
+
+        tree = ttk.Treeview(list_holder, columns=["value"], show="", height=8, selectmode="none")
+        tree.column("value", anchor="w")
+        vsb = ttk.Scrollbar(list_holder, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        tree.tag_configure("current", background=theme.CARD_BG_ALT)
+        theme.configure_stripes(tree)
+        self._list_frame = tree
+
+        # Tk's own default mouse-wheel binding for a Treeview moves it
+        # only ONE row per wheel notch, which feels much slower than
+        # normal scrolling elsewhere in Windows (most apps move 3+ lines
+        # per notch, matching the Windows mouse setting for it). Bound
+        # directly on `tree` (fires before Tk's own slower default, which
+        # is attached to the widget CLASS rather than this specific
+        # widget) and returning "break" stops that default from ALSO
+        # firing right after and scrolling a second time.
+        def _fast_scroll(event):
+            if getattr(event, "num", None) == 4:
+                units = -3
+            elif getattr(event, "num", None) == 5:
+                units = 3
+            else:
+                # A standard wheel notch on Windows is delta=+/-120; a
+                # fast flick of a physical wheel can send a larger
+                # multiple of that in one event, which this scales up
+                # for proportionally. The "or" fallback covers a smaller,
+                # non-multiple-of-120 delta (some trackpad drivers do
+                # this) so it never rounds down to a no-op 0.
+                notches = int(event.delta / 120) or (1 if event.delta > 0 else -1)
+                units = -3 * notches
+            tree.yview_scroll(units, "units")
+            return "break"
+
+        tree.bind("<MouseWheel>", _fast_scroll)
+        tree.bind("<Button-4>", _fast_scroll)  # Linux scroll up
+        tree.bind("<Button-5>", _fast_scroll)  # Linux scroll down
+        # selectmode="none" plus this click binding (rather than relying
+        # on the Treeview's own row-selection/<<TreeviewSelect>>) is
+        # deliberate: highlighting the CURRENT value's row further down in
+        # _populate_list would otherwise itself count as a "selection" and
+        # fire that same event the instant the list is drawn, closing the
+        # popup on open before anyone clicked anything.
+        tree.bind("<ButtonRelease-1>", self._on_tree_click)
+
+        self._populate_list("")
+        popup.deiconify()
+        popup.lift()
+        # Forces real OS-level input focus onto this brand-new window
+        # immediately - without this, the very first click on a
+        # just-created window can be swallowed by Windows just activating
+        # the window rather than delivering the click to the button under
+        # the cursor (this popup is destroyed and rebuilt every time it
+        # opens, so every click on it is that "first click").
+        popup.focus_force()
+        search_entry.focus_set()
+
+        # Closes as soon as a click lands anywhere outside the popup - same
+        # as any normal dropdown/combobox - checked by walking UP from
+        # whatever widget the click actually landed on. Deliberately NOT a
+        # "close on focus-out" (an earlier version used that): that closed
+        # the popup as an immediate side effect of a click landing on one
+        # of ITS OWN list buttons (which also shifts focus away from the
+        # search box), destroying the button out from under its own click
+        # before the selection could register. Checking what was actually
+        # clicked, instead of merely that focus moved, avoids that - a
+        # click on the popup's own widgets (including re-clicking this
+        # button itself) is recognized as "inside" and left alone.
+        #
+        # A later version tried closing on window-focus changes instead
+        # (Tk's <Deactivate> event, plus polling focus_get() as a
+        # fallback for switching to a different application entirely),
+        # hoping to catch clicks Windows sometimes swallows for window
+        # activation without ever delivering to Tk (see the note in
+        # README about that). In practice that back-fired much worse: on
+        # this machine it kept reading the popup's OWN brand-new-window
+        # setup as an immediate loss of focus, closing it a moment after
+        # every single open - a box you can't even use is a worse bug
+        # than a close button that sometimes needs a second click. Back
+        # to plain click detection; the popup's own "x" (above) and
+        # Escape (below) are always guaranteed to close it regardless.
+        root = self.winfo_toplevel()
+        root.bind_all("<Button-1>", self._on_global_click)
+        self._global_click_bound = True
+
+    def _on_global_click(self, event) -> None:
+        if self._popup is None or not self._popup.winfo_exists():
+            return
+        widget = event.widget
+        while widget is not None:
+            if widget == self._popup or widget == self:
+                return  # click landed inside the popup (or re-clicked the button itself) - leave it
+            widget = getattr(widget, "master", None)
+        self._close_popup()
+
+    def _populate_list(self, filter_text: str) -> None:
+        tree = self._list_frame
+        tree.delete(*tree.get_children())
+        filter_text = filter_text.strip().lower()
+        matches = [v for v in self._values if filter_text in v.lower()] if filter_text else list(self._values)
+        self._current_matches = matches
+        if not matches:
+            tree.insert("", "end", values=("No matches",))
+            return
+        current = self._variable.get()
+        for value in matches:
+            tree.insert("", "end", values=(value,), tags=("current",) if value == current else ())
+
+    def _on_tree_click(self, event) -> None:
+        row = self._list_frame.identify_row(event.y)
+        if not row or not self._current_matches:
+            return
+        values = self._list_frame.item(row, "values")
+        if values:
+            self._select(values[0])
+
+    def _select_first_match(self) -> None:
+        matches = getattr(self, "_current_matches", [])
+        if matches:
+            self._select(matches[0])
+
+    def _select(self, value: str) -> None:
+        self._variable.set(value)
+        self._close_popup()
+
+    def _close_popup(self) -> None:
+        popup, self._popup = self._popup, None
+        if self._global_click_bound:
+            try:
+                self.winfo_toplevel().unbind_all("<Button-1>")
+            except Exception:  # noqa: BLE001 - window may already be gone during teardown
+                pass
+            self._global_click_bound = False
+        if popup is not None and popup.winfo_exists():
+            popup.destroy()
+
+
 def run_in_background(widget: ctk.CTkBaseClass, work_fn, on_done, on_error=None):
     """Run a slow, DB-heavy computation (forecasting, association-rule
     mining, layout optimisation - anything that can take seconds over a
@@ -150,7 +452,8 @@ class BaseScreen(ctk.CTkFrame):
                             text_color=theme.NAVY_DARK)
         lbl.pack(anchor="w", padx=24, pady=(20, 12))
 
-    def _open_phone_capture_dialog(self, on_captured):
+    def _open_phone_capture_dialog(self, on_captured, *, title="Scan Barcode with Phone",
+                                    instruction="Scan the product's barcode"):
         """Open a small phone-scanner dialog whose only job is to capture
         one barcode/QR code and hand the decoded text to on_captured(code)
         - used to fill in a text field (like the new-product barcode field
@@ -160,7 +463,10 @@ class BaseScreen(ctk.CTkFrame):
         already running for cart scanning, this borrows it for one scan
         and hands it back exactly as it was - the till keeps working
         normally either way. Lives on BaseScreen (not just one screen)
-        since any screen with a barcode-ish field can use it."""
+        since any screen with a barcode-ish field can use it - `title`/
+        `instruction` let a caller scanning something other than a product
+        (a customer's membership QR, say) say so instead of the default
+        product-barcode wording."""
         if getattr(self.app, "mobile_scan_server", None) is None:
             self.app.mobile_scan_server = mobile_scan.MobileScanServer(lambda code: {"unknown": True})
         server = self.app.mobile_scan_server
@@ -187,7 +493,7 @@ class BaseScreen(ctk.CTkFrame):
         server.on_scan = captured
 
         dialog = ctk.CTkToplevel(self)
-        dialog.title("Scan Barcode with Phone")
+        dialog.title(title)
         fit_dialog(dialog, 400, 620)
         dialog.configure(fg_color=theme.BG_LIGHT)
         dialog.grab_set()
@@ -196,7 +502,7 @@ class BaseScreen(ctk.CTkFrame):
         body = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
         body.pack(fill="both", expand=True)
 
-        ctk.CTkLabel(body, text="Scan the product's barcode", font=ctk.CTkFont(size=14, weight="bold"),
+        ctk.CTkLabel(body, text=instruction, font=ctk.CTkFont(size=14, weight="bold"),
                      text_color=theme.NAVY_DARK).pack(pady=(16, 6))
 
         try:
@@ -391,82 +697,67 @@ class POSScreen(BaseScreen):
         body = ctk.CTkScrollableFrame(self, fg_color="transparent")
         body.pack(fill="both", expand=True)
 
+        # Just the per-sale settings up here (tier/payment/customer/cashier
+        # - things you set once and rarely touch again mid-sale). The
+        # actual search box moved to the bottom of the screen, next to its
+        # results list - see the comment down there for why.
         top = ctk.CTkFrame(body, fg_color="transparent")
         top.pack(fill="x", padx=24)
 
-        ctk.CTkLabel(top, text="Scan barcode or search item:", text_color=theme.TEXT_DARK).grid(
-            row=0, column=0, sticky="w")
-        self.search_var = tk.StringVar()
-        self.search_entry = ctk.CTkEntry(top, textvariable=self.search_var, width=260,
-                                          placeholder_text="barcode / name (English or Sinhala)")
-        self.search_entry.grid(row=1, column=0, padx=(0, 10), pady=6)
-        self.search_entry.bind("<Return>", lambda e: self.do_search())
-        styled_button(top, "Search", self.do_search, width=90).grid(row=1, column=1, padx=(0, 6))
-        # The label above the box says "Scan barcode or search item", but
-        # until now the only way to actually scan into it was a physical
-        # USB/Bluetooth scanner (those just type into whatever field has
-        # focus, like a keyboard) - there was no on-screen scan option at
-        # all, unlike the Add/Scan Item dialog in Inventory which has a
-        # "Scan with Phone" button right next to its barcode field. This is
-        # the same feature here: one tap opens the phone-camera scanner,
-        # and the single code it captures goes straight into this box and
-        # triggers the same search - which, for an exact barcode match,
-        # already skips straight to the cart (see do_search below). The
-        # full continuous "Phone Scanner" session further down (which adds
-        # every scan straight to the cart without needing this box at all)
-        # is still there too, for ringing up a whole basket hands-free.
-        styled_button(top, "Scan with Phone",
-                      lambda: self._open_phone_capture_dialog(self._on_phone_scan_into_search),
-                      kind="secondary", width=140).grid(row=1, column=2, padx=(0, 6))
-
-        ctk.CTkLabel(top, text="Price tier:", text_color=theme.TEXT_DARK).grid(row=0, column=3, padx=(20, 0), sticky="w")
+        ctk.CTkLabel(top, text="Price tier:", text_color=theme.TEXT_DARK).grid(row=0, column=0, sticky="w")
         self.tier_var = tk.StringVar(value="cash")
         ctk.CTkOptionMenu(top, values=["cash", "credit", "wholesale"], variable=self.tier_var).grid(
-            row=1, column=3, padx=(20, 0))
+            row=1, column=0)
 
-        ctk.CTkLabel(top, text="Payment:", text_color=theme.TEXT_DARK).grid(row=0, column=4, padx=(16, 0), sticky="w")
+        ctk.CTkLabel(top, text="Payment:", text_color=theme.TEXT_DARK).grid(row=0, column=1, padx=(16, 0), sticky="w")
         self.payment_var = tk.StringVar(value="cash")
         ctk.CTkOptionMenu(top, values=["cash", "card", "cheque", "credit", "split"],
-                           variable=self.payment_var).grid(row=1, column=4, padx=(16, 0))
+                           variable=self.payment_var).grid(row=1, column=1, padx=(16, 0))
 
-        ctk.CTkLabel(top, text="Customer:", text_color=theme.TEXT_DARK).grid(row=0, column=5, padx=(16, 0), sticky="w")
+        # One box does the whole job of attaching a customer to this sale -
+        # a phone number IS their loyalty ID (see customers.py), so there's
+        # no separate "pick a name from a list" dropdown alongside this any
+        # more, and no separate "Find" button either (Enter already does
+        # it). Type a number and press Enter to identify them - their name
+        # then appears right below in customer_found_label. Leave it blank
+        # for an anonymous Walk-in sale, which is the default.
+        ctk.CTkLabel(top, text="Customer - phone number:", text_color=theme.TEXT_DARK).grid(
+            row=0, column=2, padx=(16, 0), sticky="w")
+        self.customer_lookup_var = tk.StringVar()
+        self.customer_lookup_entry = ctk.CTkEntry(top, textvariable=self.customer_lookup_var, width=160)
+        self.customer_lookup_entry.grid(row=1, column=2, padx=(16, 0), sticky="w")
+        self.customer_lookup_entry.bind("<Return>", lambda e: self.identify_customer(self.customer_lookup_var.get()))
+
+        # Internal state only - not shown as a widget of its own any more.
+        # Tracks whichever customer (by name) is currently attached to the
+        # sale; identify_customer() sets it after a successful phone
+        # lookup, "Walk-in" otherwise. Recompute the cart's offer discounts
+        # the moment it changes - a loyalty-only offer switches on/off with
+        # it, so a line added before the customer was identified needs
+        # re-pricing too, not just lines added afterward.
         self.customer_var = tk.StringVar(value="Walk-in")
-        self.customer_menu = ctk.CTkOptionMenu(top, values=["Walk-in"], variable=self.customer_var, width=160)
-        self.customer_menu.grid(row=1, column=5, padx=(16, 0))
+        self.customer_var.trace_add("write", lambda *a: self._on_customer_changed())
 
-        ctk.CTkLabel(top, text="Cashier:", text_color=theme.TEXT_DARK).grid(row=0, column=6, padx=(16, 0), sticky="w")
+        ctk.CTkLabel(top, text="Cashier:", text_color=theme.TEXT_DARK).grid(row=0, column=3, padx=(16, 0), sticky="w")
         self.cashier_label = ctk.CTkLabel(top, text="Not logged in", font=ctk.CTkFont(weight="bold"),
                                            text_color=theme.DANGER_RED)
-        self.cashier_label.grid(row=1, column=6, padx=(16, 0), sticky="w")
+        self.cashier_label.grid(row=1, column=3, padx=(16, 0), sticky="w")
 
-        results_frame = ctk.CTkFrame(body, fg_color="transparent")
-        results_frame.pack(fill="x", padx=24, pady=(6, 0))
-        self.results_tree = make_treeview(
-            results_frame, ["Code", "Name", "Cash Price", "Stock"],
-            {"Code": 90, "Name": 300, "Cash Price": 100, "Stock": 80},
-            rows=5,
-        )
-        # .configure(height=...) alone doesn't stick here: by default a
-        # frame resizes itself to fit whatever its own children ask for
-        # (grid_propagate defaults to True), so the treeview's own natural
-        # height silently overrode the 140px request - this box was meant
-        # to be a compact 5-row search-results list, not one stretching to
-        # fill most of the window. grid_propagate(False) makes the
-        # requested height actually stick.
-        self.results_tree.master_frame.configure(height=140)
-        self.results_tree.master_frame.grid_propagate(False)
-        self.results_tree.master_frame.pack(fill="x")
-        self.results_tree.bind("<Double-1>", lambda e: self.add_selected_to_cart())
+        # Shows who the phone-number box above resolved to (or "Walk-in"
+        # when it's empty) - the "suitable place" for the matched name to
+        # land, right under the box that produced it.
+        self.customer_found_label = ctk.CTkLabel(top, text="Walk-in", font=ctk.CTkFont(size=12, weight="bold"),
+                                                  text_color=theme.TEXT_MUTED)
+        self.customer_found_label.grid(row=2, column=2, padx=(16, 0), pady=(6, 0), sticky="w")
 
-        qty_row = ctk.CTkFrame(body, fg_color="transparent")
-        qty_row.pack(fill="x", padx=24, pady=6)
-        ctk.CTkLabel(qty_row, text="Qty:", text_color=theme.TEXT_DARK).pack(side="left")
-        self.qty_var = tk.StringVar(value="1")
-        ctk.CTkEntry(qty_row, textvariable=self.qty_var, width=70).pack(side="left", padx=8)
-        styled_button(qty_row, "Add to Cart", self.add_selected_to_cart).pack(side="left")
+        self.loyalty_badge = ctk.CTkLabel(top, text="Walk-in sale", font=ctk.CTkFont(size=11, weight="bold"),
+                                           text_color=theme.TEXT_MUTED)
+        self.loyalty_badge.grid(row=2, column=3, padx=(16, 0), pady=(6, 0), sticky="w")
 
-        ctk.CTkLabel(body, text="Quick Items (top sellers - tap to add):",
-                     text_color=theme.TEXT_MUTED, font=ctk.CTkFont(size=11)).pack(anchor="w", padx=24, pady=(4, 0))
+        self.quick_items_label = ctk.CTkLabel(
+            body, text="Quick Items (top sellers - tap to add):",
+            text_color=theme.TEXT_MUTED, font=ctk.CTkFont(size=11))
+        self.quick_items_label.pack(anchor="w", padx=24, pady=(4, 0))
         self.quick_items_frame = ctk.CTkFrame(body, fg_color="transparent")
         self.quick_items_frame.pack(fill="x", padx=24, pady=(2, 6))
         self.tier_var.trace_add("write", lambda *a: self._refresh_quick_items())
@@ -482,11 +773,27 @@ class POSScreen(BaseScreen):
         cart_frame = ctk.CTkFrame(body, fg_color="transparent")
         cart_frame.pack(fill="both", padx=24, pady=(6, 0))
         self.cart_tree = make_treeview(
-            cart_frame, ["Item", "Qty", "Unit Price", "Line Total"],
-            {"Item": 320, "Qty": 80, "Unit Price": 100, "Line Total": 110},
+            cart_frame, ["Item", "Qty", "Unit Price", "Discount", "Line Total"],
+            {"Item": 280, "Qty": 70, "Unit Price": 90, "Discount": 90, "Line Total": 100},
             rows=10,
         )
         self.cart_tree.master_frame.pack(fill="both")
+        # Prefills the qty box below with whatever's already on the line
+        # picked - a cashier adjusting "3" to "5" shouldn't have to first
+        # go check what it currently says.
+        self.cart_tree.bind("<<TreeviewSelect>>", lambda e: self._on_cart_line_selected())
+
+        # An input right on the cart list itself, not just down at the
+        # search box - select a line already in the checkout list above
+        # and change its quantity here, instead of having to remove it and
+        # re-add it at a different quantity through the search/Qty section
+        # further down.
+        edit_qty_row = ctk.CTkFrame(body, fg_color="transparent")
+        edit_qty_row.pack(fill="x", padx=24, pady=(6, 0))
+        ctk.CTkLabel(edit_qty_row, text="Selected line - new qty:", text_color=theme.TEXT_DARK).pack(side="left")
+        self.cart_edit_qty_var = tk.StringVar()
+        ctk.CTkEntry(edit_qty_row, textvariable=self.cart_edit_qty_var, width=70).pack(side="left", padx=8)
+        styled_button(edit_qty_row, "Update Qty", self.update_selected_line_qty, kind="secondary").pack(side="left")
 
         bottom = ctk.CTkFrame(body, fg_color="transparent")
         bottom.pack(fill="x", padx=24, pady=(4, 0))
@@ -515,15 +822,88 @@ class POSScreen(BaseScreen):
         styled_button(bottom2, "Phone Scanner", self.open_phone_scanner_dialog, kind="secondary").grid(
             row=0, column=3, sticky="ew", padx=(4, 0))
 
+        # The search box lives down here, right above its own results list,
+        # instead of up top where it used to sit above everything else -
+        # feedback was that a search box makes more sense next to what it
+        # searches than floating above the tier/payment/customer settings.
+        search_row = ctk.CTkFrame(body, fg_color="transparent")
+        search_row.pack(fill="x", padx=24, pady=(6, 0))
+
+        ctk.CTkLabel(search_row, text="Scan barcode or search item:", text_color=theme.TEXT_DARK).grid(
+            row=0, column=0, columnspan=2, sticky="w")
+        self.search_var = tk.StringVar()
+        self.search_entry = ctk.CTkEntry(search_row, textvariable=self.search_var, width=280)
+        self.search_entry.grid(row=1, column=0, sticky="w")
+        self.search_entry.bind("<Return>", lambda e: self.do_search())
+        # Live-as-you-type: fires on every keystroke (not just Enter/Search),
+        # so the results list below fills in with whatever matches the
+        # letters typed so far - a cashier doesn't have to finish typing or
+        # press anything to see candidates.
+        self.search_var.trace_add("write", lambda *a: self._on_search_changed())
+
+        styled_button(
+            search_row, "Scan with Phone",
+            lambda: self._open_phone_capture_dialog(self._on_phone_scan_into_search),
+            kind="secondary",
+        ).grid(row=1, column=1, padx=(8, 0))
+        styled_button(search_row, "Search", self.do_search).grid(row=1, column=2, padx=(8, 0))
+
+        ctk.CTkLabel(search_row, text="Category:", text_color=theme.TEXT_DARK).grid(
+            row=0, column=3, padx=(16, 0), sticky="w")
+        self.category_var = tk.StringVar(value="All categories")
+        self.category_menu = SearchableDropdown(
+            search_row, values=["All categories"], variable=self.category_var, width=160, label="Category")
+        self.category_menu.grid(row=1, column=3, padx=(16, 0))
+        # Picking a category re-runs the live search immediately (same as
+        # typing a letter) so it narrows/filters what's already been typed,
+        # rather than waiting for another keystroke.
+        self.category_var.trace_add("write", lambda *a: self._on_search_changed())
+
+        results_frame = ctk.CTkFrame(body, fg_color="transparent")
+        results_frame.pack(fill="x", padx=24, pady=(6, 0))
+        self.results_tree = make_treeview(
+            results_frame, ["Code", "Name", "Cash Price", "Stock"],
+            {"Code": 90, "Name": 300, "Cash Price": 100, "Stock": 80},
+            rows=5,
+        )
+        # .configure(height=...) alone doesn't stick here: by default a
+        # frame resizes itself to fit whatever its own children ask for
+        # (grid_propagate defaults to True), so the treeview's own natural
+        # height silently overrode the 140px request - this box was meant
+        # to be a compact 5-row search-results list, not one stretching to
+        # fill most of the window. grid_propagate(False) makes the
+        # requested height actually stick, and it now scrolls internally
+        # (make_treeview's own scrollbar) once live search fills it with
+        # more matches than fit in those 5 rows.
+        self.results_tree.master_frame.configure(height=140)
+        self.results_tree.master_frame.grid_propagate(False)
+        self.results_tree.master_frame.pack(fill="x")
+        self.results_tree.bind("<Double-1>", lambda e: self.add_selected_to_cart())
+
+        qty_row = ctk.CTkFrame(body, fg_color="transparent")
+        qty_row.pack(fill="x", padx=24, pady=(6, 12))
+        ctk.CTkLabel(qty_row, text="Qty:", text_color=theme.TEXT_DARK).pack(side="left")
+        self.qty_var = tk.StringVar(value="1")
+        ctk.CTkEntry(qty_row, textvariable=self.qty_var, width=70).pack(side="left", padx=8)
+        styled_button(qty_row, "Add to Cart", self.add_selected_to_cart).pack(side="left")
+
         self._search_results: list = []
 
     def on_show(self):
-        names = [r["name"] for r in customers_module.list_customers(self.conn)] or ["Walk-in"]
-        if "Walk-in" not in names:
-            names = ["Walk-in"] + names
-        self.customer_menu.configure(values=names)
-        if self.customer_var.get() not in names:
-            self.customer_var.set("Walk-in")
+        # No dropdown to refresh any more - just make sure whoever was
+        # attached to the sale (if not Walk-in) is still a real, active
+        # customer before trusting that name for pricing/quick-items.
+        if self.customer_var.get() != "Walk-in":
+            still_active = self.conn.execute(
+                "SELECT id FROM customers WHERE active=1 AND name=?", (self.customer_var.get(),)
+            ).fetchone()
+            if still_active is None:
+                self.customer_var.set("Walk-in")
+
+        categories = ["All categories"] + pos.list_categories(self.conn)
+        self.category_menu.configure(values=categories)
+        if self.category_var.get() not in categories:
+            self.category_var.set("All categories")
 
         if self.app.logged_in:
             staff = self.conn.execute("SELECT name FROM staff WHERE id=?", (self.app.current_staff_id,)).fetchone()
@@ -532,6 +912,9 @@ class POSScreen(BaseScreen):
             self.cashier_label.configure(text="Not logged in", text_color=theme.DANGER_RED)
 
         self._refresh_quick_items()
+        self._update_loyalty_badge()
+        self._update_customer_found_label()
+        self.customer_lookup_var.set("")
         # Most USB/Bluetooth barcode scanners are "keyboard wedge" devices -
         # they just type the code + Enter into whatever field has focus, no
         # driver needed. Focusing the search box here means a cashier can
@@ -543,10 +926,98 @@ class POSScreen(BaseScreen):
         row = self.conn.execute("SELECT * FROM customers WHERE name=?", (name,)).fetchone()
         return row
 
+    def _current_is_loyalty(self) -> bool:
+        return customers_module.is_loyalty_member(self._selected_customer_row())
+
+    def _update_loyalty_badge(self):
+        if self._current_is_loyalty():
+            self.loyalty_badge.configure(text="★ Loyalty member", text_color=theme.SUCCESS_GREEN)
+        else:
+            self.loyalty_badge.configure(text="Walk-in sale", text_color=theme.TEXT_MUTED)
+
+    def _on_customer_changed(self):
+        self._update_loyalty_badge()
+        self._update_customer_found_label()
+        self._reprice_cart()
+        self._refresh_quick_items()
+
+    def _update_customer_found_label(self):
+        """Keeps the "suitable place" the matched name shows in - right
+        under the phone-number box - in sync with customer_var, whichever
+        of the (several) ways it can change just happened: a successful
+        phone lookup, a held invoice being resumed with its own customer,
+        or this screen resetting a no-longer-active customer back to
+        Walk-in in on_show()."""
+        name = self.customer_var.get()
+        if name == "Walk-in":
+            self.customer_found_label.configure(text="Walk-in", text_color=theme.TEXT_MUTED)
+        else:
+            self.customer_found_label.configure(text=f"→ {name}", text_color=theme.SUCCESS_GREEN)
+
+    def _reprice_cart(self):
+        """Recompute every cart line's offer discount for whichever
+        customer is now selected - a loyalty-only offer switches on/off
+        with them, so a line added before the customer was identified
+        needs re-pricing too, not just lines added afterward. Leaves qty
+        and unit_price alone; only the discount/offer_name can change."""
+        if not self.cart:
+            return
+        is_loyalty = self._current_is_loyalty()
+        for line in self.cart:
+            p = self.conn.execute("SELECT category FROM products WHERE id=?", (line["product_id"],)).fetchone()
+            category = p["category"] if p else None
+            discount, offer_name = offers_module.line_discount_amount(
+                self.conn, line["product_id"], category, line["qty"], line["unit_price"], is_loyalty)
+            line["discount"] = discount
+            line["offer_name"] = offer_name
+        self.refresh_cart()
+
+    def identify_customer(self, raw_text: str):
+        """The one way a customer gets attached to a sale - a phone number
+        IS their loyalty ID (see customers.py), so this single box does
+        what used to take a separate name dropdown plus a separate "Find"
+        button. Looks the number up, sets customer_var to their name
+        (which shows it in customer_found_label and re-prices the cart via
+        _on_customer_changed), and offers to register them on the spot if
+        the number doesn't match anyone yet. Clearing the box and pressing
+        Enter puts the sale back to an anonymous Walk-in one."""
+        phone = (raw_text or "").strip()
+        if not phone:
+            self.customer_var.set("Walk-in")
+            return
+
+        row = customers_module.find_customer_by_phone(self.conn, phone)
+        if row is None:
+            self.customer_found_label.configure(text="Not found", text_color=theme.DANGER_RED)
+            if not messagebox.askyesno(
+                "No loyalty account found",
+                f"No loyalty customer is registered with the phone number '{phone}'.\n\n"
+                "Register them now?",
+            ):
+                return
+            row = open_customer_registration_dialog(self, self.conn, prefill_phone=phone)
+            if row is None:
+                return  # cashier cancelled the registration dialog
+
+        self.customer_var.set(row["name"])
+        self.customer_lookup_var.set("")
+        self.customer_lookup_entry.focus_set()
+
     def _refresh_quick_items(self):
         for w in self.quick_items_frame.winfo_children():
             w.destroy()
-        rows = reports.best_sellers(self.conn, days=30, top_n=12)
+        # A loyalty customer's own most-bought items make a more useful
+        # quick-add list than the shop-wide top sellers once one's been
+        # identified at checkout - falls back to the shop-wide list for a
+        # Walk-in sale, or a loyalty customer with no purchase history yet.
+        customer_row = self._selected_customer_row()
+        rows = []
+        if customer_row is not None and customers_module.is_loyalty_member(customer_row):
+            rows = reports.customer_top_items(self.conn, customer_row["id"], top_n=12)
+            self.quick_items_label.configure(text=f"{customer_row['name']}'s usual items (tap to add):")
+        if not rows:
+            rows = reports.best_sellers(self.conn, days=30, top_n=12)
+            self.quick_items_label.configure(text="Quick Items (top sellers - tap to add):")
         tier_field = {"cash": "cash_price", "credit": "credit_price", "wholesale": "wholesale_price"}[self.tier_var.get()]
         cols = 4
         for i, r in enumerate(rows):
@@ -569,7 +1040,11 @@ class POSScreen(BaseScreen):
         if p is None:
             return
         tier_field = {"cash": "cash_price", "credit": "credit_price", "wholesale": "wholesale_price"}[self.tier_var.get()]
-        self.cart.append({"product_id": product_id, "name": p["name_en"], "qty": 1.0, "unit_price": p[tier_field]})
+        unit_price = p[tier_field]
+        discount, offer_name = offers_module.line_discount_amount(
+            self.conn, product_id, p["category"], 1.0, unit_price, self._current_is_loyalty())
+        self.cart.append({"product_id": product_id, "name": p["name_en"], "qty": 1.0, "unit_price": unit_price,
+                           "discount": discount, "offer_name": offer_name})
         self.refresh_cart()
 
     def handle_phone_scan(self, code: str) -> dict:
@@ -679,6 +1154,32 @@ class POSScreen(BaseScreen):
         self.search_var.set(code)
         self.do_search()
 
+    def _selected_category(self) -> str | None:
+        category = self.category_var.get()
+        return None if category in ("", "All categories") else category
+
+    def _on_search_changed(self, *_args) -> None:
+        """Bound to search_var's and category_var's write trace, so this
+        runs after every keystroke in the search box or every change of the
+        category filter - the results list fills in live with whatever
+        matches so far, instead of waiting for Enter or a click on
+        "Search". No popup here even when nothing matches yet - a popup on
+        every keystroke while someone is still mid-word would be unusable;
+        do_search (Enter/Search/scanner) still shows one when a *finished*
+        search comes up empty."""
+        query = self.search_var.get().strip()
+        category = self._selected_category()
+        if not query and not category:
+            self._search_results = []
+            tree_clear(self.results_tree)
+            return
+        self._search_results = pos.search_products(self.conn, query, category=category)
+        tree_clear(self.results_tree)
+        for p in self._search_results:
+            stock = pos.get_stock_on_hand(self.conn, p["id"])
+            tree_insert(self.results_tree, (p["code"], p["name_en"], f"{p['cash_price']:.2f}", f"{stock:.0f}"),
+                        iid=str(p["id"]))
+
     def do_search(self):
         query = self.search_var.get().strip()
         if not query:
@@ -698,7 +1199,7 @@ class POSScreen(BaseScreen):
             self.search_entry.focus_set()
             return
 
-        self._search_results = pos.search_products(self.conn, query)
+        self._search_results = pos.search_products(self.conn, query, category=self._selected_category())
         tree_clear(self.results_tree)
         for p in self._search_results:
             stock = pos.get_stock_on_hand(self.conn, p["id"])
@@ -736,18 +1237,40 @@ class POSScreen(BaseScreen):
         if p is None:
             return
         tier_field = {"cash": "cash_price", "credit": "credit_price", "wholesale": "wholesale_price"}[self.tier_var.get()]
-        self.cart.append({"product_id": product_id, "name": p["name_en"], "qty": qty, "unit_price": p[tier_field]})
+        unit_price = p[tier_field]
+        discount, offer_name = offers_module.line_discount_amount(
+            self.conn, product_id, p["category"], qty, unit_price, self._current_is_loyalty())
+        self.cart.append({"product_id": product_id, "name": p["name_en"], "qty": qty, "unit_price": unit_price,
+                           "discount": discount, "offer_name": offer_name})
         self.refresh_cart()
 
     def refresh_cart(self):
         tree_clear(self.cart_tree)
         total = 0.0
         for i, line in enumerate(self.cart):
-            line_total = line["qty"] * line["unit_price"]
+            discount = line.get("discount", 0.0)
+            line_total = line["qty"] * line["unit_price"] - discount
             total += line_total
-            tree_insert(self.cart_tree, (line["name"], line["qty"], f"{line['unit_price']:.2f}", f"{line_total:.2f}"),
-                        iid=str(i))
+            # A brief tooltip-style label isn't available on a plain
+            # Treeview cell, so the offer's name only shows up as the
+            # amount here - the offer that produced it is one glance away
+            # on the Offers screen if a cashier or the Owner needs to
+            # check "why did this get 15% off".
+            discount_text = f"-{discount:.2f}" if discount else "-"
+            tree_insert(
+                self.cart_tree,
+                (line["name"], line["qty"], f"{line['unit_price']:.2f}", discount_text, f"{line_total:.2f}"),
+                iid=str(i),
+            )
         self.total_label.configure(text=f"Net Total: LKR {total:,.2f}")
+
+    def _on_cart_line_selected(self):
+        sel = self.cart_tree.selection()
+        if not sel:
+            return
+        idx = int(sel[0])
+        if 0 <= idx < len(self.cart):
+            self.cart_edit_qty_var.set(str(self.cart[idx]["qty"]))
 
     def remove_selected_line(self):
         sel = self.cart_tree.selection()
@@ -755,10 +1278,42 @@ class POSScreen(BaseScreen):
             return
         idx = int(sel[0])
         del self.cart[idx]
+        self.cart_edit_qty_var.set("")
+        self.refresh_cart()
+
+    def update_selected_line_qty(self):
+        """Changes the quantity of a line already sitting in the checkout
+        list, without removing and re-adding it. Re-runs the same
+        offer-discount calculation _add_product_to_cart does, since some
+        offers scale with quantity."""
+        sel = self.cart_tree.selection()
+        if not sel:
+            messagebox.showwarning("No line selected", "Select a line in the checkout list first.")
+            return
+        try:
+            qty = float(self.cart_edit_qty_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid quantity", "Quantity must be a number.")
+            return
+        if qty <= 0:
+            messagebox.showerror("Invalid quantity", "Quantity must be greater than zero - "
+                                                        "use Remove Selected Line to take an item off the sale.")
+            return
+        idx = int(sel[0])
+        line = self.cart[idx]
+        p = self.conn.execute("SELECT category FROM products WHERE id=?", (line["product_id"],)).fetchone()
+        category = p["category"] if p else None
+        discount, offer_name = offers_module.line_discount_amount(
+            self.conn, line["product_id"], category, qty, line["unit_price"], self._current_is_loyalty())
+        line["qty"] = qty
+        line["discount"] = discount
+        line["offer_name"] = offer_name
+        self.cart_edit_qty_var.set("")
         self.refresh_cart()
 
     def clear_cart(self):
         self.cart = []
+        self.cart_edit_qty_var.set("")
         self.refresh_cart()
 
     def checkout(self):
@@ -772,8 +1327,9 @@ class POSScreen(BaseScreen):
             return
         staff_id = self.app.current_staff_id
         customer_row = self._selected_customer_row()
-        cart_lines = [pos.CartLine(product_id=c["product_id"], qty=c["qty"]) for c in self.cart]
-        net_total = sum(c["qty"] * c["unit_price"] for c in self.cart)
+        cart_lines = [pos.CartLine(product_id=c["product_id"], qty=c["qty"], discount=c.get("discount", 0.0))
+                      for c in self.cart]
+        net_total = sum(c["qty"] * c["unit_price"] - c.get("discount", 0.0) for c in self.cart)
 
         payment_choice = self.payment_var.get()
         payments = None
@@ -828,7 +1384,8 @@ class POSScreen(BaseScreen):
             return
         staff_id = self.app.current_staff_id
         customer_row = self._selected_customer_row()
-        cart_lines = [pos.CartLine(product_id=c["product_id"], qty=c["qty"]) for c in self.cart]
+        cart_lines = [pos.CartLine(product_id=c["product_id"], qty=c["qty"], discount=c.get("discount", 0.0))
+                      for c in self.cart]
         pos.hold_cart(self.conn, staff_id=staff_id, cart=cart_lines, price_tier=self.tier_var.get(),
                        customer_id=customer_row["id"] if customer_row else None)
         messagebox.showinfo("Held", "Cart held. Use 'Resume Held' to bring it back later.")
@@ -858,21 +1415,29 @@ class POSScreen(BaseScreen):
                 return
             held_id = int(sel[0])
             cart_lines, tier, customer_id = pos.resume_held_invoice(self.conn, held_id)
-            new_cart = []
-            tier_field = {"cash": "cash_price", "credit": "credit_price", "wholesale": "wholesale_price"}[tier]
-            for line in cart_lines:
-                p = self.conn.execute("SELECT * FROM products WHERE id=?", (line.product_id,)).fetchone()
-                if p is None:
-                    continue
-                new_cart.append({"product_id": line.product_id, "name": p["name_en"], "qty": line.qty,
-                                  "unit_price": p[tier_field]})
-            self.cart = new_cart
             self.tier_var.set(tier)
             if customer_id:
                 crow = customers_module.get_customer(self.conn, customer_id)
                 if crow:
                     self.on_show()
                     self.customer_var.set(crow["name"])
+            # Re-price fresh rather than trusting the flat discount amount
+            # stored when this was held - an offer may have started,
+            # ended, or been switched off in the meantime, exactly like
+            # _reprice_cart above.
+            is_loyalty = self._current_is_loyalty()
+            tier_field = {"cash": "cash_price", "credit": "credit_price", "wholesale": "wholesale_price"}[tier]
+            new_cart = []
+            for line in cart_lines:
+                p = self.conn.execute("SELECT * FROM products WHERE id=?", (line.product_id,)).fetchone()
+                if p is None:
+                    continue
+                unit_price = p[tier_field]
+                discount, offer_name = offers_module.line_discount_amount(
+                    self.conn, line.product_id, p["category"], line.qty, unit_price, is_loyalty)
+                new_cart.append({"product_id": line.product_id, "name": p["name_en"], "qty": line.qty,
+                                  "unit_price": unit_price, "discount": discount, "offer_name": offer_name})
+            self.cart = new_cart
             pos.delete_held_invoice(self.conn, held_id)
             self.refresh_cart()
             dialog.destroy()
@@ -1197,13 +1762,14 @@ class InventoryScreen(BaseScreen):
 
         ctk.CTkLabel(body, text="Product:").pack(anchor="w", padx=16, pady=(16, 0))
         product_var = tk.StringVar(value=names[0] if names else "")
-        ctk.CTkOptionMenu(body, values=names, variable=product_var, width=360).pack(padx=16)
+        SearchableDropdown(body, values=names, variable=product_var, width=360, label="Product").pack(padx=16)
 
         suppliers_list = suppliers_module.list_suppliers(self.conn)
         supplier_names = ["(none)"] + [s["name"] for s in suppliers_list]
         ctk.CTkLabel(body, text="Supplier:").pack(anchor="w", padx=16, pady=(12, 0))
         supplier_var = tk.StringVar(value=supplier_names[0])
-        ctk.CTkOptionMenu(body, values=supplier_names, variable=supplier_var, width=360).pack(padx=16)
+        SearchableDropdown(body, values=supplier_names, variable=supplier_var, width=360, label="Supplier").pack(
+            padx=16)
 
         ctk.CTkLabel(body, text="Quantity received:").pack(anchor="w", padx=16, pady=(12, 0))
         qty_var = tk.StringVar(value="10")
@@ -1483,7 +2049,8 @@ class ForecastingScreen(BaseScreen):
         self._products = products
         names = [p["name_en"] for p in products]
         self.product_var = tk.StringVar(value=names[0] if names else "")
-        ctk.CTkOptionMenu(top, values=names, variable=self.product_var, width=280).pack(side="left", padx=8)
+        SearchableDropdown(top, values=names, variable=self.product_var, width=280, label="Product").pack(
+            side="left", padx=8)
         self.run_forecast_btn = styled_button(top, "Run Forecast", self.run_forecast)
         self.run_forecast_btn.pack(side="left", padx=8)
         self.purchase_list_btn = styled_button(top, "Generate Purchase List (all products)", self.run_purchase_list,
@@ -1733,7 +2300,9 @@ class ReportsScreen(BaseScreen):
         ctk.CTkLabel(self.cashier_row, text="Staff:", text_color=theme.TEXT_DARK).pack(side="left", padx=(24, 4))
         staff_names = [r["name"] for r in self.conn.execute("SELECT name FROM staff").fetchall()] or ["Admin"]
         self.cashier_staff_var = tk.StringVar(value=staff_names[0])
-        ctk.CTkOptionMenu(self.cashier_row, values=staff_names, variable=self.cashier_staff_var).pack(side="left")
+        SearchableDropdown(
+            self.cashier_row, values=staff_names, variable=self.cashier_staff_var, width=200, label="Staff",
+        ).pack(side="left")
         ctk.CTkLabel(self.cashier_row, text="Date (YYYY-MM-DD):", text_color=theme.TEXT_DARK).pack(
             side="left", padx=(16, 4))
         self.cashier_date_var = tk.StringVar(value=date.today().isoformat())
@@ -1831,6 +2400,71 @@ class ReportsScreen(BaseScreen):
 # Customers (credit accounts)
 # --------------------------------------------------------------------------- #
 
+def open_customer_registration_dialog(parent, conn, *, prefill_phone: str = "") -> sqlite3.Row | None:
+    """Shared 'Add Customer' flow: the Customers screen's own "Add
+    Customer" button, and the POS screen's on-the-spot registration when a
+    phone number typed at checkout doesn't match anyone yet. Phone is
+    required - it's this customer's loyalty ID (see customers.py), what
+    they'll be identified by at every future checkout, so a customer with
+    no phone on file could never be found again. Blocks until the dialog
+    closes (a short modal form - fine to use Tkinter's own wait_window
+    here) and returns the newly created customer row, or None if
+    cancelled."""
+    result: dict = {"row": None}
+    dialog = ctk.CTkToplevel(parent)
+    dialog.title("Register Loyalty Customer")
+    fit_dialog(dialog, 380, 360)
+    dialog.configure(fg_color=theme.BG_LIGHT)
+    dialog.grab_set()
+
+    body = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
+    body.pack(fill="both", expand=True)
+
+    ctk.CTkLabel(
+        body, text="Registering makes them a loyalty member - found at future checkouts by the "
+                    "phone number below, and eligible for loyalty-only offers.",
+        text_color=theme.TEXT_MUTED, font=ctk.CTkFont(size=11), wraplength=320, justify="left",
+    ).pack(padx=16, pady=(12, 0))
+
+    fields = {}
+    for label, key, default in [("Name:", "name", ""), ("Phone:", "phone", prefill_phone),
+                                 ("Address:", "address", ""), ("Credit Limit:", "credit_limit", "0")]:
+        ctk.CTkLabel(body, text=label).pack(anchor="w", padx=16, pady=(12, 0))
+        v = tk.StringVar(value=default)
+        ctk.CTkEntry(body, textvariable=v, width=320).pack(padx=16)
+        fields[key] = v
+
+    def save():
+        name = fields["name"].get().strip()
+        phone = fields["phone"].get().strip()
+        if not name:
+            messagebox.showerror("Missing name", "Customer name is required.")
+            return
+        if not phone:
+            messagebox.showerror("Missing phone", "Phone number is required - it's how this customer "
+                                                    "gets identified at checkout.")
+            return
+        try:
+            limit = float(fields["credit_limit"].get() or 0)
+        except ValueError:
+            messagebox.showerror("Invalid credit limit", "Enter a number.")
+            return
+        try:
+            customer_id = customers_module.add_customer(conn, name, phone, fields["address"].get(), limit)
+        except ValueError as e:
+            messagebox.showerror("Can't register customer", str(e))
+            return
+        result["row"] = customers_module.get_customer(conn, customer_id)
+        dialog.destroy()
+
+    dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+    dialog.bind("<Return>", lambda e: save())
+    styled_button(dialog, "Save", save, kind="primary", width=140).pack(pady=18)
+
+    parent.wait_window(dialog)
+    return result["row"]
+
+
 class CustomersScreen(BaseScreen):
     def __init__(self, parent, app):
         super().__init__(parent, app)
@@ -1847,7 +2481,8 @@ class CustomersScreen(BaseScreen):
         tree_frame.pack(fill="both", expand=True, padx=24, pady=10)
         self.tree = make_treeview(
             tree_frame, ["Name", "Phone", "Credit Limit", "Balance Owed", "Available Credit"],
-            {"Name": 220, "Phone": 130, "Credit Limit": 110, "Balance Owed": 110, "Available Credit": 130},
+            {"Name": 200, "Phone": 120, "Credit Limit": 100,
+             "Balance Owed": 100, "Available Credit": 120},
         )
         self.tree.master_frame.pack(fill="both", expand=True)
 
@@ -1861,8 +2496,8 @@ class CustomersScreen(BaseScreen):
             tag = "overdue" if c["credit_limit"] > 0 and c["credit_balance"] >= c["credit_limit"] else None
             tree_insert(
                 self.tree,
-                (c["name"], c["phone"] or "", f"{c['credit_limit']:,.2f}", f"{c['credit_balance']:,.2f}",
-                 f"{available:,.2f}"),
+                (c["name"], c["phone"] or "", f"{c['credit_limit']:,.2f}",
+                 f"{c['credit_balance']:,.2f}", f"{available:,.2f}"),
                 tag=tag, iid=str(c["id"]),
             )
 
@@ -1871,44 +2506,8 @@ class CustomersScreen(BaseScreen):
         return int(sel[0]) if sel else None
 
     def open_add_dialog(self):
-        dialog = ctk.CTkToplevel(self)
-        dialog.title("Add Customer")
-        fit_dialog(dialog, 380, 340)
-        dialog.configure(fg_color=theme.BG_LIGHT)
-        dialog.grab_set()
-
-        # Fields go in a scrollable body, packed BEFORE the Save button -
-        # guarantees the button its own space regardless of Windows display
-        # scaling; see open_login_dialog in app.py for the full reasoning.
-        body = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
-        body.pack(fill="both", expand=True)
-
-        fields = {}
-        for label, key, default in [("Name:", "name", ""), ("Phone:", "phone", ""),
-                                     ("Address:", "address", ""), ("Credit Limit:", "credit_limit", "0")]:
-            ctk.CTkLabel(body, text=label).pack(anchor="w", padx=16, pady=(12, 0))
-            v = tk.StringVar(value=default)
-            ctk.CTkEntry(body, textvariable=v, width=320).pack(padx=16)
-            fields[key] = v
-
-        def save():
-            name = fields["name"].get().strip()
-            if not name:
-                messagebox.showerror("Missing name", "Customer name is required.")
-                return
-            try:
-                limit = float(fields["credit_limit"].get() or 0)
-            except ValueError:
-                messagebox.showerror("Invalid credit limit", "Enter a number.")
-                return
-            customers_module.add_customer(
-                self.conn, name, fields["phone"].get(), fields["address"].get(), limit
-            )
-            dialog.destroy()
-            self.refresh()
-
-        dialog.bind("<Return>", lambda e: save())
-        styled_button(dialog, "Save", save, kind="primary", width=140).pack(pady=18)
+        open_customer_registration_dialog(self, self.conn)
+        self.refresh()
 
     def open_settle_dialog(self):
         customer_id = self._selected_customer_id()
@@ -1980,6 +2579,179 @@ class CustomersScreen(BaseScreen):
                                      f"{r['payment']:.2f}" if r["payment"] else "", f"{r['balance']:.2f}"))
         if not rows:
             ctk.CTkLabel(dialog, text="No credit activity yet.", text_color=theme.TEXT_MUTED).pack(pady=10)
+
+
+# --------------------------------------------------------------------------- #
+# Offers (manual, staff-created discounts - see offers.py)
+# --------------------------------------------------------------------------- #
+
+class OffersScreen(BaseScreen):
+    def __init__(self, parent, app):
+        super().__init__(parent, app)
+        self.header("Offers")
+        ctk.CTkLabel(
+            self, text="Discounts staff set up on purpose - a product or a whole category, for "
+                        "everyone or for loyalty members only. Applied automatically at checkout.\n"
+                        "(For automatic near-expiry clearance discounts instead, see Promotions & Expiry.)",
+            text_color=theme.TEXT_MUTED, font=ctk.CTkFont(size=11), justify="left",
+        ).pack(anchor="w", padx=24, pady=(0, 8))
+
+        top = ctk.CTkFrame(self, fg_color="transparent")
+        top.pack(fill="x", padx=24)
+        styled_button(top, "Refresh", self.refresh, kind="secondary").pack(side="left")
+        styled_button(top, "New Offer", self.open_add_dialog, kind="primary").pack(side="left", padx=8)
+        styled_button(top, "Turn Off Selected", self.deactivate_selected, kind="danger").pack(side="left", padx=8)
+
+        tree_frame = ctk.CTkFrame(self, fg_color="transparent")
+        tree_frame.pack(fill="both", expand=True, padx=24, pady=10)
+        self.tree = make_treeview(
+            tree_frame, ["Name", "Applies To", "Discount", "For", "Starts", "Ends", "Active"],
+            {"Name": 150, "Applies To": 170, "Discount": 80, "For": 90, "Starts": 90, "Ends": 90, "Active": 60},
+        )
+        self.tree.master_frame.pack(fill="both", expand=True)
+
+    def on_show(self):
+        self.refresh()
+
+    def refresh(self):
+        tree_clear(self.tree)
+        for o in offers_module.list_offers(self.conn):
+            applies_to = o["product_name"] if o["product_id"] else f"Category: {o['category']}"
+            for_ = "Loyalty only" if o["scope"] == offers_module.SCOPE_LOYALTY else "Everyone"
+            tree_insert(
+                self.tree,
+                (o["name"], applies_to, f"{o['discount_pct']:g}%", for_,
+                 o["start_date"] or "-", o["end_date"] or "-", "Yes" if o["active"] else "No"),
+                iid=str(o["id"]),
+            )
+
+    def _selected_offer_id(self):
+        sel = self.tree.selection()
+        return int(sel[0]) if sel else None
+
+    def deactivate_selected(self):
+        offer_id = self._selected_offer_id()
+        if offer_id is None:
+            messagebox.showwarning("Select an offer", "Select an offer in the list first.")
+            return
+        if not messagebox.askyesno(
+            "Turn off offer",
+            "Turn this offer off? It stops applying at checkout immediately - the offer itself "
+            "stays on record (not deleted), so it can be reviewed or turned back on later.",
+        ):
+            return
+        offers_module.set_active(self.conn, offer_id, False)
+        self.refresh()
+
+    def open_add_dialog(self):
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("New Offer")
+        fit_dialog(dialog, 420, 620)
+        dialog.configure(fg_color=theme.BG_LIGHT)
+        dialog.grab_set()
+
+        body = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
+        body.pack(fill="both", expand=True)
+
+        ctk.CTkLabel(body, text="Offer name:").pack(anchor="w", padx=16, pady=(14, 0))
+        name_var = tk.StringVar()
+        ctk.CTkEntry(body, textvariable=name_var, width=340).pack(padx=16)
+
+        ctk.CTkLabel(body, text="Applies to:").pack(anchor="w", padx=16, pady=(12, 0))
+        target_kind_var = tk.StringVar(value="One product")
+        ctk.CTkOptionMenu(body, values=["One product", "Whole category"], variable=target_kind_var,
+                           width=340).pack(padx=16)
+
+        products = self.conn.execute("SELECT id, name_en FROM products WHERE active=1 ORDER BY name_en").fetchall()
+        product_names = [p["name_en"] for p in products]
+        product_var = tk.StringVar(value=product_names[0] if product_names else "")
+        product_menu = SearchableDropdown(body, values=product_names or ["(no products)"],
+                                           variable=product_var, width=340, label="Product")
+        product_menu.pack(padx=16, pady=(6, 0))
+
+        categories = pos.list_categories(self.conn)
+        category_var = tk.StringVar(value=categories[0] if categories else "")
+        category_menu = SearchableDropdown(body, values=categories or ["(no categories)"],
+                                            variable=category_var, width=340, label="Category")
+
+        def on_target_kind_change(*_a):
+            if target_kind_var.get() == "One product":
+                category_menu.pack_forget()
+                product_menu.pack(padx=16, pady=(6, 0))
+            else:
+                product_menu.pack_forget()
+                category_menu.pack(padx=16, pady=(6, 0))
+
+        target_kind_var.trace_add("write", on_target_kind_change)
+
+        ctk.CTkLabel(body, text="Discount %:").pack(anchor="w", padx=16, pady=(12, 0))
+        pct_var = tk.StringVar(value="10")
+        ctk.CTkEntry(body, textvariable=pct_var, width=340).pack(padx=16)
+
+        ctk.CTkLabel(body, text="For:").pack(anchor="w", padx=16, pady=(12, 0))
+        scope_var = tk.StringVar(value="Everyone")
+        ctk.CTkOptionMenu(body, values=["Everyone", "Loyalty members only"], variable=scope_var,
+                           width=340).pack(padx=16)
+
+        ctk.CTkLabel(body, text="Starts (YYYY-MM-DD, optional):").pack(anchor="w", padx=16, pady=(12, 0))
+        start_var = tk.StringVar()
+        ctk.CTkEntry(body, textvariable=start_var, width=340).pack(padx=16)
+
+        ctk.CTkLabel(body, text="Ends (YYYY-MM-DD, optional):").pack(anchor="w", padx=16, pady=(12, 0))
+        end_var = tk.StringVar()
+        ctk.CTkEntry(body, textvariable=end_var, width=340).pack(padx=16)
+
+        def save():
+            name = name_var.get().strip()
+            if not name:
+                messagebox.showerror("Missing name", "Give this offer a short name.")
+                return
+            try:
+                pct = float(pct_var.get())
+            except ValueError:
+                messagebox.showerror("Invalid discount", "Discount % must be a number.")
+                return
+
+            product_id = None
+            category = None
+            if target_kind_var.get() == "One product":
+                if not products:
+                    messagebox.showerror("No products", "There are no active products to pick from.")
+                    return
+                match = next((p for p in products if p["name_en"] == product_var.get()), None)
+                if match is None:
+                    messagebox.showerror("Pick a product", "Select a product from the list.")
+                    return
+                product_id = match["id"]
+            else:
+                if not categories:
+                    messagebox.showerror("No categories", "There are no categories to pick from.")
+                    return
+                category = category_var.get()
+
+            for label, value in (("Start date", start_var.get()), ("End date", end_var.get())):
+                if value.strip():
+                    try:
+                        date.fromisoformat(value.strip())
+                    except ValueError:
+                        messagebox.showerror("Invalid date", f"{label} must be in YYYY-MM-DD form.")
+                        return
+
+            try:
+                offers_module.add_offer(
+                    self.conn, name, pct, product_id=product_id, category=category,
+                    scope=offers_module.SCOPE_LOYALTY if scope_var.get() == "Loyalty members only"
+                    else offers_module.SCOPE_ALL,
+                    start_date=start_var.get().strip() or None, end_date=end_var.get().strip() or None,
+                )
+            except ValueError as e:
+                messagebox.showerror("Can't save offer", str(e))
+                return
+            dialog.destroy()
+            self.refresh()
+
+        dialog.bind("<Return>", lambda e: save())
+        styled_button(dialog, "Save Offer", save, kind="primary", width=160).pack(pady=18)
 
 
 # --------------------------------------------------------------------------- #

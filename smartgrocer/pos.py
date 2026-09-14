@@ -53,14 +53,40 @@ class InvoiceResult:
     lines: list = field(default_factory=list)
 
 
-def search_products(conn: sqlite3.Connection, query: str, limit: int = 25) -> list[sqlite3.Row]:
+def search_products(
+    conn: sqlite3.Connection, query: str, limit: int = 25, category: str | None = None,
+) -> list[sqlite3.Row]:
+    """Matches on code, English name, or Sinhala name. `query` may be blank
+    (used by the POS search box's live-as-you-type list to show something
+    the moment a category is picked, before any letters are typed) as long
+    as `category` narrows it down - a blank query with no category would
+    just return the whole catalog, so that combination returns nothing
+    instead. `category` (optional) narrows to an exact category, matching
+    the value the POS screen's category filter shows in its dropdown."""
+    query = (query or "").strip()
+    if not query and not category:
+        return []
     like = f"%{query}%"
-    return conn.execute(
-        """SELECT * FROM products WHERE active=1 AND
-           (code LIKE ? OR name_en LIKE ? OR name_si LIKE ?)
-           ORDER BY name_en LIMIT ?""",
-        (like, like, like, limit),
+    sql = """SELECT * FROM products WHERE active=1 AND
+             (code LIKE ? OR name_en LIKE ? OR name_si LIKE ?)"""
+    params: list = [like, like, like]
+    if category:
+        sql += " AND category=?"
+        params.append(category)
+    sql += " ORDER BY name_en LIMIT ?"
+    params.append(limit)
+    return conn.execute(sql, params).fetchall()
+
+
+def list_categories(conn: sqlite3.Connection) -> list[str]:
+    """Distinct categories currently in use by an active product, for the
+    POS search box's category filter dropdown - there's no separate
+    categories table, `products.category` is free text, so this is just
+    whatever values are actually out there right now."""
+    rows = conn.execute(
+        "SELECT DISTINCT category FROM products WHERE active=1 AND category != '' ORDER BY category"
     ).fetchall()
+    return [r["category"] for r in rows]
 
 
 def _barcode_variants(code: str) -> list[str]:

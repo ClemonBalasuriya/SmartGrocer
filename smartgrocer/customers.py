@@ -31,9 +31,39 @@ class CreditLimitExceededError(Exception):
         )
 
 
+def is_loyalty_member(customer_row: sqlite3.Row | None) -> bool:
+    """Per the shop's own rule: registering a customer at all is what
+    makes them a loyalty member - there's no separate opt-in step. Only
+    the seeded "Walk-in" customer (used for anonymous cash sales, never
+    actually registered by anyone) is not a member."""
+    return customer_row is not None and customer_row["name"] != "Walk-in"
+
+
+def _check_phone_not_taken(conn: sqlite3.Connection, phone: str, *, exclude_id: int | None = None) -> None:
+    """A customer's phone number IS their loyalty ID - it's what gets
+    printed as a barcode and scanned at checkout (see POSScreen in the
+    GUI) - so two active customers sharing one phone number would make a
+    scan ambiguous about who it means. Blank/no phone is fine (that
+    customer just isn't scannable/identifiable by phone - they can still
+    be picked by name like before this feature existed); a real phone
+    number must be unique among active, real (non-"Walk-in") customers."""
+    phone = (phone or "").strip()
+    if not phone:
+        return
+    q = "SELECT id FROM customers WHERE active=1 AND name != 'Walk-in' AND phone=?"
+    params: list = [phone]
+    if exclude_id is not None:
+        q += " AND id != ?"
+        params.append(exclude_id)
+    clash = conn.execute(q, params).fetchone()
+    if clash is not None:
+        raise ValueError(f"Phone number '{phone}' is already registered to another customer.")
+
+
 def add_customer(
     conn: sqlite3.Connection, name: str, phone: str = "", address: str = "", credit_limit: float = 0.0
 ) -> int:
+    _check_phone_not_taken(conn, phone)
     cur = conn.execute(
         "INSERT INTO customers (name, phone, address, credit_limit) VALUES (?,?,?,?)",
         (name.strip(), phone.strip(), address.strip(), credit_limit),
@@ -42,9 +72,23 @@ def add_customer(
     return cur.lastrowid
 
 
+def find_customer_by_phone(conn: sqlite3.Connection, phone: str) -> sqlite3.Row | None:
+    """The primary way a loyalty customer is identified at checkout -
+    exact match only (phone numbers get typed or scanned under time
+    pressure, and a "close enough" fuzzy match risks quietly attaching a
+    sale, and any loyalty-only discount, to the wrong person's account)."""
+    phone = (phone or "").strip()
+    if not phone:
+        return None
+    return conn.execute(
+        "SELECT * FROM customers WHERE active=1 AND name != 'Walk-in' AND phone=?", (phone,)
+    ).fetchone()
+
+
 def update_customer(
     conn: sqlite3.Connection, customer_id: int, name: str, phone: str, address: str, credit_limit: float
 ) -> None:
+    _check_phone_not_taken(conn, phone, exclude_id=customer_id)
     conn.execute(
         "UPDATE customers SET name=?, phone=?, address=?, credit_limit=? WHERE id=?",
         (name.strip(), phone.strip(), address.strip(), credit_limit, customer_id),

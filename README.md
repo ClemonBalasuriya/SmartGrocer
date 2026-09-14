@@ -256,7 +256,321 @@ internet access (couldn't `pip install` anything) and no display/`tkinter`
      sitting next to the Search button - that repositioning shipped in
      the same round as the mousewheel regression, so it went back too.
      Touchpad scrolling being intermittently unreliable in some spots is
-     a known open issue, not fully solved as of this note.
+     a known open issue, not fully solved as of this note. (It's since
+     been solved for real - see the entry below explaining what was
+     actually wrong, which turned out to make the whole premise of this
+     paragraph's `_on_global_mousewheel` fix incorrect too.)
+   - **Touchpad/wheel scrolling over the sidebar nav list and the POS
+     screen's body reported as still not working at all**, even after two
+     rounds of hardening `_on_global_mousewheel` itself (trying every
+     known private attribute name for the scrollable frame's internal
+     canvas instead of just one, and reading the widget under the pointer
+     from `event.widget` instead of re-deriving it from raw screen
+     coordinates - both real, defensible hardening, neither one wrong,
+     and neither one the actual bug). Checking CustomTkinter's own current
+     source directly (`ctk_scrollable_frame.py` on its GitHub repo, rather
+     than continuing to guess) turned up the real cause: **this app's own
+     "fix" was the bug**.
+     CustomTkinter's `CTkScrollableFrame` already registers its own
+     `self.bind_all("<MouseWheel>", self._mouse_wheel_all, add=True)`
+     inside its own `__init__` - one per instance - and `_mouse_wheel_all`
+     already walks up from whatever widget the event landed on to work out
+     whether IT should react (stopping at a CTkScrollbar/CTkSlider/
+     CTkTextbox, which scroll themselves), which already covers scrolling
+     over a button or any other child widget, not just bare background.
+     `customtkinter>=5.2` in `requirements.txt` means this native fix is
+     almost certainly what's actually installed. The assumption an earlier
+     version of this app was built on - that CTkScrollableFrame flatly
+     *can't* scroll over its own children - was true of some past
+     CustomTkinter release, but isn't true of the one actually running
+     here, and nothing had re-checked that assumption since.
+     Working from that (wrong, but reasonable at the time) assumption, an
+     earlier fix added this app's OWN app-wide mousewheel handler,
+     re-applied on a repeating 500ms timer as a defensive measure against
+     "anything else touching the same global slot." That re-apply called
+     `self.bind_all("<MouseWheel>", ...)` with no `add=True` - and
+     Tkinter's `bind_all` without `add` *replaces* the entire list of
+     scripts bound to that event on the `"all"` bindtag, rather than
+     adding to it. Every 500ms, for as long as the app ran, that silently
+     deleted every `CTkScrollableFrame` instance's own already-correct
+     native registration - the sidebar's, the POS screen's, every
+     dialog's - and put only this app's own (redundant, cruder) copy back
+     in its place. The wheel not working wasn't CustomTkinter falling
+     short of what this app needed; it was this app quietly breaking
+     CustomTkinter's own working mechanism, over and over, faster than
+     anything could rely on it - which is also exactly why the two earlier
+     hardening attempts, however sound in isolation, could never have
+     fixed it: neither touched the timer doing the actual damage.
+     Fixed by removing this app's own `_on_global_mousewheel` and its
+     repeating-timer re-apply entirely (`_reassert_scroll_binding`,
+     `smartgrocer/gui/app.py`) rather than patching it to coexist (e.g.
+     adding `add=True` to it too, which would have left both handlers
+     firing for the same scroll, moving the list twice as fast as
+     intended) - once this app stops interfering, CustomTkinter's own
+     native per-instance handling runs unimpeded, which is a more precise
+     mechanism than what this app was reimplementing anyway. The sidebar's
+     ▲/▼ click-to-scroll arrow buttons (a fallback that doesn't depend on
+     wheel events at all) are untouched by this and still work the same
+     way, via the `_find_scroll_canvas()` helper added in the round before
+     this one - kept for that, even though the wheel-handling code it was
+     originally hardening is now gone.
+   - **The real cause of "every screen going and coming" plus crashes**
+     (`No more menus can be allocated`, then
+     `sqlite3.ProgrammingError: Cannot operate on a closed database`):
+     turned out to have nothing to do with scrolling at all, despite the
+     symptom looking identical to the stutter above. When the periodic
+     `_reassert_scroll_binding` method was first added to
+     `smartgrocer/gui/app.py`, the code that used to continue
+     `SmartGrocerApp.__init__` right after that point - building
+     `self.container`, creating all 13 screens, and calling
+     `show_frame("dashboard")` - was accidentally left *inside*
+     `_reassert_scroll_binding`'s own body instead of staying part of
+     `__init__` (Python has no marker for "this new method ends here"
+     other than indentation, and the leftover `__init__` code sat at the
+     same indent with no `def` between them, so it silently became part
+     of the new method). Since `_reassert_scroll_binding` re-runs itself
+     every fraction of a second forever via `self.after(...)`, the
+     *entire app* - every screen, every widget - was being torn down and
+     rebuilt from scratch that often, which is what looked like the
+     window flickering/disappearing, exhausted Tcl's menu-handle limit
+     (each rebuild made new option-menu widgets without the old ones ever
+     being freed), and eventually tried to use the database connection
+     after it had been closed. Fixed by moving `__init__`'s tail end back
+     into `__init__` where it belongs and leaving
+     `_reassert_scroll_binding` as its own small, separate method -
+     verified with `ast.parse`/`ast.walk` (checking method boundaries and
+     that no method name is duplicated), `py_compile`, and the full test
+     suite (39/39). If the app ever seems to rebuild itself repeatedly
+     again, check for this same class of mistake first: a `def` inserted
+     into the middle of another method without confirming the *rest* of
+     the original method is still attached to the right one.
+   - **POS search box moved to the bottom of the screen**, next to its
+     own results list, instead of sitting above the Price
+     tier/Payment/Customer/Cashier row - it's used far more often than
+     those settings, so it now sits right where its results and the Qty
+     row already are. Two search improvements came with the move:
+     - **Category filter**: a "Category:" dropdown next to the search box
+       (`pos.list_categories`, reading distinct values straight out of
+       `products.category` - there's no separate categories table) narrows
+       results to one category, in addition to the existing
+       code/English-name/Sinhala-name matching.
+     - **Live search-as-you-type**: results now update after every
+       keystroke (`POSScreen._on_search_changed`, wired via
+       `self.search_var.trace_add("write", ...)`), not only after
+       pressing Enter or clicking "Search" - typing "ric" starts showing
+       matching items immediately, and the results box already scrolls
+       (it's a `Treeview` from `make_treeview`) once more than 5 rows
+       match. Scanning a full barcode (or pressing Enter/clicking
+       "Search" with one typed in) still works exactly as before: an
+       exact code match skips the list entirely and goes straight into
+       the cart.
+   - **Phone-camera barcode misreads**: scanning the same physical barcode
+     with "Scan with Phone" could occasionally add a *different* product
+     than the one just scanned, because a single camera frame can
+     misdecode (motion blur, glare, the barcode half out of frame) into a
+     different but still valid-looking code. Fixed in
+     `smartgrocer/mobile_scan.py`: the **live camera** mode (continuous
+     frames while the phone's camera is pointed at items) now requires
+     the same decoded code on two consecutive frames, about a quarter
+     second apart, before accepting it - a genuine scan reads the same
+     code twice in a row essentially always, while a misread on one frame
+     almost never repeats immediately on the next. The one-photo-per-item
+     fallback (used when the browser can't do live camera, e.g. some
+     iPhone/Safari cases) is unaffected and still accepts its single
+     photo immediately, since there's no second frame to compare it
+     against there.
+   - **Long dropdown lists couldn't scroll**: CustomTkinter's own
+     `CTkOptionMenu` dropdown has no scrollbar - past a certain number of
+     values it just becomes a stack of buttons taller than the screen,
+     with entries at the bottom unreachable. Fine for a short, fixed list
+     (price tier, payment method), but every dropdown that grows with your
+     data - the new Category filter, POS's Customer selector, the
+     Product/Supplier pickers in Receive Stock, the Staff picker in
+     Login/Forgot PIN, and the Staff filter on Reports - would eventually
+     hit this as the shop's catalog/customer/staff lists grow. Replaced
+     all of those (only those - the short fixed ones are untouched) with
+     a new `SearchableDropdown` (`smartgrocer/gui/screens.py`): a small
+     popup with its own scrollable list AND a search box that filters it
+     as you type, which is also just faster than scanning a long list by
+     eye once you have more than a handful of categories/customers/staff.
+   - **Clicking a `SearchableDropdown` list item didn't select it, then a
+     follow-up fix made the list not show up at all**: the popup closed
+     itself as soon as its search box lost keyboard focus - which also
+     happens the instant you click one of its OWN list buttons, so the
+     popup (and the button just clicked) could be destroyed as a side
+     effect of that very click, before the click's own selection had a
+     chance to register. The first fix for this replaced the popup
+     window with a plain frame placed on top of the main window instead,
+     which turned out to render behind/under the rest of the screen in
+     practice - invisible instead of unselectable. Settled on: keep the
+     popup as its own small window (draws on top of everything reliably,
+     regardless of the app's own widget stacking), but decide when to
+     close it by checking what was actually clicked (walking up from the
+     clicked widget to see whether it's part of the popup) instead of by
+     watching focus - a click on the popup's own buttons is now correctly
+     left alone, only a click genuinely outside it closes it. Also forces
+     real OS-level focus onto the popup the moment it opens
+     (`popup.focus_force()`), since a brand-new window's first click can
+     otherwise just activate the window instead of reaching the widget
+     under the cursor.
+   - **Mousewheel/trackpad scrolling didn't work inside a
+     `SearchableDropdown`'s list**: the app-wide mousewheel handler
+     (`SmartGrocerApp._on_global_mousewheel`) finds whatever's under the
+     cursor with `winfo_containing()`, which doesn't reliably see into an
+     override-redirect popup window like this one's - so it never found
+     the list to scroll it. A first attempt bound the wheel directly on
+     the popup itself instead, which still didn't scroll (CustomTkinter's
+     `CTkScrollableFrame`, used for the list, reimplements scrolling on
+     its own canvas in a way that turned out not to respond reliably
+     inside a standalone popup window either). Settled on replacing that
+     scrollable frame with a plain `ttk.Treeview` instead - a native Tk
+     widget with mousewheel scrolling built in by Tk itself, no custom
+     event wiring needed, which is exactly what every other scrollable
+     list in this app (`make_treeview`) already relies on.
+     Even that didn't scroll by wheel - only by dragging the scrollbar
+     itself, which pointed at the popup window ITSELF rather than
+     anything inside it: it used `overrideredirect(True)` for a clean,
+     borderless "dropdown" look, and on Windows a window shown that way
+     never gets real window-manager focus/activation. Clicking still
+     worked regardless (Windows routes clicks by cursor position), but
+     mouse-wheel input is routed by which window currently has focus -
+     which this kind of window can never actually get, so the wheel
+     event never reached anything inside it no matter what was bound
+     where. Replaced `overrideredirect(True)` with `-toolwindow`
+     (Windows-only; ignored elsewhere) - a real, window-manager-owned
+     window with just a slim title bar and no taskbar entry, which
+     should let it receive focus, and with it, wheel input, normally.
+   - **Once wheel scrolling worked, it felt too slow**: Tk's own default
+     wheel handling for a `ttk.Treeview` moves it only one row per wheel
+     notch, noticeably slower than normal scrolling elsewhere in Windows
+     (most apps move 3+ lines per notch, matching the Windows mouse
+     setting for it). A handler bound directly on the list widget itself
+     now scrolls 3 rows per notch instead (scaling up further for a fast
+     flick of a high-resolution wheel) and suppresses Tk's own slower
+     default so the two don't both fire and scroll twice.
+   - **A `SearchableDropdown` popup didn't say what it was, and looked
+     different from the rest of the app's popups**: it now takes a
+     `label` (each call site names its own - "Category", "Customer",
+     "Product", "Supplier", "Staff") shown both as the popup's own window
+     title and as a small header inside it (the title bar alone is easy
+     to miss, being slim by design - see the `-toolwindow` note above).
+     Its background also now matches the same light background the
+     app's other popup dialogs (Login, Receive Stock, ...) use directly
+     on the dialog window itself, rather than a separate white bordered
+     "card" that looked visually different from them.
+   - **That fix then showed the same name twice** (the OS title bar text
+     plus the bold header inside the popup, right underneath it): the
+     title bar text is now blank (`popup.title("")`), leaving the bold
+     in-popup header as the one and only name shown. (A plain "x" was
+     also added next to that header at this point, as a second way to
+     close the popup - removed again a few fixes later; see the last
+     entry below.)
+   - **A few different attempts at making click-outside-to-close fully
+     reliable made things worse instead of better, and are worth recording
+     so nobody re-tries the same dead ends**: the click-based detection
+     below (walking up from whatever was actually clicked) was, at one
+     point, swapped out for closing the popup whenever it lost Windows
+     window focus - first via Tk's `<Deactivate>` event, then also by
+     polling `focus_get()` every 200ms as a fallback for switching to a
+     different application entirely, on the theory that Windows can
+     swallow a click for window-activation without ever handing it to Tk
+     as a real click event. In practice, on this machine, that approach
+     made the popup read its OWN brand-new-window setup as an instant
+     loss of focus, closing itself a moment after every single open - the
+     box would "pop up and go" before it could be used at all, a far
+     worse bug than occasionally needing a second click to close it. A
+     separate attempt at the same time to also strip Windows' native
+     close button via a direct Win32 API call turned out to risk
+     corrupting the popup's own on-screen rendering, since CustomTkinter
+     already does similar low-level window-style work of its own for
+     that same window. Both of those have been fully reverted - no
+     `<Deactivate>` binding, no focus polling, no raw Win32 calls
+     anywhere in `SearchableDropdown` - back to the simpler mechanism
+     below, which has none of these failure modes because it only ever
+     reacts to an actual click event, never to window-focus timing.
+   - **Two close buttons showing at once**: the plain in-app "x" added a
+     few fixes back (next to the bold header) and Windows' own native
+     title-bar close button both did the same thing, side by side. Since
+     removing the native one natively risked breaking the popup's own
+     rendering (the entry above), the in-app one was the one dropped
+     instead - the popup now has exactly one close button (Windows' own,
+     in its title bar), on top of clicking away and Escape.
+   - **That native close button didn't actually go through this app's own
+     closing logic**: clicking it just let Tk's default window-close
+     handling destroy the popup directly, never calling `_close_popup()`
+     - unlike clicking away, pressing Escape, or re-clicking the dropdown
+     button, all of which do. Harmless for the popup itself (later checks
+     already treat a destroyed popup as "gone"), but it meant the
+     click-outside `<Button-1>` binding that `_close_popup()` is
+     responsible for removing never got removed that way, staying
+     attached to the whole app after the popup was already gone. Fixed by
+     wiring the window's close button, via `popup.protocol("WM_DELETE_WINDOW", self._close_popup)`,
+     to the exact same `_close_popup()` every other way of closing it
+     already uses - one cleanup path for all of them, instead of one path
+     with an exception.
+
+## Loyalty customers, membership scanning & offers
+
+Requested directly by the shop: tell a "loyal" (registered) customer apart
+from an anonymous walk-in at checkout, identify them by phone number or a
+scannable card, show when an item's price includes a discount, and let
+staff set up offers that are either for everyone or for loyalty members
+only - without needing a second physical scanner for customers versus
+products.
+
+- **What makes someone a "loyalty member"**: registering them at all
+  (`customers.add_customer`, from the Customers screen or on the spot at
+  checkout) - there's no separate opt-in step. The one exception is the
+  seeded "Walk-in" customer used for anonymous cash sales, which is not a
+  real registration and never counts (`customers.is_loyalty_member`).
+- **One scan channel for both products and customers, not two**: a
+  customer's membership QR encodes `"SGCUST:" + their member_code`
+  (`customers.member_qr_payload`), so it's told apart from a plain product
+  barcode by that prefix alone (`customers.member_code_from_scan`) -
+  wherever scanned text can land (the POS search box, the always-on Phone
+  Scanner, the dedicated "Scan Card" button), it's checked for that prefix
+  first and routed to identifying a customer instead of searching the
+  catalog. This is exactly why a QR (not a plain barcode) was used for
+  membership: a plain 1D barcode has no room for a distinguishing prefix
+  and would be genuinely ambiguous with a product code read by the same
+  1D scanner, whereas a QR's payload is arbitrary text either way. A
+  standard 1D laser barcode scanner (most shops' existing hardware) cannot
+  read a QR code at all - it needs a 2D imager scanner or, as built here,
+  a phone camera (`mobile_scan.py`'s existing phone-as-scanner feature,
+  reused for this rather than building a second one).
+- **Offers** (`offers.py`, `offers` table, Offers screen) are a manual,
+  staff-created list - deliberately separate from `promotions.py`'s
+  automatic near-expiry clearance suggestions, which only ever *suggest* a
+  discount and never apply one to a sale. An offer targets one product or
+  a whole category, is scoped to "everyone" or "loyalty members only", and
+  can have an optional start/end date. Applied automatically the moment an
+  item is added to the cart (and re-checked whenever the selected customer
+  changes, since a loyalty-only offer switches on/off with them) via
+  `offers.line_discount_amount`, which is stored as `pos.CartLine.discount`
+  - already a first-class, flat-currency-per-line field `create_invoice`
+  understood before any of this, just never populated by the GUI until
+  now. Where two offers could both apply, the single biggest discount
+  wins, never the smaller one.
+- **Membership codes are also just typeable**: every registered customer
+  gets a short human-readable code (`"SG-XXXXXX"`) as well as the QR, so a
+  cashier can identify them by typing it in (or the phone number) if a
+  scan fails or nothing's at hand.
+- **Sending the membership code to a customer's phone**: SMS/WhatsApp
+  (via the Twilio setup `notifications.py` already supports for staff
+  alerts) can text the plain membership *code*, but deliberately does NOT
+  attempt to send the scannable QR *image* - Twilio (or any SMS/MMS/
+  WhatsApp provider) needs to fetch an image from a public HTTPS URL, and
+  this PC, sitting on the shop's own LAN, isn't reachable from the public
+  internet without extra networking work (port-forwarding, a public
+  hostname, etc.) well outside the scope of a POS till. The reliable way
+  to get a customer the actual scannable QR is the on-screen display right
+  after registering, or the printable card built from it - both work with
+  nothing extra to set up.
+- **Existing databases upgrade in place**: `db._migrate` adds the new
+  `member_code` column and backfills a code for every real customer
+  already on file (never "Walk-in"), the same pattern used for every
+  earlier schema change in this project - a shop's existing customer/sale
+  history is never at risk from this update.
 
 ## Packaging as a standalone Windows .exe
 

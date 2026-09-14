@@ -22,7 +22,7 @@ import ssl
 
 from smartgrocer import (
     association, cash_drawer, customers, data_generator, db, forecasting, layout, mobile_scan, netclient,
-    netserver, pos, promotions, receipts, reports, staff, suppliers,
+    netserver, offers, pos, promotions, receipts, reports, staff, suppliers,
 )
 
 
@@ -918,6 +918,158 @@ def test_receipt_text_includes_key_fields():
     assert result.invoice_no in text
     assert p["name_en"][:22] in text
     assert f"{result.net_total:.2f}" in text
+
+
+def test_walk_in_is_not_a_loyalty_member_but_a_registered_customer_is():
+    conn = _fresh_db()
+    walk_in = conn.execute("SELECT * FROM customers WHERE name='Walk-in'").fetchone()
+    assert not customers.is_loyalty_member(walk_in)
+    assert not customers.is_loyalty_member(None)
+
+    cid = customers.add_customer(conn, "Loyalty Person", phone="0771234567")
+    member = customers.get_customer(conn, cid)
+    assert customers.is_loyalty_member(member)
+
+
+def test_phone_number_is_the_loyalty_id_and_must_be_unique():
+    """A customer's phone number IS their loyalty ID (see customers.py) -
+    typed in at checkout to find them by name, so two active customers
+    sharing one number would make a lookup ambiguous."""
+    conn = _fresh_db()
+    cid1 = customers.add_customer(conn, "Person One", phone="0711111111")
+    customers.add_customer(conn, "Person Two", phone="0722222222")
+
+    assert customers.find_customer_by_phone(conn, "0711111111")["id"] == cid1
+    assert customers.find_customer_by_phone(conn, "0000000000") is None
+    # Walk-in itself must never be findable by "phone" - it has none, and
+    # even if it did, it isn't a real loyalty account.
+    assert customers.find_customer_by_phone(conn, "") is None
+
+    # Registering a second customer with an already-taken number is rejected...
+    try:
+        customers.add_customer(conn, "Person Three", phone="0711111111")
+        assert False, "should have rejected a duplicate phone number"
+    except ValueError:
+        pass
+    # ...as is editing someone else's number to collide with it...
+    cid3 = customers.add_customer(conn, "Person Three", phone="0733333333")
+    try:
+        customers.update_customer(conn, cid3, "Person Three", "0711111111", "", 0)
+        assert False, "should have rejected a duplicate phone number"
+    except ValueError:
+        pass
+    # ...but a customer keeping their own number when saving other edits is fine.
+    customers.update_customer(conn, cid1, "Person One Renamed", "0711111111", "", 0)
+    assert customers.get_customer(conn, cid1)["name"] == "Person One Renamed"
+
+
+def test_offer_scoped_to_loyalty_only_applies_to_registered_customers():
+    conn = _fresh_db()
+    p = _product_with_stock(conn, min_qty=5)
+    offers.add_offer(conn, "Members-only Milk Deal", 20, product_id=p["id"], scope=offers.SCOPE_LOYALTY)
+
+    pct_loyalty, name = offers.best_discount_pct(conn, p["id"], p["category"], is_loyalty=True)
+    assert pct_loyalty == 20
+    assert name == "Members-only Milk Deal"
+
+    pct_walkin, name_walkin = offers.best_discount_pct(conn, p["id"], p["category"], is_loyalty=False)
+    assert pct_walkin == 0
+    assert name_walkin is None
+
+
+def test_offer_scoped_to_everyone_applies_regardless_of_loyalty():
+    conn = _fresh_db()
+    p = _product_with_stock(conn, min_qty=5)
+    offers.add_offer(conn, "Everyone Discount", 10, product_id=p["id"], scope=offers.SCOPE_ALL)
+    for is_loyalty in (True, False):
+        pct, name = offers.best_discount_pct(conn, p["id"], p["category"], is_loyalty=is_loyalty)
+        assert pct == 10
+        assert name == "Everyone Discount"
+
+
+def test_category_offer_applies_to_every_product_in_it_and_biggest_discount_wins():
+    conn = _fresh_db()
+    p = _product_with_stock(conn, min_qty=5)
+    offers.add_offer(conn, "Category Wide", 5, category=p["category"], scope=offers.SCOPE_ALL)
+    offers.add_offer(conn, "Bigger Product Deal", 15, product_id=p["id"], scope=offers.SCOPE_ALL)
+    pct, name = offers.best_discount_pct(conn, p["id"], p["category"], is_loyalty=False)
+    assert pct == 15  # the bigger of the two applicable offers wins, never the smaller
+    assert name == "Bigger Product Deal"
+
+
+def test_offer_outside_its_date_window_does_not_apply():
+    conn = _fresh_db()
+    p = _product_with_stock(conn, min_qty=5)
+    from datetime import date as _date, timedelta as _timedelta
+    yesterday = (_date.today() - _timedelta(days=1)).isoformat()
+    last_week = (_date.today() - _timedelta(days=7)).isoformat()
+    offers.add_offer(conn, "Expired Deal", 30, product_id=p["id"], start_date=last_week, end_date=yesterday)
+    pct, name = offers.best_discount_pct(conn, p["id"], p["category"], is_loyalty=True)
+    assert pct == 0
+    assert name is None
+
+
+def test_deactivated_offer_does_not_apply():
+    conn = _fresh_db()
+    p = _product_with_stock(conn, min_qty=5)
+    offer_id = offers.add_offer(conn, "Turned Off", 25, product_id=p["id"])
+    offers.set_active(conn, offer_id, False)
+    pct, name = offers.best_discount_pct(conn, p["id"], p["category"], is_loyalty=True)
+    assert pct == 0
+    assert name is None
+
+
+def test_offer_needs_exactly_one_of_product_or_category():
+    conn = _fresh_db()
+    p = _product_with_stock(conn, min_qty=5)
+    try:
+        offers.add_offer(conn, "Neither", 10)
+        assert False, "expected ValueError with no product/category"
+    except ValueError:
+        pass
+    try:
+        offers.add_offer(conn, "Both", 10, product_id=p["id"], category=p["category"])
+        assert False, "expected ValueError with both product AND category"
+    except ValueError:
+        pass
+
+
+def test_line_discount_amount_flows_through_create_invoice_as_a_flat_amount():
+    """The GUI computes offers.line_discount_amount and stores it on
+    pos.CartLine.discount before calling create_invoice - this checks that
+    round trip end to end, the way POSScreen.checkout actually does it,
+    rather than just testing offers.py in isolation."""
+    conn = _fresh_db()
+    p = _product_with_stock(conn, min_qty=4)
+    offers.add_offer(conn, "Test Discount", 10, product_id=p["id"], scope=offers.SCOPE_ALL)
+
+    unit_price = p["cash_price"]
+    qty = 4.0
+    discount, offer_name = offers.line_discount_amount(conn, p["id"], p["category"], qty, unit_price, False)
+    assert offer_name == "Test Discount"
+    assert abs(discount - round(qty * unit_price * 0.10, 2)) < 0.01
+
+    result = pos.create_invoice(
+        conn, staff_id=1, cart=[pos.CartLine(product_id=p["id"], qty=qty, discount=discount)],
+    )
+    expected_net = round(qty * unit_price - discount, 2)
+    assert abs(result.net_total - expected_net) < 0.01
+    assert abs(result.discount - discount) < 0.01
+
+
+def test_customer_top_items_reflects_only_that_customers_purchases():
+    conn = _fresh_db()
+    p1 = _product_with_stock(conn, min_qty=5)
+    other = conn.execute(
+        "SELECT * FROM products WHERE active=1 AND id != ? ORDER BY id LIMIT 1", (p1["id"],)
+    ).fetchone()
+    cid = customers.add_customer(conn, "Regular Shopper")
+    pos.create_invoice(conn, staff_id=1, cart=[pos.CartLine(product_id=p1["id"], qty=3)],
+                        customer_id=cid, customer_name="Regular Shopper")
+    top = reports.customer_top_items(conn, cid)
+    assert any(r["product_id"] == p1["id"] for r in top)
+    if other is not None:
+        assert not any(r["product_id"] == other["id"] for r in top)  # never bought this one
 
 
 if __name__ == "__main__":
