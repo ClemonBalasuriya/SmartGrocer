@@ -445,6 +445,9 @@ class SuggestionBox:
         # immediately reopen the popup on an empty query. This flag skips
         # that one, single reopen.
         self._suppress_next = False
+        # Pending debounce timer id (see _on_text_changed) - None when no
+        # query is currently scheduled.
+        self._debounce_id: str | None = None
 
         variable.trace_add("write", lambda *_a: self._on_text_changed())
         entry.bind("<Down>", self._focus_list)
@@ -492,8 +495,39 @@ class SuggestionBox:
     def _on_text_changed(self) -> None:
         if self._suppress_next:
             self._suppress_next = False
+            self._cancel_debounce()
             self._close_popup()
             return
+        query = self._variable.get().strip()
+        if len(query) < self._min_chars:
+            self._cancel_debounce()
+            self._close_popup()
+            return
+        # Debounced rather than querying/rendering on every single
+        # keystroke: a barcode scanner "types" a whole code (often 8-13
+        # digits) far faster than anyone could by hand, and each one of
+        # those characters used to run its own synchronous DB query and
+        # popup render right here - a burst of work that visibly lagged
+        # behind the actual, near-instant scan, which is what showed up
+        # as a scan seeming slow to register. Waiting for a short pause
+        # collapses a whole fast-typed/scanned burst into one query.
+        # <Return> (bound separately on the entry, not through this
+        # class at all) always reads the fully-typed value directly and
+        # immediately - so accuracy never depends on whether this timer
+        # has fired yet, only the live preview's snappiness does.
+        self._cancel_debounce()
+        self._debounce_id = self._entry.after(120, self._run_query)
+
+    def _cancel_debounce(self) -> None:
+        if self._debounce_id is not None:
+            try:
+                self._entry.after_cancel(self._debounce_id)
+            except Exception:  # noqa: BLE001 - entry may already be gone during teardown
+                pass
+            self._debounce_id = None
+
+    def _run_query(self) -> None:
+        self._debounce_id = None
         query = self._variable.get().strip()
         if len(query) < self._min_chars:
             self._close_popup()
@@ -581,6 +615,30 @@ class SuggestionBox:
         tree.bind("<Escape>", lambda e: self._close_and_refocus())
         tree.bind("<Up>", self._on_tree_up_from_top)
 
+        # Without its own wheel handler, scrolling over this list did
+        # nothing here and fell straight through to whatever's bound
+        # globally instead - which, on this screen, is the CTkScrollableFrame
+        # the whole POS/Checkout page sits in (CustomTkinter wires that up
+        # with bind_all, which really does mean EVERY widget in the app,
+        # popups included, not just its own frame). So scrolling this
+        # dropdown scrolled the page underneath it at the same time. Same
+        # fix as SearchableDropdown's own list above: handle the wheel here
+        # and "break" so it stops right here instead of reaching bind_all.
+        def _popup_scroll(event):
+            if getattr(event, "num", None) == 4:
+                units = -3
+            elif getattr(event, "num", None) == 5:
+                units = 3
+            else:
+                notches = int(event.delta / 120) or (1 if event.delta > 0 else -1)
+                units = -3 * notches
+            tree.yview_scroll(units, "units")
+            return "break"
+
+        tree.bind("<MouseWheel>", _popup_scroll)
+        tree.bind("<Button-4>", _popup_scroll)  # Linux scroll up
+        tree.bind("<Button-5>", _popup_scroll)  # Linux scroll down
+
         popup.deiconify()
 
         # Showing a brand-new Toplevel window can itself steal the actual
@@ -639,6 +697,15 @@ class SuggestionBox:
         self._close_popup()
         self._entry.focus_set()
         self._on_select(payload)
+
+    def close(self) -> None:
+        """Force this box's popup shut right now, regardless of why -
+        <Return> in the entry deliberately isn't wired to anything in this
+        class (see the class docstring), so a caller that commits on Enter
+        needs to close a still-open popup itself rather than leaving it
+        sitting there looking like it's still offering choices after the
+        typed/scanned code has already been accepted."""
+        self._close_popup()
 
     def suppress_next_change(self) -> None:
         """Call this immediately before anything OUTSIDE this box's own
@@ -708,6 +775,12 @@ class SuggestionBox:
         self._entry.focus_set()
 
     def _close_popup(self) -> None:
+        # Also cancels any debounced query still waiting to fire (see
+        # _on_text_changed) - otherwise a deliberate close via Escape,
+        # clicking away, or picking a suggestion could get silently
+        # reopened ~120ms later by a stale timer left over from
+        # whatever was typed just before the close.
+        self._cancel_debounce()
         popup, self._popup = self._popup, None
         if self._global_click_bound:
             try:
@@ -760,20 +833,45 @@ class BaseScreen(ctk.CTkFrame):
         lbl.pack(anchor="w", padx=24, pady=(20, 12))
 
     def _open_phone_capture_dialog(self, on_captured, *, title="Scan Barcode with Phone",
-                                    instruction="Scan the product's barcode"):
-        """Open a small phone-scanner dialog whose only job is to capture
-        one barcode/QR code and hand the decoded text to on_captured(code)
-        - used to fill in a text field (like the new-product barcode field
-        in Inventory, or the search box in POS) from the phone's camera.
-        Reuses the same background server the till's own Phone Scanner
-        feature uses (POSScreen.open_phone_scanner_dialog), so if that's
-        already running for cart scanning, this borrows it for one scan
-        and hands it back exactly as it was - the till keeps working
-        normally either way. Lives on BaseScreen (not just one screen)
-        since any screen with a barcode-ish field can use it - `title`/
-        `instruction` let a caller scanning something other than a product
-        (a customer's membership QR, say) say so instead of the default
-        product-barcode wording."""
+                                    instruction="Scan the product's barcode", continuous=False,
+                                    on_closed=None):
+        """Open a small phone-scanner dialog that hands decoded barcode/QR
+        text to on_captured(code) - used to fill in a text field (like the
+        new-product barcode field in Inventory, or the search box in POS)
+        from the phone's camera. Reuses the same background server the
+        till's own Phone Scanner feature uses (POSScreen.open_phone_scanner_
+        dialog), so if that's already running for cart scanning, this
+        borrows it and hands it back exactly as it was - the till keeps
+        working normally either way. Lives on BaseScreen (not just one
+        screen) since any screen with a barcode-ish field can use it -
+        `title`/`instruction` let a caller scanning something other than a
+        product (a customer's membership QR, say) say so instead of the
+        default product-barcode wording.
+
+        continuous=False (the default) is the original one-shot behaviour:
+        capture exactly one code, hand it to on_captured, and close. Some
+        callers want to add a whole run of items one after another without
+        re-opening this each time (Inventory's "Add / Scan Item" bulk-add
+        flow, say) - continuous=True keeps this dialog open and calls
+        on_captured(code) for EVERY scan instead, showing a running "Last
+        scanned" line so the cashier can see each one land without looking
+        away from the phone. Either way, this returns a restore() function
+        - safe to call more than once, and safe even after this popup
+        already closed itself - that gives the phone scanner's on_scan
+        handler back and closes this popup if it's still open. A caller
+        using continuous=True should call the returned restore() from ITS
+        OWN close handler too (not just rely on this popup's own Done
+        button), so that a scan arriving after the CALLER's own fields are
+        gone can't try to act on them.
+
+        on_closed, if given, fires exactly once, however this popup ends up
+        closing (its own Done button, its window-close X, or the caller
+        invoking the returned restore() itself) - a continuous=True caller
+        that released its OWN window's modal grab to let this popup and its
+        window both be clickable at once (see start_phone_scan in
+        open_add_product_dialog for why that's needed) uses this to grab
+        its window back the moment this one goes away, rather than leaving
+        the caller's window stuck non-modal forever after."""
         if getattr(self.app, "mobile_scan_server", None) is None:
             self.app.mobile_scan_server = mobile_scan.MobileScanServer(lambda code: {"unknown": True})
         server = self.app.mobile_scan_server
@@ -782,7 +880,12 @@ class BaseScreen(ctk.CTkFrame):
                 server.start()
             except OSError as e:
                 messagebox.showerror("Could not start phone scanner", str(e))
-                return
+                if on_closed is not None:
+                    try:
+                        on_closed()
+                    except Exception:
+                        pass
+                return lambda: None
 
         previous_on_scan = server.on_scan
         state = {"restored": False}
@@ -791,20 +894,59 @@ class BaseScreen(ctk.CTkFrame):
             if not state["restored"]:
                 state["restored"] = True
                 server.on_scan = previous_on_scan
+                if on_closed is not None:
+                    try:
+                        on_closed()
+                    except Exception:
+                        pass
+            try:
+                dialog.destroy()
+            except Exception:
+                pass  # already closed (or never got this far) - nothing to clean up
 
         def captured(code):
-            restore()
-            self.after(0, lambda: (on_captured(code), dialog.destroy()))
+            if continuous:
+                self.after(0, lambda: (
+                    on_captured(code),
+                    last_scanned_label.configure(text=f"✓ Scanned: {code}", text_color=theme.SUCCESS_GREEN),
+                ))
+            else:
+                restore()
+                self.after(0, lambda: on_captured(code))
             return {"name": code, "added": True}
 
         server.on_scan = captured
 
         dialog = ctk.CTkToplevel(self)
         dialog.title(title)
-        fit_dialog(dialog, 400, 620)
+        fit_dialog(dialog, 400, 660 if continuous else 620)
         dialog.configure(fg_color=theme.BG_LIGHT)
-        dialog.grab_set()
-        dialog.protocol("WM_DELETE_WINDOW", lambda: (restore(), dialog.destroy()))
+        if not continuous:
+            # One-shot capture (e.g. POS's search box, or Inventory before
+            # continuous mode existed): the window this fills in is closed
+            # or out of focus anyway the instant a code lands, so a modal
+            # grab here was harmless.
+            #
+            # continuous=True is different, and grabbing here was an
+            # actual bug, not just an inconvenience: this popup is meant
+            # to stay open across a WHOLE RUN of scans (see the docstring
+            # above), and the caller's own window is what shows each
+            # scanned item's Save/Add-Stock button and its quantity/detail
+            # fields - grab_set() made THIS popup the only clickable
+            # window on screen, so there was no way to actually click that
+            # Save button without closing this one first. That's exactly
+            # the "every item I have to link the phone again" complaint -
+            # closing this to click Save, then reopening "Scan with Phone"
+            # (which shows the link screen again, even though it's really
+            # the same still-running connection) for every single item.
+            # Leaving this non-modal, like the till's own always-open
+            # phone-scanner dialog (open_phone_scanner_dialog) already
+            # does for the same reason, lets both windows stay up at once:
+            # click the popup to scan the next item, click the caller's
+            # window to fill in details and hit Save, without ever closing
+            # either one until "Done".
+            dialog.grab_set()
+        dialog.protocol("WM_DELETE_WINDOW", restore)
 
         body = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
         body.pack(fill="both", expand=True)
@@ -829,16 +971,35 @@ class BaseScreen(ctk.CTkFrame):
         ctk.CTkLabel(body, text="Pairing code:", text_color=theme.TEXT_MUTED, font=ctk.CTkFont(size=11)).pack()
         ctk.CTkLabel(body, text=server.pairing_code, font=ctk.CTkFont(size=28, weight="bold"),
                      text_color=theme.NAVY_DARK).pack(pady=(2, 12))
+
+        if continuous:
+            last_scanned_label = ctk.CTkLabel(body, text="Nothing scanned yet.",
+                                               font=ctk.CTkFont(size=12, weight="bold"),
+                                               text_color=theme.TEXT_MUTED)
+            last_scanned_label.pack(pady=(0, 4))
+            main_instruction = ("Point the camera at each item's barcode in turn - every one you "
+                                 "scan fills it in and checks the catalog automatically, without "
+                                 "coming back to this screen. Keep going through as many items as "
+                                 "you like; tap Done below when you're finished scanning.")
+        else:
+            main_instruction = ("Point the camera at the barcode - it fills in the field "
+                                 "automatically as soon as it's read, and this window closes on "
+                                 "its own.")
+
         ctk.CTkLabel(
             body,
-            text="Point the camera at the barcode - it fills in the field automatically as "
-                 "soon as it's read, and this window closes on its own. (First-time on a new "
-                 "phone: it'll show a one-time \"Connection not private\" warning - tap "
-                 "Advanced/Show Details then Proceed/visit this website.)",
+            text=main_instruction +
+                 " (First-time on a new phone: it'll show a one-time \"Connection not private\" "
+                 "warning - tap Advanced/Show Details then Proceed/visit this website. Also, if "
+                 "Windows pops up a Firewall permission prompt the first time this runs on this "
+                 "PC - it can appear behind this window - click \"Allow access\": until it's "
+                 "allowed, the phone can't connect at all. Only needed once, ever.)",
             text_color=theme.TEXT_MUTED, font=ctk.CTkFont(size=11), wraplength=340, justify="left",
         ).pack(padx=20, pady=(0, 14))
 
-        styled_button(dialog, "Cancel", lambda: (restore(), dialog.destroy()), kind="secondary", width=140).pack(pady=(0, 16))
+        styled_button(dialog, "Done" if continuous else "Cancel", restore, kind="secondary", width=140).pack(pady=(0, 16))
+
+        return restore
 
 
 # --------------------------------------------------------------------------- #
@@ -988,7 +1149,12 @@ def prompt_split_payment(parent, total: float) -> list[tuple[str, float]] | None
 class POSScreen(BaseScreen):
     def __init__(self, parent, app):
         super().__init__(parent, app)
-        self.header("POS / Checkout")  # stays fixed at the top, outside the scrollable area below
+        # A custom header row instead of the plain self.header(...) other
+        # screens use.
+        header_row = ctk.CTkFrame(self, fg_color="transparent")
+        header_row.pack(fill="x", padx=24, pady=(20, 12))
+        ctk.CTkLabel(header_row, text="POS / Checkout", font=ctk.CTkFont(size=22, weight="bold"),
+                     text_color=theme.NAVY_DARK).pack(side="left")
         self.cart: list[dict] = []
 
         # Everything below goes in a scrollable frame, not straight into
@@ -1022,7 +1188,11 @@ class POSScreen(BaseScreen):
         # Live-as-you-type: fires on every keystroke (not just Enter/Search),
         # so the results list below fills in with whatever matches the
         # letters typed so far - a cashier doesn't have to finish typing or
-        # press anything to see candidates.
+        # press anything to see candidates. Debounced (see
+        # _on_search_changed) rather than querying on every single
+        # keystroke, since a barcode scanner "types" a whole code far
+        # faster than anyone could by hand.
+        self._search_debounce_id: str | None = None
         self.search_var.trace_add("write", lambda *a: self._on_search_changed())
         # Remembers that this box had the cursor last, out of every input
         # on this screen a scan could plausibly land in - see
@@ -1058,6 +1228,23 @@ class POSScreen(BaseScreen):
         # typing a letter) so it narrows/filters what's already been typed,
         # rather than waiting for another keystroke.
         self.category_var.trace_add("write", lambda *a: self._on_search_changed())
+
+        # A quiet, inline "not found" line rather than a popup - a popup
+        # is a modal dialog that steals the keyboard/mouse until it's
+        # dismissed, which is fine for one deliberate lookup but brings a
+        # continuous scanning session (a USB/BT gun, or the linked phone
+        # scanner - either one can send several codes a minute with
+        # nobody touching the keyboard between them) to a dead stop the
+        # moment ONE scanned code doesn't match anything: every scan after
+        # that just piles up behind the dialog instead of registering,
+        # which is exactly what "can't scan continuously" looks like from
+        # the till. This label says the same thing without blocking
+        # anything - the next scan a moment later just works.
+        self.search_status_label = ctk.CTkLabel(
+            body, text="", text_color=theme.DANGER_RED, font=ctk.CTkFont(size=11),
+            wraplength=560, justify="left",
+        )
+        self.search_status_label.pack(fill="x", padx=24, pady=(2, 0), anchor="w")
 
         results_frame = ctk.CTkFrame(body, fg_color="transparent")
         results_frame.pack(fill="x", padx=24, pady=(6, 0))
@@ -1249,6 +1436,30 @@ class POSScreen(BaseScreen):
             row=1, column=2, padx=(16, 0), sticky="w")
         styled_button(add_item_row, "Add", self._add_item_from_whichever_box_has_text, kind="primary").grid(
             row=1, column=3, padx=(8, 0), sticky="w")
+
+        # Same reasoning as search_status_label above - a "not found" here
+        # is exactly as likely to come from a continuous scanning session
+        # as the top search box is (this pair is what a scan lands in
+        # once the cashier's already clicked into one of them for this
+        # sale), so it gets the same non-blocking treatment instead of a
+        # popup that would stop every scan after it cold.
+        self.cart_add_status_label = ctk.CTkLabel(
+            add_item_row, text="", text_color=theme.DANGER_RED, font=ctk.CTkFont(size=11),
+            wraplength=560, justify="left",
+        )
+        self.cart_add_status_label.grid(row=2, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        # add_item_by_barcode/add_item_by_name only clear this label when
+        # THEY run (Enter, the Add button, or a scan landing here) - typing
+        # or deleting text without triggering either of those (e.g.
+        # clearing the box by hand after a "Not found" line appeared, or
+        # just backspacing it out) left a stale message sitting there with
+        # nothing left in the box to explain it, reported directly. These
+        # traces clear it on every change to either box - typed, deleted,
+        # or a suggestion picked - same as search_var's own trace already
+        # does for search_status_label above; no debounce needed since
+        # clearing a label is free, unlike that box's live results query.
+        self.cart_add_barcode_var.trace_add("write", self._on_cart_add_changed)
+        self.cart_add_name_var.trace_add("write", self._on_cart_add_changed)
 
         # fill="both" WITHOUT expand=True: inside a CTkScrollableFrame,
         # "expand" fights with the scrollbar's own idea of how tall the
@@ -1502,7 +1713,8 @@ class POSScreen(BaseScreen):
                 "Register them now?",
             ):
                 return
-            row = open_customer_registration_dialog(self, self.conn, prefill_phone=phone)
+            row = open_customer_registration_dialog(
+                self, self.conn, prefill_phone=phone, allow_credit_limit=self._is_admin())
             if row is None:
                 return  # cashier cancelled the registration dialog
 
@@ -1671,6 +1883,23 @@ class POSScreen(BaseScreen):
         if getattr(self.app, "mobile_scan_server", None) is None:
             self.app.mobile_scan_server = mobile_scan.MobileScanServer(self.handle_phone_scan)
         server = self.app.mobile_scan_server
+        # The background scanner server is shared by the whole app (one
+        # phone, one connection, whichever screen is using it) - Inventory's
+        # "Add / Scan Item" -> "Scan with Phone" (and any other screen using
+        # _open_phone_capture_dialog) borrows it for a while and points
+        # on_scan at itself, then hands it back when done. If THIS dialog
+        # is opened when the server already existed (created by one of
+        # those screens first, not by POS), the `is None` check above never
+        # runs, so on_scan could still be pointed at whatever that other
+        # screen left it as (its own placeholder, say) instead of this
+        # screen's handle_phone_scan - a scan would silently do nothing at
+        # all here (no fill-in for search/add-by-barcode, nothing routed by
+        # _route_scanned_code) with no error shown anywhere, exactly the
+        # "linked but scanning doesn't do anything here anymore" symptom
+        # reported. Setting it here unconditionally, every time this dialog
+        # opens, makes the till reclaim its own scanner regardless of what
+        # any other screen did with it beforehand.
+        server.on_scan = self.handle_phone_scan
         if not server.running:
             try:
                 server.start()
@@ -1740,7 +1969,15 @@ class POSScreen(BaseScreen):
                  "problem: it's this PC talking to your phone directly, not the "
                  "internet. On Android/Chrome tap Advanced, then \"Proceed\". On "
                  "iPhone/Safari tap Show Details, then \"visit this website\". You "
-                 "only need to do this once per phone.",
+                 "only need to do this once per phone.\n\n"
+                 "Also, the FIRST time this Phone Scanner screen is opened on this "
+                 "PC, Windows itself may pop up \"Windows Defender Firewall has "
+                 "blocked some features of this app\" (it may appear behind this "
+                 "window - check the taskbar if nothing seems to happen). Click "
+                 "\"Allow access\", with both Private and Public networks ticked. "
+                 "Until that's allowed, the phone can't reach this PC at all, and "
+                 "every scan attempt will simply fail to connect no matter how good "
+                 "the barcode looks - this only needs doing once, ever, on this PC.",
             text_color=theme.TEXT_DARK, font=ctk.CTkFont(size=11), wraplength=320, justify="left",
         ).pack(padx=12, pady=10)
 
@@ -1777,7 +2014,40 @@ class POSScreen(BaseScreen):
         "Search". No popup here even when nothing matches yet - a popup on
         every keystroke while someone is still mid-word would be unusable;
         do_search (Enter/Search/scanner) still shows one when a *finished*
-        search comes up empty."""
+        search comes up empty.
+
+        Debounced rather than querying/rebuilding the results table on
+        every single keystroke: a barcode scanner "types" a whole code
+        (often 8-13 digits) far faster than anyone could by hand, and each
+        one of those characters used to run its own synchronous DB query
+        and full table rebuild right here - a burst of work that visibly
+        lagged behind the actual, near-instant scan, which is what showed
+        up as a scan seeming slow to register. <Return> (do_search, bound
+        separately) always reads the fully-typed value directly and
+        immediately, so accuracy never depends on this timer having
+        fired - only the live preview's snappiness does."""
+        self.search_status_label.configure(text="")  # a fresh keystroke/scan retires any stale "not found" line
+        if self._search_debounce_id is not None:
+            try:
+                self.search_entry.after_cancel(self._search_debounce_id)
+            except Exception:  # noqa: BLE001 - widget may already be gone during teardown
+                pass
+        self._search_debounce_id = self.search_entry.after(120, self._run_search_query)
+
+    def _on_cart_add_changed(self, *_args) -> None:
+        """Bound to both cart_add_barcode_var's and cart_add_name_var's
+        write trace - retires any stale "Not found" line under the "Add
+        item" row the moment either box's text changes at all (typing,
+        deleting, a suggestion picked, or a fresh scan overwriting it),
+        the same way _on_search_changed already does for the search box's
+        own status line above. Unlike that one, there's no live results
+        table to keep in sync here - add_item_by_barcode/add_item_by_name
+        only look anything up once, on Enter/the Add button/a scan - so
+        this needs no debounce, it's just clearing a label."""
+        self.cart_add_status_label.configure(text="")
+
+    def _run_search_query(self) -> None:
+        self._search_debounce_id = None
         query = self.search_var.get().strip()
         category = self._selected_category()
         if not query and not category:
@@ -1808,6 +2078,7 @@ class POSScreen(BaseScreen):
         # same as any other search result.
         query = self.search_var.get().strip()
         if not query:
+            self.search_status_label.configure(text="")
             return
 
         self._search_results = pos.search_products(self.conn, query, category=self._selected_category())
@@ -1817,15 +2088,21 @@ class POSScreen(BaseScreen):
             tree_insert(self.results_tree, (p["code"], p["name_en"], f"{p['cash_price']:.2f}", f"{stock:.0f}"),
                         iid=str(p["id"]))
         if not self._search_results:
-            # Previously this failed silently (an empty results box looks
-            # the same as "still typing") - spelling it out, and echoing
-            # back exactly what was searched for, makes a genuine
-            # code/name mismatch obvious immediately rather than the
-            # cashier assuming the scan just didn't register.
-            messagebox.showinfo("Not found", f"No product in the catalog matches '{query}'.\n\n"
-                                 "If you just added this item, check the Inventory screen's Code "
-                                 "column for the exact code that was saved and compare it with what "
-                                 "you're scanning/typing here - they must match exactly.")
+            # Previously this was a popup (messagebox.showinfo) - spelling
+            # this out and echoing back exactly what was searched for
+            # still makes a genuine code/name mismatch obvious rather than
+            # the cashier assuming the scan just didn't register, but a
+            # popup blocks the keyboard/mouse until dismissed, which turns
+            # one unmatched code, mid a continuous USB/BT-scanner or
+            # phone-scanner session, into a dead stop for every scan that
+            # follows it - see search_status_label's own comment above.
+            self.search_status_label.configure(
+                text=f"Not found: '{query}' isn't in the catalog. If you just added this item, check "
+                     "Inventory's Code column for the exact code and compare it with what you're "
+                     "scanning/typing here - they must match exactly.",
+            )
+        else:
+            self.search_status_label.configure(text="")
 
     def add_selected_to_cart(self):
         sel = self.results_tree.selection()
@@ -1855,14 +2132,19 @@ class POSScreen(BaseScreen):
         _route_scanned_code), at this row's shared quantity."""
         code = self.cart_add_barcode_var.get().strip()
         if not code:
+            self.cart_add_status_label.configure(text="")
             return
         qty = self._cart_add_qty()
         if qty is None:
             return
         product = pos.get_product_by_code(self.conn, code)
         if product is None:
-            messagebox.showinfo("Not found", f"No product in the catalog matches barcode '{code}'.")
+            # A quiet inline line, not a popup - see cart_add_status_label's
+            # own comment above for why a blocking dialog here would stall
+            # every scan after this one during a continuous scanning run.
+            self.cart_add_status_label.configure(text=f"Not found: no product matches barcode '{code}'.")
             return
+        self.cart_add_status_label.configure(text="")
         self._add_product_to_cart(product["id"], qty)
         self.cart_add_barcode_var.set("")
         self.cart_add_qty_var.set("1")
@@ -1879,6 +2161,7 @@ class POSScreen(BaseScreen):
         choosing)."""
         query = self.cart_add_name_var.get().strip()
         if not query:
+            self.cart_add_status_label.configure(text="")
             return
         qty = self._cart_add_qty()
         if qty is None:
@@ -1886,14 +2169,18 @@ class POSScreen(BaseScreen):
 
         matches = pos.search_products(self.conn, query, category=self._selected_category())
         if len(matches) == 1:
+            self.cart_add_status_label.configure(text="")
             self._add_product_to_cart(matches[0]["id"], qty)
             self.cart_add_name_var.set("")
             self.cart_add_qty_var.set("1")
             self.cart_add_name_entry.focus_set()
             return
         if not matches:
-            messagebox.showinfo("Not found", f"No product in the catalog matches '{query}'.")
+            # Quiet inline line rather than a popup - same reasoning as
+            # add_item_by_barcode just above.
+            self.cart_add_status_label.configure(text=f"Not found: no product matches '{query}'.")
             return
+        self.cart_add_status_label.configure(text="")
 
         self.search_var.set(query)
         self.do_search()
@@ -2462,10 +2749,16 @@ class InventoryScreen(BaseScreen):
         btn_row.pack(fill="x", padx=24)
         styled_button(btn_row, "Refresh", self.refresh, kind="secondary").pack(side="left")
         styled_button(btn_row, "Export CSV", self.export, kind="secondary").pack(side="left", padx=8)
+        # "Add / Scan Item" alone now covers what used to be two separate
+        # buttons - it already told a brand-new barcode apart from an
+        # existing one automatically; the "Don't have the barcode? Pick
+        # from list" link (see open_add_product_dialog) covers the one
+        # thing the old standalone "Receive Stock (GRN)" button could do
+        # that this couldn't - restocking a product without scanning/typing
+        # its code - so that separate button/dialog was retired rather than
+        # kept as a second, overlapping way to do the same thing.
         self.add_btn = styled_button(btn_row, "Add / Scan Item", self.open_add_product_dialog, kind="primary")
         self.add_btn.pack(side="left", padx=8)
-        self.grn_btn = styled_button(btn_row, "Receive Stock (GRN)", self.open_grn_dialog, kind="primary")
-        self.grn_btn.pack(side="left", padx=8)
         self.edit_btn = styled_button(btn_row, "Edit Item", self.open_edit_product_dialog, kind="secondary")
         self.edit_btn.pack(side="left", padx=8)
         self.remove_btn = styled_button(btn_row, "Remove / Restore Item", self.toggle_product_active, kind="danger")
@@ -2514,7 +2807,6 @@ class InventoryScreen(BaseScreen):
             "(Owner-only to remove/restore one) - log in from the sidebar first. Anyone can view stock levels."
         )
         self.add_btn.configure(state="normal" if is_admin else "disabled")
-        self.grn_btn.configure(state="normal" if is_admin else "disabled")
         self.edit_btn.configure(state="normal" if is_admin else "disabled")
         self.remove_btn.configure(state="normal" if is_owner else "disabled")
 
@@ -2654,101 +2946,134 @@ class InventoryScreen(BaseScreen):
             )
         self.refresh()
 
-    def open_grn_dialog(self):
-        if not self._is_admin():
-            messagebox.showwarning("Admin required", "Log in as Admin or Owner (sidebar) to receive stock.")
-            return
-        dialog = ctk.CTkToplevel(self)
-        dialog.title("Receive Stock (GRN)")
-        fit_dialog(dialog, 420, 340)
-        dialog.configure(fg_color=theme.BG_LIGHT)
-        dialog.grab_set()  # wasn't modal before - the Inventory screen behind it was still clickable
+    def _add_supplier_on_the_fly(self, parent_dialog, suppliers_list: list, supplier_names: list,
+                                  dropdown, var: tk.StringVar) -> None:
+        """A small "New Supplier" popup usable from inside another dialog
+        (Receive Stock / Add / Scan Item) - the point is a delivery from a
+        supplier that isn't registered yet shouldn't force abandoning
+        whatever's already been typed on this item just to go add it on
+        the Suppliers screen first. Mutates suppliers_list/supplier_names
+        IN PLACE (append, not reassignment) so the caller's own closures
+        over those same list objects see the new supplier immediately,
+        and refreshes the dropdown + selects the new supplier."""
+        popup = ctk.CTkToplevel(parent_dialog)
+        popup.title("New Supplier")
+        fit_dialog(popup, 340, 280)
+        popup.configure(fg_color=theme.BG_LIGHT)
+        popup.grab_set()
 
-        # Fields go in a scrollable body, packed BEFORE the Save button -
-        # guarantees the button its own space regardless of how much taller
-        # Windows display scaling renders this content than the pixel guess
-        # above; see open_login_dialog in app.py for the full reasoning.
-        body = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
-        body.pack(fill="both", expand=True)
+        ctk.CTkLabel(popup, text="Supplier name:").pack(anchor="w", padx=16, pady=(16, 0))
+        name_var = tk.StringVar()
+        name_entry = ctk.CTkEntry(popup, textvariable=name_var)
+        name_entry.pack(fill="x", padx=16)
 
-        products = self.conn.execute("SELECT id, code, name_en FROM products WHERE active=1 ORDER BY name_en").fetchall()
-        names = [f"{p['code']} - {p['name_en']}" for p in products]
+        ctk.CTkLabel(popup, text="Phone (optional):").pack(anchor="w", padx=16, pady=(10, 0))
+        phone_var = tk.StringVar()
+        ctk.CTkEntry(popup, textvariable=phone_var).pack(fill="x", padx=16)
 
-        ctk.CTkLabel(body, text="Product:").pack(anchor="w", padx=16, pady=(16, 0))
-        product_var = tk.StringVar(value=names[0] if names else "")
-        SearchableDropdown(body, values=names, variable=product_var, width=360, label="Product").pack(padx=16)
+        def save_supplier():
+            name = name_var.get().strip()
+            if not name:
+                messagebox.showerror("Invalid input", "Supplier name cannot be blank.")
+                return
+            if any(s["name"] == name for s in suppliers_list):
+                messagebox.showerror("Invalid input", f"A supplier named '{name}' already exists.")
+                return
+            new_id = suppliers_module.add_supplier(self.conn, name, phone_var.get())
+            suppliers_list.append({"id": new_id, "name": name, "phone": phone_var.get().strip(),
+                                    "address": "", "active": 1})
+            supplier_names.append(name)
+            dropdown.configure(values=supplier_names)
+            var.set(name)
+            popup.destroy()
 
-        suppliers_list = suppliers_module.list_suppliers(self.conn)
-        supplier_names = ["(none)"] + [s["name"] for s in suppliers_list]
-        ctk.CTkLabel(body, text="Supplier:").pack(anchor="w", padx=16, pady=(12, 0))
-        supplier_var = tk.StringVar(value=supplier_names[0])
-        SearchableDropdown(body, values=supplier_names, variable=supplier_var, width=360, label="Supplier").pack(
-            padx=16)
-
-        ctk.CTkLabel(body, text="Quantity received:").pack(anchor="w", padx=16, pady=(12, 0))
-        qty_var = tk.StringVar(value="10")
-        ctk.CTkEntry(body, textvariable=qty_var).pack(fill="x", padx=16)
-
-        ctk.CTkLabel(body, text="Cost price (per unit):").pack(anchor="w", padx=16, pady=(12, 0))
-        cost_var = tk.StringVar()
-        ctk.CTkEntry(body, textvariable=cost_var).pack(fill="x", padx=16)
-
-        ctk.CTkLabel(body, text="Expiry date (YYYY-MM-DD, blank if none):").pack(anchor="w", padx=16, pady=(12, 0))
-        expiry_var = tk.StringVar()
-        ctk.CTkEntry(body, textvariable=expiry_var).pack(fill="x", padx=16)
-
-        def save():
-            try:
-                idx = names.index(product_var.get())
-                product = products[idx]
-                qty = float(qty_var.get())
-                cost = float(cost_var.get()) if cost_var.get().strip() else None
-                expiry = expiry_var.get().strip() or None
-                supplier_id = None
-                if supplier_var.get() != "(none)":
-                    match = next((s for s in suppliers_list if s["name"] == supplier_var.get()), None)
-                    supplier_id = match["id"] if match else None
-                pos.receive_stock(self.conn, product_id=product["id"], qty=qty, cost_price=cost,
-                                   expiry_date=expiry, supplier_id=supplier_id)
-                dialog.destroy()
-                self.refresh()
-            except ValueError as e:
-                messagebox.showerror("Invalid input", str(e))
-
-        dialog.bind("<Return>", lambda e: save())
-        styled_button(dialog, "Save", save, kind="primary", width=140).pack(pady=18)
+        popup.bind("<Return>", lambda e: save_supplier())
+        styled_button(popup, "Add Supplier", save_supplier, kind="primary", width=140).pack(pady=18)
+        popup.after(150, name_entry.focus_set)
 
     def open_add_product_dialog(self):
-        """One entry point for "put an item into the store" that figures
-        out which of two things you mean, from the barcode itself - you
-        shouldn't have to know in advance whether a product is already in
-        the catalog before you can scan it in:
+        """One entry point for "put an item into the store" - covers
+        everything the old separate "Add / Scan Item" and "Receive Stock
+        (GRN)" buttons used to split between them, since both really just
+        meant "stock came in, record it":
 
         - Scan/type a code that's NOT in the catalog yet -> this is a
           brand-new product, so the full details form appears (name,
           category, prices, etc.) to register it for the first time.
         - Scan/type a code that IS already in the catalog -> there's
-          nothing to ask except how many more units just came in, so it
-          shows the existing product's name/category/current stock and
-          just asks for the quantity received (same as the "Receive Stock
-          (GRN)" dialog, sharing pos.receive_stock with it).
+          nothing to ask except how much came in, so it shows the
+          existing product's name/category/current stock and asks for
+          the quantity.
+        - Don't have a barcode handy at all (e.g. going off a supplier's
+          paper invoice, not scanning each item)? "Don't have the
+          barcode? Pick from list" opens a searchable list of every
+          product already in the catalog and fills the code field for
+          you, landing on exactly the same existing-product path above -
+          this is what the standalone GRN dialog used to be for.
 
-        The barcode field can be filled by typing on the keyboard, by a
-        USB/Bluetooth barcode scanner (it just types the digits into
-        whichever field has focus, so the field is auto-focused for that),
-        or by scanning it with a phone via the same phone-scanner feature
-        used at the till."""
+        Supplier and Payment (Cash/Cheque/Not paid yet) sit above both of
+        those paths, not inside either one - a whole bulk-add session is
+        normally one delivery from one supplier, paid one way, whether
+        the items in it are restocks or brand-new products, so picking
+        both once for "the first item" carries forward automatically for
+        every item after it (a successful Save keeps them as they were;
+        only the explicit Clear button resets them) instead of asking
+        again for every single line.
+
+        The barcode field itself can still be filled by typing on the
+        keyboard, by a USB/Bluetooth barcode scanner (it just types the
+        digits into whichever field has focus, so the field is
+        auto-focused for that), or by scanning it with a phone via the
+        same phone-scanner feature used at the till - and as it's typed
+        or scanned, a live dropdown suggests matching products by code,
+        so you can stop partway through and click the right one instead
+        of finishing the whole code. Picking a suggestion, or pressing
+        Enter after the code (typed or scanned) is complete, both land on
+        the same result - see _use_product_code."""
         if not self._is_admin():
             messagebox.showwarning("Admin required", "Log in as Admin or Owner (sidebar) to add an item.")
             return
         dialog = ctk.CTkToplevel(self)
         dialog.title("Add / Scan Item")
-        fit_dialog(dialog, 440, 780)
+        fit_dialog(dialog, 440, 820)  # a bit taller - Payment now always shows, not just for a restock
         dialog.configure(fg_color=theme.BG_LIGHT)
         dialog.grab_set()
 
+        # Holds the function _open_phone_capture_dialog hands back once the
+        # phone is linked in continuous mode (see the "Scan with Phone"
+        # button below) - calling it hands the till's phone-scanner
+        # connection back to whatever was using it before and closes that
+        # small popup if it's still open. Needs calling from HERE too (not
+        # just that popup's own Done button) so that closing THIS whole
+        # dialog while the phone is still linked can't leave a scan
+        # arriving later trying to act on fields that no longer exist.
+        phone_scan_restore = {"fn": None}
+
+        def close_dialog():
+            if phone_scan_restore["fn"] is not None:
+                phone_scan_restore["fn"]()
+            dialog.destroy()
+
+        dialog.protocol("WM_DELETE_WINDOW", close_dialog)
+
         body = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
         body.pack(fill="both", expand=True)
+
+        session_count = {"n": 0}
+        session_label = ctk.CTkLabel(
+            body, text="", text_color=theme.SUCCESS_GREEN, font=ctk.CTkFont(size=12, weight="bold"),
+        )
+        session_label.pack(anchor="w", padx=16, pady=(10, 0))
+
+        def _update_session_label():
+            if session_count["n"] == 0:
+                session_label.configure(text="")
+            elif session_count["n"] == 1:
+                session_label.configure(text="1 item added so far - keep scanning/typing to add more.")
+            else:
+                session_label.configure(
+                    text=f"{session_count['n']} items added so far - keep scanning/typing to add more."
+                )
 
         def field(parent, label, initial=""):
             ctk.CTkLabel(parent, text=label).pack(anchor="w", padx=16, pady=(10, 0))
@@ -2763,18 +3088,219 @@ class InventoryScreen(BaseScreen):
         code_var = tk.StringVar()
         code_entry = ctk.CTkEntry(code_row, textvariable=code_var)
         code_entry.pack(side="left", fill="x", expand=True)
+
+        def _use_product_code(code: str) -> None:
+            """Common landing point for every way this dialog can learn a
+            product's code other than typing the whole thing by hand -
+            a phone scan, a live suggestion picked while typing/scanning,
+            or "Pick from list". Just sets the code and re-checks it, same
+            as pressing Enter after typing would - except guarded the same
+            way a scan already was: a code for a NEW (not-yet-in-the-
+            catalog) product shows a full details form the cashier is
+            meant to fill in and Save, and swapping code_var out from
+            under that mid-fill would hide new_frame and make the
+            in-progress item look like it just vanished - no error, no
+            chance to fix a mistake. An "existing product" match has
+            nothing typed to lose (just a quantity that resets on save
+            anyway) so those keep going straight through."""
+            if state["mode"] == "new":
+                status_label.configure(
+                    text="Still filling in the previous (new) item - click Save or Clear before "
+                         "using another code.",
+                    text_color=theme.DANGER_RED,
+                )
+                return
+            # This is an external, non-typing change to code_var (the user
+            # already finished choosing, they didn't just type this) -
+            # without suppressing it, setting it back to the real code
+            # would look exactly like a fresh keystroke to the suggestion
+            # box below and pop it open again a moment later, showing the
+            # same single match right after it was already picked. See
+            # SuggestionBox.suppress_next_change's own docstring.
+            code_suggestions.suppress_next_change()
+            code_var.set(code)
+            check_code()
+
+        # Live suggestions as this box is typed/scanned into - matches by
+        # CODE PREFIX only (not name; see search_products_by_code's own
+        # docstring for why a barcode box keeps that distinction), same
+        # widget/behavior already proven on the POS screen's own barcode
+        # box. A USB/Bluetooth scanner "types" the whole code far faster
+        # than this can react to each character, so this is debounced
+        # (SuggestionBox handles that) - either way, pressing Enter after
+        # a full code (typed or scanned) is untouched by this and still
+        # proceeds immediately via check_code below, exactly as before.
+        code_suggestions = SuggestionBox(
+            code_entry, code_var,
+            fetch_fn=lambda q: [(f"{p['code']} — {p['name_en']}", p) for p in pos.search_products_by_code(self.conn, q)],
+            on_select=lambda product: _use_product_code(product["code"]),
+        )
+
+        def start_phone_scan():
+            def on_scanned(scanned):
+                _use_product_code(scanned)
+
+            # continuous=True: this keeps the phone linked and this
+            # dialog's own barcode field being filled in for every scan
+            # that follows, not just the first - that's what lets one
+            # phone-scanner session add a whole delivery's worth of items
+            # in a row (each one checked, filled in, and saved via the
+            # normal Save button, same as typing the code by hand would)
+            # instead of needing "Scan with Phone" tapped again per item.
+            #
+            # THIS dialog holds a modal grab (see dialog.grab_set() near
+            # the top of open_add_product_dialog), and Tk's grab is
+            # application-wide, not per-window - so with it still held,
+            # the little phone-link popup we're about to open would be
+            # completely unclickable behind it. Release it here so BOTH
+            # windows are usable while the phone is linked (click the
+            # popup to see the QR again, click back here to fill in a
+            # quantity/details and hit Save) - exactly what "one link,
+            # add every item" needs. on_closed grabs it back the moment
+            # the popup goes away (its own Done button, its X, or this
+            # dialog's own close_dialog calling phone_scan_restore["fn"]
+            # first) so this dialog goes back to blocking the rest of the
+            # app once the phone step is done, same as before.
+            dialog.grab_release()
+
+            def _regrab():
+                if dialog.winfo_exists():
+                    try:
+                        dialog.grab_set()
+                    except Exception:
+                        pass
+
+            phone_scan_restore["fn"] = self._open_phone_capture_dialog(
+                on_scanned, continuous=True,
+                title="Scan Items to Add",
+                instruction="Scan each item's barcode, one after another",
+                on_closed=_regrab,
+            )
+
         styled_button(
-            code_row, "Scan with Phone",
-            lambda: self._open_phone_capture_dialog(lambda scanned: (code_var.set(scanned), check_code())),
+            code_row, "Scan with Phone", start_phone_scan,
             kind="secondary", width=130,
         ).pack(side="left", padx=(8, 0))
 
+        def pick_from_list():
+            """For restocking without a barcode in hand at all - e.g.
+            working off a supplier's paper invoice by product name rather
+            than scanning each item. Picking one here just fills in its
+            code and runs it through check_code(), landing on exactly the
+            same existing-product path as if that code had been scanned -
+            this is what the standalone "Receive Stock (GRN)" dialog used
+            to be the only way to do."""
+            if state["mode"] == "new":
+                status_label.configure(
+                    text="Still filling in the previous (new) item - click Save or Clear before "
+                         "picking another one.",
+                    text_color=theme.DANGER_RED,
+                )
+                return
+            catalog = self.conn.execute(
+                "SELECT id, code, name_en FROM products WHERE active=1 ORDER BY name_en"
+            ).fetchall()
+            if not catalog:
+                messagebox.showinfo("No products yet", "The catalog is empty - nothing to pick from yet.")
+                return
+            labels = [f"{p['code']} - {p['name_en']}" for p in catalog]
+
+            popup = ctk.CTkToplevel(dialog)
+            popup.title("Pick a Product")
+            fit_dialog(popup, 380, 220)
+            popup.configure(fg_color=theme.BG_LIGHT)
+            popup.grab_set()
+
+            ctk.CTkLabel(popup, text="Product:").pack(anchor="w", padx=16, pady=(16, 0))
+            pick_var = tk.StringVar(value=labels[0])
+            SearchableDropdown(popup, values=labels, variable=pick_var, width=340, label="Product").pack(padx=16)
+
+            def choose():
+                idx = labels.index(pick_var.get())
+                chosen_code = catalog[idx]["code"]
+                popup.destroy()
+                _use_product_code(chosen_code)
+
+            popup.bind("<Return>", lambda e: choose())
+            styled_button(popup, "Use This Product", choose, kind="primary", width=160).pack(pady=18)
+
+        styled_button(
+            body, "Don't have the barcode? Pick from list", pick_from_list, kind="secondary",
+        ).pack(anchor="w", padx=16, pady=(4, 0))
+
         status_label = ctk.CTkLabel(
-            body, text="Type, scan with a USB/Bluetooth scanner, or tap \"Scan with Phone\" - "
-                       "then press Enter (or click away) to check the catalog.",
+            body, text="Type, scan with a USB/Bluetooth scanner, tap \"Scan with Phone\", or pick "
+                       "from the list above - a suggestion list appears as you go, but nothing "
+                       "happens until you press Enter or click a suggestion.",
             text_color=theme.TEXT_MUTED, font=ctk.CTkFont(size=11), wraplength=380, justify="left",
         )
         status_label.pack(anchor="w", padx=16, pady=(6, 6))
+
+        # Supplier - shared by both paths below, since either one creates a
+        # stock batch (an opening batch for a brand-new product, a restock
+        # batch for one that already exists) that can record who it came
+        # from - what the standalone "Receive Stock (GRN)" dialog used to
+        # be a separate button for. Optional either way - "(none)" if
+        # you'd rather skip it.
+        suppliers_list = suppliers_module.list_suppliers(self.conn)
+        supplier_names = ["(none)"] + [s["name"] for s in suppliers_list]
+        ctk.CTkLabel(body, text="Supplier (optional):").pack(anchor="w", padx=16, pady=(0, 0))
+        supplier_row = ctk.CTkFrame(body, fg_color="transparent")
+        supplier_row.pack(fill="x", padx=16, pady=(0, 6))
+        supplier_var = tk.StringVar(value=supplier_names[0])
+        supplier_dropdown = SearchableDropdown(
+            supplier_row, values=supplier_names, variable=supplier_var, width=290, label="Supplier")
+        supplier_dropdown.pack(side="left")
+        styled_button(
+            supplier_row, "+ New", lambda: self._add_supplier_on_the_fly(
+                dialog, suppliers_list, supplier_names, supplier_dropdown, supplier_var),
+            kind="secondary", width=80,
+        ).pack(side="left", padx=(8, 0))
+
+        def _resolve_supplier_id() -> int | None:
+            if supplier_var.get() == "(none)":
+                return None
+            match = next((s for s in suppliers_list if s["name"] == supplier_var.get()), None)
+            return match["id"] if match else None
+
+        # Payment - shared by both paths below, same as Supplier just
+        # above, and for the same reason: a whole delivery/session of
+        # items usually comes in paid the SAME way (all cash, or one
+        # cheque/credit arrangement covering the lot), whether some of
+        # those items are restocks of things already in the catalog or
+        # brand-new products being registered for the first time. Not
+        # every delivery is paid cash on the spot: sometimes it's a
+        # cheque (handed over now, but the money only actually leaves the
+        # bank once it clears - worth a reminder of the date/amount),
+        # sometimes the stock is taken on credit and only settled later,
+        # e.g. once it's been sold. What the standalone "Receive Stock
+        # (GRN)" dialog's own Payment section used to cover, and now also
+        # applies to a brand-new product's opening stock, which used to
+        # have no way to record any of this at all.
+        ctk.CTkLabel(body, text="Payment:").pack(anchor="w", padx=16, pady=(6, 0))
+        payment_var = tk.StringVar(value="Cash")
+        cheque_fields = ctk.CTkFrame(body, fg_color="transparent")
+        cheque_number_var = tk.StringVar()
+        cheque_date_var = tk.StringVar()
+
+        def _on_payment_changed(*_a):
+            if payment_var.get() == "Cheque":
+                cheque_fields.pack(fill="x", padx=16, pady=(4, 6))
+            else:
+                cheque_fields.pack_forget()
+            # Same stale-scroll-canvas glitch check_code() guards against
+            # below (see _refresh_scroll_region) - showing/hiding the
+            # cheque fields changes body's content height too.
+            _refresh_scroll_region()
+
+        ctk.CTkOptionMenu(
+            body, values=["Cash", "Cheque", "Not paid yet (credit)"],
+            variable=payment_var, command=_on_payment_changed,
+        ).pack(fill="x", padx=16)
+        ctk.CTkLabel(cheque_fields, text="Cheque number:").pack(anchor="w", pady=(6, 0))
+        ctk.CTkEntry(cheque_fields, textvariable=cheque_number_var).pack(fill="x")
+        ctk.CTkLabel(cheque_fields, text="Cheque date (YYYY-MM-DD):").pack(anchor="w", pady=(6, 0))
+        ctk.CTkEntry(cheque_fields, textvariable=cheque_date_var).pack(fill="x")
 
         # --- Existing-product path: just ask how much stock came in. ---
         existing_frame = ctk.CTkFrame(body, fg_color="transparent")
@@ -2808,17 +3334,114 @@ class InventoryScreen(BaseScreen):
         ctk.CTkCheckBox(flags_row, text="Staple item", variable=staple_var).pack(side="left", padx=12)
         ctk.CTkCheckBox(flags_row, text="Child-target item", variable=child_var).pack(side="left")
 
-        save_btn = styled_button(dialog, "Save", lambda: None, kind="primary", width=160)
-        save_btn.pack(pady=16)
+        button_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        button_row.pack(pady=16)
+        save_btn = styled_button(button_row, "Save", lambda: None, kind="primary", width=160)
+        save_btn.pack(side="left")
+        styled_button(
+            button_row, "Clear", lambda: reset_form(
+                keep_supplier=False,
+                message="Cleared. Type, scan with a USB/Bluetooth scanner, tap \"Scan with Phone\", or "
+                        "pick from the list above - a suggestion list appears as you go, but nothing "
+                        "happens until you press Enter or click a suggestion.",
+            ), kind="secondary", width=90,
+        ).pack(side="left", padx=(8, 0))
+        styled_button(button_row, "Done", close_dialog, kind="secondary", width=100).pack(
+            side="left", padx=(8, 0))
 
         state = {"mode": None, "product": None}
+
+        def _new_product_ready() -> bool:
+            """Whether the new-product form currently has everything
+            pos.add_product actually requires - a name, a category, and a
+            cash price above zero. Backs the "Save New Product" button's
+            enabled state below, so a blank/incomplete form can't be
+            clicked at all - it used to be clickable the whole time, only
+            failing afterwards with an error message from pos.add_product
+            once Save was actually pressed."""
+            if not name_en_var.get().strip():
+                return False
+            if not category_var.get().strip():
+                return False
+            try:
+                return float(cash_var.get() or 0) > 0
+            except ValueError:
+                return False
+
+        def _update_save_button_state(*_a):
+            """Re-checked live as the required new-product fields are
+            typed into, so Save unlocks the moment the form is actually
+            complete rather than needing another action to notice."""
+            if state["mode"] == "new":
+                save_btn.configure(state="normal" if _new_product_ready() else "disabled")
+
+        for _required_var in (name_en_var, category_var, cash_var):
+            _required_var.trace_add("write", _update_save_button_state)
+
+        def reset_form(keep_supplier: bool = True, message: str | None = None):
+            """Blank every field back to its default, ready for the next
+            item, without closing the dialog. keep_supplier=True (used
+            right after a successful save) leaves the Supplier dropdown -
+            and now Payment (method, cheque number/date) too - exactly as
+            they were: bulk-adding is usually one delivery, one supplier,
+            paid one way, whether that next item is a restock of
+            something already in the catalog or a brand-new product, so
+            the user shouldn't have to re-pick "Cash" (or re-enter the
+            same cheque details) for every single line of the same
+            delivery. The explicit Clear button passes keep_supplier=False
+            for a genuine start-over instead, which does reset both.
+            `message`, when given, replaces the status line (used by
+            Clear); left out, the status line is untouched (used right
+            after a save, so the green "added!" confirmation isn't
+            immediately overwritten by this same reset)."""
+            if not keep_supplier:
+                supplier_var.set(supplier_names[0])
+                payment_var.set("Cash")
+                cheque_number_var.set("")
+                cheque_date_var.set("")
+                cheque_fields.pack_forget()
+            code_var.set("")
+            qty_received_var.set("10")
+            existing_cost_var.set("")
+            existing_expiry_var.set("")
+            name_en_var.set("")
+            name_si_var.set("")
+            category_var.set("")
+            unit_var.set("pcs")
+            cost_var.set("")
+            cash_var.set("")
+            credit_var.set("")
+            wholesale_var.set("")
+            pack_size_var.set("1")
+            reorder_var.set("10")
+            initial_qty_var.set("0")
+            expiry_var.set("")
+            perishable_var.set(False)
+            staple_var.set(False)
+            child_var.set(False)
+            if message is not None:
+                status_label.configure(text=message, text_color=theme.TEXT_MUTED)
+            check_code(keep_status=True)
+            code_entry.focus_set()
 
         def save_existing():
             code = code_var.get().strip()
             product = pos.get_product_by_code(self.conn, code)
             if product is None:
-                messagebox.showerror("Invalid input", "That barcode no longer matches a product - re-check it.")
+                status_label.configure(
+                    text="That barcode no longer matches a product - re-check it.",
+                    text_color=theme.DANGER_RED,
+                )
                 check_code()
+                return
+            payment_choice = payment_var.get()
+            method = {"Cash": "cash", "Cheque": "cheque", "Not paid yet (credit)": "credit"}[payment_choice]
+            supplier_id = _resolve_supplier_id()
+            if method != "cash" and supplier_id is None:
+                status_label.configure(
+                    text="A cheque or credit purchase needs a supplier selected above - who is it owed to?",
+                    text_color=theme.DANGER_RED,
+                )
                 return
             try:
                 pos.receive_stock(
@@ -2826,15 +3449,50 @@ class InventoryScreen(BaseScreen):
                     qty=float(qty_received_var.get() or 0),
                     cost_price=float(existing_cost_var.get()) if existing_cost_var.get().strip() else None,
                     expiry_date=existing_expiry_var.get().strip() or None,
+                    supplier_id=supplier_id, payment_method=method,
+                    cheque_number=cheque_number_var.get(), cheque_date=cheque_date_var.get().strip() or None,
                 )
             except ValueError as e:
-                messagebox.showerror("Invalid input", str(e))
+                # A plain in-dialog message rather than messagebox.showerror
+                # here - on this specific dialog, a popped-up messagebox was
+                # reported to leave the "Add / Scan Item" window looking
+                # like it had closed/gone back to the main page once the
+                # messagebox was dismissed (very likely a Windows focus/
+                # z-order quirk between a native modal dialog and this
+                # CTkToplevel, not an actual close - but confusing either
+                # way). Everything already typed stays exactly as it was;
+                # only the status line changes color/text to show the error.
+                status_label.configure(text=str(e), text_color=theme.DANGER_RED)
                 return
-            dialog.destroy()
+            except Exception as e:  # noqa: BLE001 - anything unexpected still leaves everything you typed in place
+                status_label.configure(
+                    text=f"Something went wrong and this wasn't saved: {e} - nothing you entered "
+                         "was lost, fix the problem (or click Clear to start over) and try again.",
+                    text_color=theme.DANGER_RED,
+                )
+                return
             self.refresh()
-            messagebox.showinfo("Stock added", f"Added {qty_received_var.get()} {product['unit']} to '{product['name_en']}'.")
+            session_count["n"] += 1
+            _update_session_label()
+            status_label.configure(
+                text=f"Added {qty_received_var.get()} {product['unit']} to '{product['name_en']}'. "
+                     f"Ready for the next item - scan/type its code, or click Done to finish.",
+                text_color=theme.SUCCESS_GREEN,
+            )
+            reset_form()
 
         def save_new():
+            new_name = name_en_var.get().strip()
+            payment_choice = payment_var.get()
+            method = {"Cash": "cash", "Cheque": "cheque", "Not paid yet (credit)": "credit"}[payment_choice]
+            supplier_id = _resolve_supplier_id()
+            initial_qty = float(initial_qty_var.get() or 0)
+            if method != "cash" and initial_qty > 0 and supplier_id is None:
+                status_label.configure(
+                    text="A cheque or credit purchase needs a supplier selected above - who is it owed to?",
+                    text_color=theme.DANGER_RED,
+                )
+                return
             try:
                 pos.add_product(
                     self.conn,
@@ -2852,51 +3510,201 @@ class InventoryScreen(BaseScreen):
                     is_perishable=perishable_var.get(),
                     is_staple=staple_var.get(),
                     child_target=child_var.get(),
-                    initial_qty=float(initial_qty_var.get() or 0),
+                    initial_qty=initial_qty,
                     expiry_date=expiry_var.get().strip() or None,
+                    supplier_id=supplier_id, payment_method=method,
+                    cheque_number=cheque_number_var.get(), cheque_date=cheque_date_var.get().strip() or None,
                 )
             except ValueError as e:
-                messagebox.showerror("Invalid input", str(e))
+                # See the matching comment in save_existing() above - a
+                # native messagebox popup on THIS dialog was reported to
+                # leave the window looking like it had closed/gone back to
+                # the main page after being dismissed, so this stays an
+                # in-dialog message instead; nothing typed is lost either way.
+                status_label.configure(text=str(e), text_color=theme.DANGER_RED)
                 return
-            dialog.destroy()
+            except Exception as e:  # noqa: BLE001 - anything unexpected still leaves everything you typed in place
+                status_label.configure(
+                    text=f"Something went wrong and this wasn't saved: {e} - nothing you entered "
+                         "was lost, fix the problem (or click Clear to start over) and try again.",
+                    text_color=theme.DANGER_RED,
+                )
+                return
             self.refresh()
-            messagebox.showinfo("Product added", f"'{name_en_var.get().strip()}' was added to the catalog.")
+            session_count["n"] += 1
+            _update_session_label()
+            status_label.configure(
+                text=f"'{new_name}' was added to the catalog. "
+                     f"Ready for the next item - scan/type its code, or click Done to finish.",
+                text_color=theme.SUCCESS_GREEN,
+            )
+            reset_form()
 
-        def check_code(event=None):
-            code = code_var.get().strip()
-            if not code:
-                existing_frame.pack_forget()
-                new_frame.pack_forget()
-                save_btn.configure(state="disabled")
-                status_label.configure(text="Type, scan with a USB/Bluetooth scanner, or tap \"Scan with "
-                                             "Phone\" - then press Enter (or click away) to check the catalog.")
-                state["mode"] = None
-                return
-            product = pos.get_product_by_code(self.conn, code)
-            save_btn.configure(state="normal")
+        def _refresh_scroll_region():
+            """body (the whole form above the buttons) is a
+            CTkScrollableFrame, and on Windows in particular its inner
+            canvas can fail to notice that the content changed height the
+            instant a child frame (existing_frame/new_frame/cheque_fields)
+            gets pack_forget()'d or pack()'d back mid-dialog - the widgets
+            are all really there and correctly configured (the Save
+            button's own text/state proves the code above ran fine), but
+            the canvas's scroll region goes stale and the visible area can
+            render as a totally blank page until something else forces a
+            redraw (resizing the window, scrolling, etc). That's the
+            reported "Add / Scan Item goes blank" - a rendering glitch in
+            the scroll container, not a crash and not lost data. Forcing
+            an idle-task flush plus a fresh scrollregion recompute after
+            every visibility change fixes that. Best-effort and silent:
+            _parent_canvas is a private CustomTkinter attribute that has
+            been stable across the 5.x line but isn't guaranteed forever,
+            so if a future version renames it this just quietly does
+            nothing rather than breaking the dialog over a cosmetic fix."""
+            try:
+                dialog.update_idletasks()
+                canvas = body._parent_canvas
+                canvas.configure(scrollregion=canvas.bbox("all"))
+            except Exception:  # noqa: BLE001
+                pass
+
+        def check_code(event=None, keep_status=False):
+            """keep_status=True is used right after a successful save (via
+            reset_form): the code field is now blank again, but we don't want
+            to stomp on the green "added!" confirmation status_label just
+            showed - it should stay up until the user starts on the next
+            item."""
+            try:
+                # The live suggestion list (code_suggestions) never closes
+                # itself on <Return> by design - only on a click/Escape/
+                # focus-out, or picking one - so a code committed by
+                # pressing Enter (typed or scanned) would otherwise leave
+                # that popup sitting there looking like it's still
+                # offering choices after this already acted on one.
+                # Always close it the moment this dialog is about to act
+                # on whatever's in the box.
+                code_suggestions.close()
+                code = code_var.get().strip()
+                if not code:
+                    existing_frame.pack_forget()
+                    new_frame.pack_forget()
+                    save_btn.configure(state="disabled")
+                    if not keep_status:
+                        status_label.configure(
+                            text="Type, scan with a USB/Bluetooth scanner, tap \"Scan with Phone\", "
+                                 "or pick from the list above - a suggestion list appears as you go, "
+                                 "but nothing happens until you press Enter or click a suggestion.",
+                            text_color=theme.TEXT_MUTED,
+                        )
+                    state["mode"] = None
+                    state["product"] = None
+                    return
+                # Everything below this point does real work (a DB lookup,
+                # then hiding one frame and showing another) with no
+                # safety net of its own - unlike every button click in
+                # this dialog (Save, Add Stock, etc), which is wrapped in
+                # its own try/except and reports a problem via
+                # status_label. Before this try/except existed, an
+                # unexpected error partway through (e.g. right after
+                # new_frame.pack_forget() but before existing_frame.pack()
+                # ran) left BOTH frames hidden - the whole dialog looking
+                # like it had simply gone blank, with no error shown
+                # anywhere to explain why. Wrapping the whole thing means
+                # that instead always ends in a real error message, never
+                # silent blankness.
+                try:
+                    product = pos.get_product_by_code(self.conn, code)
+                except Exception as e:  # noqa: BLE001
+                    existing_frame.pack_forget()
+                    new_frame.pack_forget()
+                    save_btn.configure(state="disabled")
+                    status_label.configure(
+                        text=f"Couldn't look up that code: {e} - try again, or click Clear to start over.",
+                        text_color=theme.DANGER_RED,
+                    )
+                    state["mode"] = None
+                    state["product"] = None
+                    return
+                try:
+                    _apply_code_lookup_result(code, product)
+                except Exception as e:  # noqa: BLE001
+                    existing_frame.pack_forget()
+                    new_frame.pack_forget()
+                    save_btn.configure(state="disabled")
+                    status_label.configure(
+                        text=f"Something went wrong showing that item: {e} - try again, or click Clear "
+                             "to start over. Nothing was saved.",
+                        text_color=theme.DANGER_RED,
+                    )
+                    state["mode"] = None
+                    state["product"] = None
+            finally:
+                # Runs on every path through the above (blank code, a
+                # found product, a new one, or either error branch) so a
+                # stale-canvas blank page can never survive to be the last
+                # thing check_code leaves on screen.
+                _refresh_scroll_region()
+
+        def _apply_code_lookup_result(code: str, product) -> None:
             if product is not None:
+                save_btn.configure(state="normal")
                 state["mode"] = "existing"
                 new_frame.pack_forget()
+                # A NEW product deserves fresh per-item fields, not
+                # whatever was typed for the LAST existing product checked
+                # here - otherwise a quantity/cost/expiry typed for one
+                # item could silently carry over and get applied to a
+                # completely different one if the phone scans the next
+                # item before this one's Save is clicked (continuous
+                # scanning means that next scan can arrive at any moment,
+                # not just after the cashier is done with this one).
+                # Guarded on the product actually changing so check_code
+                # re-firing for the SAME still-unsaved code (e.g. a
+                # redundant FocusOut) doesn't wipe out mid-typed values.
+                # Payment is deliberately NOT reset here (see reset_form) -
+                # it's a whole-delivery choice, not a per-item one, so
+                # switching to a different not-yet-saved item mid-session
+                # should keep whatever was already picked.
+                if state["product"] != product["id"]:
+                    qty_received_var.set("10")
+                    existing_cost_var.set("")
+                    existing_expiry_var.set("")
+                state["product"] = product["id"]
                 on_hand = pos.get_stock_on_hand(self.conn, product["id"])
                 existing_info.configure(
                     text=f"Already in the catalog: {product['name_en']} ({product['category']}) - "
                          f"{on_hand:.0f} {product['unit']} in stock now. Just enter how many more came in."
                 )
                 existing_frame.pack(fill="x")
-                status_label.configure(text=f"Found an existing product for code '{code}'.")
+                status_label.configure(text=f"Found an existing product for code '{code}'.", text_color=theme.TEXT_MUTED)
                 save_btn.configure(text="Add Stock", command=save_existing)
             else:
                 state["mode"] = "new"
+                state["product"] = None
                 existing_frame.pack_forget()
                 new_frame.pack(fill="x")
                 status_label.configure(text=f"Code '{code}' isn't in the catalog yet - fill in the new "
-                                             f"product's details below.")
+                                             f"product's details below. Save New Product unlocks once "
+                                             f"the name, category, and cash price are filled in.",
+                                        text_color=theme.TEXT_MUTED)
                 save_btn.configure(text="Save New Product", command=save_new)
+                _update_save_button_state()
 
+        # Deliberately ONLY <Return> - typing/scanning into this box (with
+        # the live suggestion dropdown previewing matches as it goes) never
+        # proceeds to the existing/new-product view on its own; nothing
+        # happens until you explicitly commit, either by pressing Enter
+        # after a typed/scanned code or by clicking a suggestion (that
+        # calls check_code itself, via _use_product_code, since picking
+        # one off the list is just as deliberate a choice as pressing
+        # Enter). This used to also run on <FocusOut> (clicking/tabbing
+        # away from the box), which meant just glancing at another field
+        # mid-typing - or the suggestion popup itself briefly taking focus
+        # - could flip the whole dialog over to "new product" for a
+        # still-incomplete code. Removed for exactly that reason - nothing
+        # here reacts until you say it's ready.
         code_entry.bind("<Return>", check_code)
-        code_entry.bind("<FocusOut>", check_code)
         save_btn.configure(state="disabled")
         dialog.after(150, code_entry.focus_set)
+        dialog.after(150, _refresh_scroll_region)
 
     # _open_phone_capture_dialog moved to BaseScreen - POSScreen's search box
     # uses it too now, not just this dialog's barcode field.
@@ -3314,7 +4122,9 @@ class ReportsScreen(BaseScreen):
 # Customers (credit accounts)
 # --------------------------------------------------------------------------- #
 
-def open_customer_registration_dialog(parent, conn, *, prefill_phone: str = "") -> sqlite3.Row | None:
+def open_customer_registration_dialog(
+    parent, conn, *, prefill_phone: str = "", allow_credit_limit: bool = True
+) -> sqlite3.Row | None:
     """Shared 'Add Customer' flow: the Customers screen's own "Add
     Customer" button, and the POS screen's on-the-spot registration when a
     phone number typed at checkout doesn't match anyone yet. Phone is
@@ -3323,8 +4133,19 @@ def open_customer_registration_dialog(parent, conn, *, prefill_phone: str = "") 
     no phone on file could never be found again. Blocks until the dialog
     closes (a short modal form - fine to use Tkinter's own wait_window
     here) and returns the newly created customer row, or None if
-    cancelled."""
+    cancelled.
+
+    allow_credit_limit controls whether the person registering this
+    customer gets to choose their credit limit at all - callers pass their
+    own _is_admin() here. A Cashier registering someone (at the till, or
+    from this screen) always gets the shop's own default credit limit
+    (customers_module.get_default_credit_limit) with no way to type a
+    different number - letting any cashier hand out an arbitrary credit
+    limit on the spot was the actual gap being closed, not just a UI
+    nicety. Admin/Owner still sees the normal editable field, pre-filled
+    with that same default as a starting point they're free to change."""
     result: dict = {"row": None}
+    default_limit = customers_module.get_default_credit_limit(conn)
     dialog = ctk.CTkToplevel(parent)
     dialog.title("Register Loyalty Customer")
     fit_dialog(dialog, 380, 360)
@@ -3342,11 +4163,25 @@ def open_customer_registration_dialog(parent, conn, *, prefill_phone: str = "") 
 
     fields = {}
     for label, key, default in [("Name:", "name", ""), ("Phone:", "phone", prefill_phone),
-                                 ("Address:", "address", ""), ("Credit Limit:", "credit_limit", "0")]:
+                                 ("Address:", "address", "")]:
         ctk.CTkLabel(body, text=label).pack(anchor="w", padx=16, pady=(12, 0))
         v = tk.StringVar(value=default)
         ctk.CTkEntry(body, textvariable=v, width=320).pack(padx=16)
         fields[key] = v
+
+    if allow_credit_limit:
+        ctk.CTkLabel(body, text="Credit Limit:").pack(anchor="w", padx=16, pady=(12, 0))
+        credit_limit_var = tk.StringVar(value=f"{default_limit:g}")
+        ctk.CTkEntry(body, textvariable=credit_limit_var, width=320).pack(padx=16)
+    else:
+        credit_limit_var = None
+        ctk.CTkLabel(
+            body,
+            text=f"Credit limit: LKR {default_limit:,.2f} (the shop's default for a new customer - "
+                 "only Admin/Owner can set a different one, either here or later from the "
+                 "Customers screen's \"Edit Credit Limit\").",
+            text_color=theme.TEXT_MUTED, font=ctk.CTkFont(size=11), wraplength=320, justify="left",
+        ).pack(anchor="w", padx=16, pady=(12, 0))
 
     def save():
         name = fields["name"].get().strip()
@@ -3358,11 +4193,14 @@ def open_customer_registration_dialog(parent, conn, *, prefill_phone: str = "") 
             messagebox.showerror("Missing phone", "Phone number is required - it's how this customer "
                                                     "gets identified at checkout.")
             return
-        try:
-            limit = float(fields["credit_limit"].get() or 0)
-        except ValueError:
-            messagebox.showerror("Invalid credit limit", "Enter a number.")
-            return
+        if credit_limit_var is not None:
+            try:
+                limit = float(credit_limit_var.get() or 0)
+            except ValueError:
+                messagebox.showerror("Invalid credit limit", "Enter a number.")
+                return
+        else:
+            limit = default_limit
         try:
             customer_id = customers_module.add_customer(conn, name, phone, fields["address"].get(), limit)
         except ValueError as e:
@@ -3384,12 +4222,27 @@ class CustomersScreen(BaseScreen):
         super().__init__(parent, app)
         self.header("Customers & Credit Accounts")
 
+        self.hint = ctk.CTkLabel(
+            self, text="", text_color=theme.TEXT_MUTED, font=ctk.CTkFont(size=11),
+            wraplength=760, justify="left",
+        )
+        self.hint.pack(anchor="w", padx=24, pady=(0, 6))
+
         top = ctk.CTkFrame(self, fg_color="transparent")
         top.pack(fill="x", padx=24)
         styled_button(top, "Refresh", self.refresh, kind="secondary").pack(side="left")
         styled_button(top, "Add Customer", self.open_add_dialog, kind="primary").pack(side="left", padx=8)
         styled_button(top, "Settle Credit", self.open_settle_dialog, kind="success").pack(side="left", padx=8)
         styled_button(top, "View Statement", self.open_statement_dialog, kind="secondary").pack(side="left", padx=8)
+        # Both Admin/Owner-only - see refresh() below, which disables these
+        # for a Cashier rather than hiding them, same as InventoryScreen
+        # does for its own admin-only buttons.
+        self.edit_limit_btn = styled_button(
+            top, "Edit Credit Limit", self.open_edit_credit_limit_dialog, kind="secondary")
+        self.edit_limit_btn.pack(side="left", padx=8)
+        self.default_limit_btn = styled_button(
+            top, "Default Credit Limit", self.open_default_credit_limit_dialog, kind="secondary")
+        self.default_limit_btn.pack(side="left", padx=8)
 
         tree_frame = ctk.CTkFrame(self, fg_color="transparent")
         tree_frame.pack(fill="both", expand=True, padx=24, pady=10)
@@ -3403,7 +4256,30 @@ class CustomersScreen(BaseScreen):
     def on_show(self):
         self.refresh()
 
+    def _current_role(self) -> str | None:
+        if not self.app.logged_in:
+            return None
+        row = self.conn.execute(
+            "SELECT role FROM staff WHERE id=?", (self.app.current_staff_id,)
+        ).fetchone()
+        return row["role"] if row else None
+
+    def _is_admin(self) -> bool:
+        return self._current_role() in ("admin", "owner")
+
     def refresh(self):
+        is_admin = self._is_admin()
+        self.hint.configure(
+            text="Anyone can register a new loyalty customer (they get the shop's default credit "
+                 "limit below), settle a payment, or view a statement. Changing a customer's own "
+                 "credit limit, or the shop's default for new customers, is Admin/Owner-only "
+                 "- log in from the sidebar first."
+            if not is_admin else
+            "As Admin/Owner, you can also set a different credit limit for a customer while "
+            "registering them, change an existing customer's limit, or change the shop's default."
+        )
+        self.edit_limit_btn.configure(state="normal" if is_admin else "disabled")
+        self.default_limit_btn.configure(state="normal" if is_admin else "disabled")
         tree_clear(self.tree)
         for c in customers_module.list_customers(self.conn):
             available = round(c["credit_limit"] - c["credit_balance"], 2)
@@ -3420,8 +4296,121 @@ class CustomersScreen(BaseScreen):
         return int(sel[0]) if sel else None
 
     def open_add_dialog(self):
-        open_customer_registration_dialog(self, self.conn)
+        # A Cashier gets the shop's default credit limit with no way to
+        # change it (allow_credit_limit=False shows it as a read-only
+        # line instead of an entry) - only Admin/Owner can pick a
+        # different one for a new customer here. See
+        # open_customer_registration_dialog's own docstring.
+        open_customer_registration_dialog(self, self.conn, allow_credit_limit=self._is_admin())
         self.refresh()
+
+    def open_edit_credit_limit_dialog(self):
+        if not self._is_admin():
+            messagebox.showwarning(
+                "Admin required", "Log in as Admin or Owner (sidebar) to change a customer's credit limit.")
+            return
+        customer_id = self._selected_customer_id()
+        if customer_id is None:
+            messagebox.showwarning("Select a customer", "Select a customer in the list first.")
+            return
+        c = customers_module.get_customer(self.conn, customer_id)
+        if c is None:
+            return
+        if c["name"] == "Walk-in":
+            messagebox.showinfo(
+                "Not applicable",
+                "\"Walk-in\" is the anonymous cash-sale customer, not a real registered one - it "
+                "never has a credit limit of its own.",
+            )
+            return
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title(f"Edit Credit Limit — {c['name']}")
+        fit_dialog(dialog, 360, 300)
+        dialog.configure(fg_color=theme.BG_LIGHT)
+        dialog.grab_set()
+
+        body = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
+        body.pack(fill="both", expand=True)
+
+        ctk.CTkLabel(body, text=f"{c['name']} ({c['phone'] or 'no phone on file'})",
+                     font=ctk.CTkFont(size=14, weight="bold"), text_color=theme.NAVY_DARK).pack(pady=(16, 2))
+        ctk.CTkLabel(body, text=f"Currently owes LKR {c['credit_balance']:,.2f} of a "
+                                 f"LKR {c['credit_limit']:,.2f} limit.",
+                     text_color=theme.TEXT_MUTED, font=ctk.CTkFont(size=11)).pack(pady=(0, 10))
+
+        ctk.CTkLabel(body, text="New credit limit:").pack(anchor="w", padx=20)
+        limit_var = tk.StringVar(value=f"{c['credit_limit']:g}")
+        ctk.CTkEntry(body, textvariable=limit_var, width=300).pack(padx=20)
+
+        def save():
+            try:
+                new_limit = float(limit_var.get())
+            except ValueError:
+                messagebox.showerror("Invalid credit limit", "Enter a number.")
+                return
+            if new_limit < 0:
+                messagebox.showerror("Invalid credit limit", "Credit limit can't be negative.")
+                return
+            if new_limit < c["credit_balance"] and not messagebox.askyesno(
+                "Below current balance",
+                f"{c['name']} already owes LKR {c['credit_balance']:,.2f} - more than this new "
+                f"limit of LKR {new_limit:,.2f}. They won't be able to buy on credit again until "
+                "they pay some of it down. Save anyway?",
+            ):
+                return
+            customers_module.update_customer(
+                self.conn, customer_id, c["name"], c["phone"] or "", c["address"] or "", new_limit)
+            dialog.destroy()
+            self.refresh()
+
+        dialog.bind("<Return>", lambda e: save())
+        styled_button(dialog, "Save", save, kind="primary", width=140).pack(pady=18)
+
+    def open_default_credit_limit_dialog(self):
+        if not self._is_admin():
+            messagebox.showwarning(
+                "Admin required", "Log in as Admin or Owner (sidebar) to change the default credit limit.")
+            return
+        current = customers_module.get_default_credit_limit(self.conn)
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Default Credit Limit")
+        fit_dialog(dialog, 380, 300)
+        dialog.configure(fg_color=theme.BG_LIGHT)
+        dialog.grab_set()
+
+        body = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
+        body.pack(fill="both", expand=True)
+
+        ctk.CTkLabel(
+            body,
+            text="This is the credit limit a brand-new customer starts with when a Cashier "
+                 "registers them - at the till or from \"Add Customer\" here. Cashiers can't "
+                 "choose a different one themselves; Admin/Owner still can, either for one "
+                 "customer while registering them, or afterwards with \"Edit Credit Limit\".",
+            text_color=theme.TEXT_MUTED, font=ctk.CTkFont(size=11), wraplength=320, justify="left",
+        ).pack(padx=16, pady=(16, 10))
+
+        ctk.CTkLabel(body, text="Default credit limit for new customers:").pack(anchor="w", padx=20)
+        limit_var = tk.StringVar(value=f"{current:g}")
+        ctk.CTkEntry(body, textvariable=limit_var, width=300).pack(padx=20)
+
+        def save():
+            try:
+                new_default = float(limit_var.get())
+            except ValueError:
+                messagebox.showerror("Invalid credit limit", "Enter a number.")
+                return
+            try:
+                customers_module.set_default_credit_limit(self.conn, new_default)
+            except ValueError as e:
+                messagebox.showerror("Invalid credit limit", str(e))
+                return
+            dialog.destroy()
+
+        dialog.bind("<Return>", lambda e: save())
+        styled_button(dialog, "Save", save, kind="primary", width=140).pack(pady=18)
 
     def open_settle_dialog(self):
         customer_id = self._selected_customer_id()
@@ -3435,7 +4424,14 @@ class CustomersScreen(BaseScreen):
 
         dialog = ctk.CTkToplevel(self)
         dialog.title("Settle Credit")
-        fit_dialog(dialog, 360, 260)
+        # Was 260 - technically never NEEDED maximizing (fit_dialog's own
+        # docstring explains why: the Save-equivalent button already lives
+        # outside the scrollable body, so it's always visible) but still
+        # felt visibly cramped for what's on it (an amount, a method
+        # dropdown, the button) - reported directly. Taller now so it
+        # reads as a normal-sized dialog at a glance, not a fix for
+        # anything actually broken.
+        fit_dialog(dialog, 360, 340)
         dialog.configure(fg_color=theme.BG_LIGHT)
         dialog.grab_set()
 
@@ -3673,29 +4669,89 @@ class OffersScreen(BaseScreen):
 # --------------------------------------------------------------------------- #
 
 class SuppliersScreen(BaseScreen):
+    """Supplier master records plus the shop's accounts-payable side - not
+    every delivery is paid cash on the spot, so this screen also covers:
+    paying down what's owed a supplier, a reminder list of cheques given
+    to suppliers that haven't cleared yet (so the bank account has the
+    funds ready), a running statement per supplier, and sending stock back
+    to one. See suppliers.py's module docstring for the full design - it
+    deliberately mirrors CustomersScreen's credit-account handling.
+
+    Paying a supplier or returning stock to one is Admin/Owner-only, same
+    as receiving stock is in Inventory's "Add / Scan Item" (these are all
+    purchasing-side actions, not day-to-day sales-floor ones) - Cheques
+    Due and View Statement are just read-only information, so anyone can
+    check them."""
+
     def __init__(self, parent, app):
         super().__init__(parent, app)
         self.header("Suppliers")
+
+        self.hint = ctk.CTkLabel(
+            self, text="", text_color=theme.TEXT_MUTED, font=ctk.CTkFont(size=11),
+            wraplength=760, justify="left",
+        )
+        self.hint.pack(anchor="w", padx=24, pady=(0, 6))
 
         top = ctk.CTkFrame(self, fg_color="transparent")
         top.pack(fill="x", padx=24)
         styled_button(top, "Refresh", self.refresh, kind="secondary").pack(side="left")
         styled_button(top, "Add Supplier", self.open_add_dialog, kind="primary").pack(side="left", padx=8)
+        styled_button(top, "View Statement", self.open_statement_dialog, kind="secondary").pack(side="left", padx=8)
+        styled_button(top, "Cheques Due", self.open_cheques_due_dialog, kind="secondary").pack(side="left", padx=8)
+        # Both Admin/Owner-only - see refresh() below, which disables these
+        # for a Cashier rather than hiding them, same as everywhere else in
+        # this app that gates a button this way.
+        self.pay_btn = styled_button(top, "Pay Supplier", self.open_pay_dialog, kind="success")
+        self.pay_btn.pack(side="left", padx=8)
+        self.return_btn = styled_button(top, "Return to Supplier", self.open_return_dialog, kind="danger")
+        self.return_btn.pack(side="left", padx=8)
 
         tree_frame = ctk.CTkFrame(self, fg_color="transparent")
         tree_frame.pack(fill="both", expand=True, padx=24, pady=10)
         self.tree = make_treeview(
-            tree_frame, ["Name", "Phone", "Address"], {"Name": 220, "Phone": 140, "Address": 260},
+            tree_frame, ["Name", "Phone", "Address", "Payable Balance"],
+            {"Name": 200, "Phone": 130, "Address": 240, "Payable Balance": 120},
         )
         self.tree.master_frame.pack(fill="both", expand=True)
 
     def on_show(self):
         self.refresh()
 
+    def _current_role(self) -> str | None:
+        if not self.app.logged_in:
+            return None
+        row = self.conn.execute(
+            "SELECT role FROM staff WHERE id=?", (self.app.current_staff_id,)
+        ).fetchone()
+        return row["role"] if row else None
+
+    def _is_admin(self) -> bool:
+        return self._current_role() in ("admin", "owner")
+
     def refresh(self):
+        is_admin = self._is_admin()
+        self.hint.configure(
+            text="Anyone can register a new supplier, view a statement, or check cheques due. "
+                 "Paying a supplier down or returning stock to one is Admin/Owner-only - log in "
+                 "from the sidebar first."
+            if not is_admin else
+            "As Admin/Owner, you can also record a payment against a supplier's balance or send "
+            "stock back to one."
+        )
+        self.pay_btn.configure(state="normal" if is_admin else "disabled")
+        self.return_btn.configure(state="normal" if is_admin else "disabled")
         tree_clear(self.tree)
         for s in suppliers_module.list_suppliers(self.conn):
-            tree_insert(self.tree, (s["name"], s["phone"] or "", s["address"] or ""), iid=str(s["id"]))
+            tree_insert(
+                self.tree,
+                (s["name"], s["phone"] or "", s["address"] or "", f"{s['payable_balance']:,.2f}"),
+                iid=str(s["id"]),
+            )
+
+    def _selected_supplier_id(self):
+        sel = self.tree.selection()
+        return int(sel[0]) if sel else None
 
     def open_add_dialog(self):
         dialog = ctk.CTkToplevel(self)
@@ -3728,6 +4784,183 @@ class SuppliersScreen(BaseScreen):
 
         dialog.bind("<Return>", lambda e: save())
         styled_button(dialog, "Save", save, kind="primary", width=140).pack(pady=18)
+
+    def open_pay_dialog(self):
+        if not self._is_admin():
+            messagebox.showwarning("Admin required", "Log in as Admin or Owner (sidebar) to pay a supplier.")
+            return
+        supplier_id = self._selected_supplier_id()
+        if supplier_id is None:
+            messagebox.showwarning("Select a supplier", "Select a supplier in the list first.")
+            return
+        s = suppliers_module.get_supplier(self.conn, supplier_id)
+        if s is None or s["payable_balance"] <= 0:
+            messagebox.showinfo("Nothing owed", f"{s['name'] if s else 'This supplier'} has no outstanding balance.")
+            return
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Pay Supplier")
+        fit_dialog(dialog, 360, 340)
+        dialog.configure(fg_color=theme.BG_LIGHT)
+        dialog.grab_set()
+
+        body = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
+        body.pack(fill="both", expand=True)
+
+        ctk.CTkLabel(body, text=f"You owe {s['name']} LKR {s['payable_balance']:,.2f}",
+                     font=ctk.CTkFont(size=14, weight="bold"), text_color=theme.NAVY_DARK).pack(pady=(16, 10))
+
+        ctk.CTkLabel(body, text="Amount paying:").pack(anchor="w", padx=20)
+        amount_var = tk.StringVar(value=f"{s['payable_balance']:.2f}")
+        ctk.CTkEntry(body, textvariable=amount_var, width=300).pack(padx=20)
+
+        ctk.CTkLabel(body, text="Method:").pack(anchor="w", padx=20, pady=(10, 0))
+        method_var = tk.StringVar(value="cash")
+        ctk.CTkOptionMenu(body, values=["cash", "cheque", "bank_transfer"], variable=method_var, width=300).pack(padx=20)
+
+        def save():
+            try:
+                amount = float(amount_var.get())
+            except ValueError:
+                messagebox.showerror("Invalid amount", "Enter a number.")
+                return
+            if amount <= 0 or amount > s["payable_balance"] + 0.01:
+                messagebox.showerror("Invalid amount", f"Enter an amount up to LKR {s['payable_balance']:,.2f}.")
+                return
+            suppliers_module.pay_supplier(self.conn, supplier_id, amount, method_var.get())
+            dialog.destroy()
+            self.refresh()
+
+        dialog.bind("<Return>", lambda e: save())
+        styled_button(dialog, "Record Payment", save, kind="success", width=160).pack(pady=18)
+
+    def open_statement_dialog(self):
+        supplier_id = self._selected_supplier_id()
+        if supplier_id is None:
+            messagebox.showwarning("Select a supplier", "Select a supplier in the list first.")
+            return
+        s = suppliers_module.get_supplier(self.conn, supplier_id)
+        rows = suppliers_module.supplier_statement(self.conn, supplier_id)
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title(f"Supplier Statement — {s['name'] if s else ''}")
+        fit_dialog(dialog, 560, 420)
+        dialog.configure(fg_color=theme.BG_LIGHT)
+        dialog.grab_set()
+
+        stmt_tree = make_treeview(dialog, ["Date", "Description", "Charge", "Payment", "Balance"],
+                                   {"Date": 130, "Description": 200, "Charge": 80, "Payment": 80, "Balance": 90})
+        stmt_tree.master_frame.pack(fill="both", expand=True, padx=16, pady=16)
+        for r in rows:
+            tree_insert(stmt_tree, (r["ts"], r["description"], f"{r['charge']:.2f}" if r["charge"] else "",
+                                     f"{r['payment']:.2f}" if r["payment"] else "", f"{r['balance']:.2f}"))
+        if not rows:
+            ctk.CTkLabel(dialog, text="No purchase/payment activity yet.", text_color=theme.TEXT_MUTED).pack(pady=10)
+
+    def open_cheques_due_dialog(self):
+        rows = suppliers_module.list_pending_cheques(self.conn)
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Cheques Due")
+        fit_dialog(dialog, 560, 420)
+        dialog.configure(fg_color=theme.BG_LIGHT)
+        dialog.grab_set()
+
+        ctk.CTkLabel(
+            dialog, text="Cheques given to suppliers that haven't been marked cleared yet - make "
+                         "sure the amount is in the bank account by the date shown.",
+            text_color=theme.TEXT_MUTED, font=ctk.CTkFont(size=11), wraplength=520, justify="left",
+        ).pack(anchor="w", padx=16, pady=(16, 8))
+
+        chq_tree = make_treeview(
+            dialog, ["Supplier", "Cheque No.", "Due Date", "Amount"],
+            {"Supplier": 180, "Cheque No.": 120, "Due Date": 110, "Amount": 100},
+        )
+        chq_tree.master_frame.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+        for r in rows:
+            tree_insert(
+                chq_tree,
+                (r["supplier_name"], r["cheque_number"] or "-", r["cheque_date"] or "-", f"{r['amount']:,.2f}"),
+                iid=str(r["id"]),
+            )
+        if not rows:
+            ctk.CTkLabel(dialog, text="No cheques pending - nothing to remind you about.",
+                         text_color=theme.TEXT_MUTED).pack(pady=10)
+            return
+
+        def mark_cleared():
+            sel = chq_tree.selection()
+            if not sel:
+                messagebox.showwarning("Select a cheque", "Select a cheque in the list first.")
+                return
+            suppliers_module.mark_cheque_cleared(self.conn, int(sel[0]))
+            dialog.destroy()
+            self.open_cheques_due_dialog()
+
+        styled_button(dialog, "Mark Selected as Cleared", mark_cleared, kind="secondary").pack(pady=(0, 16))
+
+    def open_return_dialog(self):
+        if not self._is_admin():
+            messagebox.showwarning("Admin required", "Log in as Admin or Owner (sidebar) to return stock.")
+            return
+        supplier_id = self._selected_supplier_id()
+        if supplier_id is None:
+            messagebox.showwarning("Select a supplier", "Select a supplier in the list first.")
+            return
+        s = suppliers_module.get_supplier(self.conn, supplier_id)
+        batches = self.conn.execute(
+            """SELECT b.id, b.batch_no, b.qty_remaining, b.cost_price, p.name_en
+               FROM stock_batches b JOIN products p ON p.id = b.product_id
+               WHERE b.supplier_id=? AND b.qty_remaining > 0 ORDER BY b.received_date DESC""",
+            (supplier_id,),
+        ).fetchall()
+        if not batches:
+            messagebox.showinfo(
+                "Nothing to return",
+                f"No stock still on hand from {s['name'] if s else 'this supplier'} to send back.")
+            return
+        labels = [f"{b['batch_no']} - {b['name_en']} ({b['qty_remaining']:g} left)" for b in batches]
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title(f"Return to Supplier — {s['name'] if s else ''}")
+        fit_dialog(dialog, 420, 420)
+        dialog.configure(fg_color=theme.BG_LIGHT)
+        dialog.grab_set()
+
+        body = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
+        body.pack(fill="both", expand=True)
+
+        ctk.CTkLabel(body, text="Batch:").pack(anchor="w", padx=16, pady=(16, 0))
+        batch_var = tk.StringVar(value=labels[0])
+        SearchableDropdown(body, values=labels, variable=batch_var, width=360, label="Batch").pack(padx=16)
+
+        ctk.CTkLabel(body, text="Quantity returning:").pack(anchor="w", padx=16, pady=(12, 0))
+        qty_var = tk.StringVar(value="1")
+        ctk.CTkEntry(body, textvariable=qty_var, width=360).pack(padx=16)
+
+        ctk.CTkLabel(body, text="Credit amount (blank = qty × cost price):").pack(anchor="w", padx=16, pady=(12, 0))
+        credit_var = tk.StringVar()
+        ctk.CTkEntry(body, textvariable=credit_var, width=360).pack(padx=16)
+
+        ctk.CTkLabel(body, text="Reason:").pack(anchor="w", padx=16, pady=(12, 0))
+        reason_var = tk.StringVar()
+        ctk.CTkEntry(body, textvariable=reason_var, width=360).pack(padx=16)
+
+        def save():
+            try:
+                idx = labels.index(batch_var.get())
+                batch = batches[idx]
+                qty = float(qty_var.get())
+                credit_amount = float(credit_var.get()) if credit_var.get().strip() else None
+                suppliers_module.return_to_supplier(
+                    self.conn, batch["id"], qty, credit_amount=credit_amount, reason=reason_var.get().strip())
+                dialog.destroy()
+                self.refresh()
+            except ValueError as e:
+                messagebox.showerror("Invalid input", str(e))
+
+        dialog.bind("<Return>", lambda e: save())
+        styled_button(dialog, "Confirm Return", save, kind="danger", width=160).pack(pady=18)
 
 
 # --------------------------------------------------------------------------- #

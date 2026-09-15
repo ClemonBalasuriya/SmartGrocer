@@ -228,6 +228,55 @@ CREATE TABLE IF NOT EXISTS returns (
     reason         TEXT
 );
 
+-- One single row (id is always 1) holding shop-wide settings that aren't
+-- tied to any one customer/product/etc. Currently just the default credit
+-- limit a Cashier-registered customer starts with (see customers.py's
+-- get_default_credit_limit/set_default_credit_limit and the Customers
+-- screen's "Default Credit Limit" button, Admin/Owner-only) - a plain
+-- table (rather than till_config.py's per-PC JSON file) because this is
+-- shop data everyone shares, not one till's own connection settings.
+CREATE TABLE IF NOT EXISTS shop_settings (
+    id                    INTEGER PRIMARY KEY CHECK (id = 1),
+    default_credit_limit  REAL NOT NULL DEFAULT 0
+);
+
+-- Payments made to a supplier - either a general settlement against that
+-- supplier's running payable_balance (batch_id NULL, mirrors
+-- credit_settlements for customers), or a cheque logged right at the
+-- moment stock was received (batch_id set) purely as an informational
+-- reminder of the cheque's date/amount so funds are ready in the bank -
+-- that kind never affects payable_balance, since the batch itself is
+-- already marked 'paid'. See suppliers.py's pay_supplier,
+-- record_purchase_payment, mark_cheque_cleared, list_pending_cheques.
+CREATE TABLE IF NOT EXISTS supplier_payments (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    supplier_id    INTEGER NOT NULL REFERENCES suppliers(id),
+    batch_id       INTEGER REFERENCES stock_batches(id),
+    amount         REAL NOT NULL,
+    method         TEXT NOT NULL DEFAULT 'cash',    -- cash | cheque | bank_transfer
+    cheque_number  TEXT,
+    cheque_date    TEXT,                             -- ISO date - when the cheque is dated/due
+    status         TEXT NOT NULL DEFAULT 'cleared',  -- 'pending' | 'cleared' - only meaningful for cheques
+    paid_at        TEXT NOT NULL,
+    note           TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_supplierpayments_supplier ON supplier_payments(supplier_id);
+CREATE INDEX IF NOT EXISTS idx_supplierpayments_cheque_date ON supplier_payments(cheque_date);
+
+-- Stock physically sent back to a supplier (damaged/wrong delivery/etc) -
+-- see suppliers.py's return_to_supplier.
+CREATE TABLE IF NOT EXISTS supplier_returns (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    supplier_id    INTEGER NOT NULL REFERENCES suppliers(id),
+    product_id     INTEGER NOT NULL REFERENCES products(id),
+    batch_id       INTEGER REFERENCES stock_batches(id),
+    qty            REAL NOT NULL,
+    credit_amount  REAL NOT NULL DEFAULT 0,
+    returned_at    TEXT NOT NULL,
+    reason         TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_supplierreturns_supplier ON supplier_returns(supplier_id);
+
 CREATE INDEX IF NOT EXISTS idx_invitems_product ON invoice_items(product_id);
 CREATE INDEX IF NOT EXISTS idx_invitems_invoice ON invoice_items(invoice_id);
 CREATE INDEX IF NOT EXISTS idx_invoices_datetime ON invoices(datetime);
@@ -281,6 +330,15 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE staff ADD COLUMN email TEXT")
     if "phone" not in staff_cols:
         conn.execute("ALTER TABLE staff ADD COLUMN phone TEXT")
+    supplier_cols = {r["name"] for r in conn.execute("PRAGMA table_info(suppliers)")}
+    if "payable_balance" not in supplier_cols:
+        conn.execute("ALTER TABLE suppliers ADD COLUMN payable_balance REAL NOT NULL DEFAULT 0")
+    if "payment_status" not in batch_cols:
+        # 'paid' by default - matches how every restock behaved before this
+        # feature existed (cash in hand, nothing owed) - only a GRN
+        # explicitly marked 'cheque' or 'not paid yet' (see
+        # pos.receive_stock) sets anything else.
+        conn.execute("ALTER TABLE stock_batches ADD COLUMN payment_status TEXT NOT NULL DEFAULT 'paid'")
     conn.commit()
 
 
@@ -314,6 +372,8 @@ def init_db(conn: sqlite3.Connection) -> None:
             "INSERT INTO customers (name, phone, credit_limit) VALUES (?,?,?)",
             ("Walk-in", "", 0),
         )
+    if conn.execute("SELECT COUNT(*) c FROM shop_settings").fetchone()["c"] == 0:
+        conn.execute("INSERT INTO shop_settings (id, default_credit_limit) VALUES (1, 0)")
     conn.commit()
 
 

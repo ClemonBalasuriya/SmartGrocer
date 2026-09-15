@@ -188,6 +188,26 @@ class SmartGrocerApp(ctk.CTk):
         )
         self.change_pin_btn.pack(fill="x", pady=2)
 
+        # Linking a phone scanner is a "before you start ringing anything
+        # up" setup step, not something specific to whichever screen
+        # happens to be open - it used to be a 4th button buried in POS/
+        # Checkout's own row of Hold Invoice/Resume Held/Return-Refund
+        # buttons, where a cashier who'd never used it before genuinely
+        # couldn't find it ("scanner button can't see"). Living here
+        # instead, right under the day-status card, means it's visible no
+        # matter which screen is on-screen. This delegates to the POS
+        # screen's own dialog and scan-routing logic
+        # (POSScreen.open_phone_scanner_dialog) rather than duplicating
+        # it - self.frames["pos"] always exists once __init__ finishes
+        # (see the NAV_ITEMS loop below), even while a different screen is
+        # the one currently shown, since a Toplevel dialog isn't tied to
+        # whether its parent frame is the one currently gridded on top.
+        ctk.CTkButton(
+            self.sidebar, text="📷  Link Phone Scanner", height=34, font=ctk.CTkFont(size=12, weight="bold"),
+            fg_color=theme.ACCENT_BLUE, hover_color=theme.ACCENT_BLUE_HOVER, text_color="#FFFFFF",
+            command=lambda: self.frames["pos"].open_phone_scanner_dialog(),
+        ).pack(fill="x", padx=14, pady=(0, 12))
+
         divider = ctk.CTkFrame(self.sidebar, height=1, fg_color="#1E2D52")
         divider.pack(fill="x", padx=16, pady=(0, 12))
 
@@ -283,6 +303,21 @@ class SmartGrocerApp(ctk.CTk):
         # CTkScrollbar/CTkSlider/CTkTextbox to scroll itself), and letting
         # it run unimpeded is strictly better than running a second,
         # cruder copy of the same idea alongside it.
+        #
+        # NOTE ON PINCH-TO-ZOOM (tried and reverted): a touchpad pinch
+        # gesture is reported to Windows apps as a MouseWheel event with
+        # the Control modifier held (the convention a browser uses for
+        # "zoom" rather than "scroll"), so a `<Control-MouseWheel>` binding
+        # that swallowed it seemed like the right fix for a pinch
+        # unexpectedly scrolling this page. In practice, on this
+        # touchpad/driver, ORDINARY two-finger scrolling ALSO reports
+        # Control as held on every event, not just an actual pinch - Tk
+        # can't tell the two apart here, so that binding caught real
+        # scrolling too and broke it outright (worse than the pinch
+        # annoyance it was meant to fix). Do not reintroduce a
+        # `<Control-MouseWheel>`/`<Control-Button-4/5>` binding here for
+        # that reason - it trades a minor, rare glitch (pinch causing an
+        # unwanted scroll) for a major one (scrolling not working at all).
 
         self.container = ctk.CTkFrame(self, corner_radius=0, fg_color=theme.BG_LIGHT)
         self.container.grid(row=0, column=1, sticky="nsew")
@@ -298,11 +333,37 @@ class SmartGrocerApp(ctk.CTk):
         self.show_frame("dashboard")
         self.refresh_day_status()
 
+        # NO custom app-wide MouseWheel/Button-4/Button-5 binding here - see
+        # the long "NOTE ON MOUSE-WHEEL SCROLLING" comment above, next to
+        # nav_scroll. A hand-added one very much like this used to live
+        # here (bound with add="+", so it didn't wipe out CustomTkinter's
+        # own handler the way the much older app-1.py-era bug did) - but
+        # "doesn't destroy the other handler" isn't the same as "doesn't
+        # interfere with it". Every wheel-ish event this touchpad ever
+        # sends (which per the pinch-to-zoom note below is Control-
+        # MouseWheel, whether the gesture was an actual pinch or an
+        # ordinary two-finger scroll - Tk doesn't require an exact
+        # modifier match to fire a plain, unqualified `<MouseWheel>`
+        # binding, so CustomTkinter's own handler ALREADY reacts to it) was
+        # firing BOTH that handler and CustomTkinter's own at once, each
+        # scrolling the same canvas its own amount - not broken exactly,
+        # but not "correct" either (a jumpier, inconsistent scroll distance
+        # per gesture than either handler alone would give). Removing it
+        # restores the single, already-correct CustomTkinter handler as the
+        # only thing reacting to wheel/trackpad input.
+        #
+        # Plain two-finger swipe (as opposed to pinch) not scrolling at all
+        # is a separate, real limitation - but it's this specific touchpad
+        # driver simply never sending Tk any event for that gesture in the
+        # first place (confirmed: every screen in this app is equally
+        # affected, including ones with no custom scroll code whatsoever),
+        # so there is no event here for ANY binding, custom or
+        # CustomTkinter's own, to ever catch. That's a Windows/driver
+        # setting to check (Settings > Bluetooth & devices > Touchpad -
+        # "Drag two fingers to scroll" and similar), not something fixable
+        # from inside this app.
+
         if self.till_config["mode"] == "server":
-            # Was sharing before the app was last closed - resume
-            # automatically with the SAME pairing code, so any Cashier
-            # Till already configured to connect here doesn't need to be
-            # re-paired after every restart of the Main Till.
             self.start_sharing(pairing_code=self.till_config.get("pairing_code"))
 
     def show_frame(self, key: str):
@@ -370,7 +431,8 @@ class SmartGrocerApp(ctk.CTk):
 
         ctk.CTkLabel(body, text="PIN:").pack(anchor="w", padx=16, pady=(12, 0))
         pin_var = tk.StringVar()
-        ctk.CTkEntry(body, textvariable=pin_var, width=280, show="*").pack(padx=16)
+        pin_entry = ctk.CTkEntry(body, textvariable=pin_var, width=280, show="*")
+        pin_entry.pack(padx=16)
 
         already_open = cash_drawer.get_open_session(self.conn) is not None
         float_var = tk.StringVar(value="0")
@@ -416,6 +478,16 @@ class SmartGrocerApp(ctk.CTk):
             hover_color=theme.BG_LIGHT, height=24,
             command=lambda: self.open_forgot_pin_dialog(staff_var.get()),
         ).pack()
+
+        # Staff is already picked (defaults to the first name in the
+        # list) - the PIN is the one thing every login actually needs to
+        # type, so put the cursor there the moment the dialog opens rather
+        # than making the cashier click into it first. `after(150, ...)`
+        # rather than focusing immediately - same reasoning as the barcode
+        # field elsewhere in this app: the dialog's own grab_set()/window-
+        # manager focus needs a moment to settle first, or an immediate
+        # focus_set() here can get silently overridden by that.
+        dialog.after(150, pin_entry.focus_set)
 
     def open_forgot_pin_dialog(self, preselected_name: str = ""):
         """Self-service PIN recovery for ANY role (cashier, admin, owner) -

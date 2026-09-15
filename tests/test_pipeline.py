@@ -264,6 +264,65 @@ def test_supplier_summary_reflects_received_stock():
     assert summary["Unit Test Supplier"]["qty_received"] >= 20
 
 
+def test_supplier_credit_purchase_and_settlement_track_payable_balance():
+    conn = _fresh_db()
+    sid = suppliers.add_supplier(conn, "Credit Test Supplier")
+    p = conn.execute("SELECT * FROM products LIMIT 1").fetchone()
+    batch_id = pos.receive_stock(
+        conn, product_id=p["id"], qty=10, cost_price=50.0, supplier_id=sid, payment_method="credit",
+    )
+    supplier = suppliers.get_supplier(conn, sid)
+    assert abs(supplier["payable_balance"] - 500.0) < 0.01
+    batch = conn.execute("SELECT payment_status FROM stock_batches WHERE id=?", (batch_id,)).fetchone()
+    assert batch["payment_status"] == "credit"
+
+    suppliers.pay_supplier(conn, sid, 200.0, method="cash")
+    assert abs(suppliers.get_supplier(conn, sid)["payable_balance"] - 300.0) < 0.01
+
+    statement = suppliers.supplier_statement(conn, sid)
+    assert len(statement) == 2  # one charge, one payment
+    assert abs(statement[-1]["balance"] - 300.0) < 0.01
+
+
+def test_supplier_cheque_at_receipt_is_reminder_only():
+    conn = _fresh_db()
+    sid = suppliers.add_supplier(conn, "Cheque Test Supplier")
+    p = conn.execute("SELECT * FROM products LIMIT 1").fetchone()
+    pos.receive_stock(
+        conn, product_id=p["id"], qty=5, cost_price=20.0, supplier_id=sid,
+        payment_method="cheque", cheque_number="CHQ-001", cheque_date="2026-03-15",
+    )
+    # A cheque handed over at receiving time is a reminder, not a debt -
+    # the batch is already 'paid' and payable_balance never moves.
+    assert suppliers.get_supplier(conn, sid)["payable_balance"] == 0
+
+    pending = suppliers.list_pending_cheques(conn)
+    assert len(pending) == 1
+    assert pending[0]["supplier_name"] == "Cheque Test Supplier"
+    assert pending[0]["cheque_date"] == "2026-03-15"
+    assert abs(pending[0]["amount"] - 100.0) < 0.01
+
+    suppliers.mark_cheque_cleared(conn, pending[0]["id"])
+    assert suppliers.list_pending_cheques(conn) == []
+    assert suppliers.get_supplier(conn, sid)["payable_balance"] == 0  # unaffected either way
+
+
+def test_return_to_supplier_reduces_stock_and_credits_payable():
+    conn = _fresh_db()
+    sid = suppliers.add_supplier(conn, "Return Test Supplier")
+    p = conn.execute("SELECT * FROM products LIMIT 1").fetchone()
+    batch_id = pos.receive_stock(
+        conn, product_id=p["id"], qty=10, cost_price=30.0, supplier_id=sid, payment_method="credit",
+    )
+    before = pos.get_stock_on_hand(conn, p["id"])
+    suppliers.return_to_supplier(conn, batch_id, 3, reason="damaged in transit")
+    assert pos.get_stock_on_hand(conn, p["id"]) == before - 3
+    # 10*30=300 owed, minus a 3*30=90 credit for the return -> 210 left owed.
+    assert abs(suppliers.get_supplier(conn, sid)["payable_balance"] - 210.0) < 0.01
+    returns = suppliers.list_returns(conn, sid)
+    assert len(returns) == 1 and returns[0]["qty"] == 3
+
+
 def test_cash_drawer_day_open_sell_close_matches():
     conn = _fresh_db()
     p = _product_with_stock(conn, min_qty=2)
@@ -790,6 +849,42 @@ def test_add_product_creates_catalog_entry_with_opening_stock():
             pass
 
 
+def test_add_product_opening_stock_on_credit_raises_supplier_payable():
+    # A brand-new product's OPENING stock can be taken on credit too, not
+    # just a restock via receive_stock - the Inventory dialog's Payment
+    # section now covers both paths (see open_add_product_dialog).
+    conn = _fresh_db()
+    sid = suppliers.add_supplier(conn, "New Product Credit Supplier")
+    product_id = pos.add_product(
+        conn, code="NEW-BARCODE-CREDIT", name_en="Credit-Opened Product", category="Snacks",
+        cost_price=40.0, cash_price=60.0, initial_qty=10, supplier_id=sid, payment_method="credit",
+    )
+    assert abs(suppliers.get_supplier(conn, sid)["payable_balance"] - 400.0) < 0.01
+    batch = conn.execute(
+        "SELECT payment_status FROM stock_batches WHERE product_id=?", (product_id,)
+    ).fetchone()
+    assert batch["payment_status"] == "credit"
+
+    # A cheque handed over for the opening stock is a reminder, not a debt.
+    sid2 = suppliers.add_supplier(conn, "New Product Cheque Supplier")
+    pos.add_product(
+        conn, code="NEW-BARCODE-CHEQUE", name_en="Cheque-Opened Product", category="Snacks",
+        cost_price=25.0, cash_price=40.0, initial_qty=4, supplier_id=sid2, payment_method="cheque",
+        cheque_number="CHQ-900", cheque_date="2026-04-01",
+    )
+    assert suppliers.get_supplier(conn, sid2)["payable_balance"] == 0
+    pending = suppliers.list_pending_cheques(conn)
+    assert any(p["supplier_name"] == "New Product Cheque Supplier" and abs(p["amount"] - 100.0) < 0.01
+               for p in pending)
+
+    # Zero opening stock means nothing was actually purchased yet, so a
+    # non-cash payment method with no supplier is harmless, not an error.
+    pos.add_product(
+        conn, code="NEW-BARCODE-NOQTY", name_en="No Opening Stock Product", category="Snacks",
+        cost_price=10.0, cash_price=15.0, initial_qty=0, payment_method="credit",
+    )
+
+
 def test_receive_stock_tops_up_existing_product():
     # This is the "already in the catalog - just ask the quantity" path of
     # the Inventory screen's "Add / Scan Item" dialog (and the GRN dialog),
@@ -961,6 +1056,45 @@ def test_phone_number_is_the_loyalty_id_and_must_be_unique():
     # ...but a customer keeping their own number when saving other edits is fine.
     customers.update_customer(conn, cid1, "Person One Renamed", "0711111111", "", 0)
     assert customers.get_customer(conn, cid1)["name"] == "Person One Renamed"
+
+
+def test_search_customers_suggests_by_phone_prefix_and_by_name():
+    """Backs the checkout screen's live suggestion dropdown on the phone
+    box (SuggestionBox in gui/screens.py) - phone-prefix matches should
+    win over a name match, and Walk-in/inactive customers must never
+    appear (same rule find_customer_by_phone already follows)."""
+    conn = _fresh_db()
+    cid1 = customers.add_customer(conn, "Amara Perera", phone="0771234567")
+    customers.add_customer(conn, "Amila Silva", phone="0709998888")
+
+    by_phone = customers.search_customers(conn, "0771")
+    assert [c["id"] for c in by_phone] == [cid1]
+
+    by_name = customers.search_customers(conn, "Amara")
+    assert [c["id"] for c in by_name] == [cid1]
+
+    both = customers.search_customers(conn, "Am")  # matches both names
+    assert {c["id"] for c in both} == {cid1, customers.find_customer_by_phone(conn, "0709998888")["id"]}
+
+    assert customers.search_customers(conn, "") == []
+    assert not any(c["name"] == "Walk-in" for c in customers.search_customers(conn, "Walk"))
+
+
+def test_search_products_by_code_matches_prefix_only_not_name():
+    """Backs the checkout screen's dedicated barcode-box suggestions - code
+    prefix only, never a name match (that's what the separate name box's
+    own suggestions, via the existing search_products, are for)."""
+    conn = _fresh_db()
+    p = _product_with_stock(conn, min_qty=1)
+    code = p["code"]
+
+    matches = pos.search_products_by_code(conn, code[:4])
+    assert any(m["id"] == p["id"] for m in matches)
+
+    # Searching by this product's NAME must not turn up here, even though
+    # search_products (used by the name box) would find it.
+    assert not any(m["id"] == p["id"] for m in pos.search_products_by_code(conn, p["name_en"]))
+    assert pos.search_products_by_code(conn, "") == []
 
 
 def test_offer_scoped_to_loyalty_only_applies_to_registered_customers():

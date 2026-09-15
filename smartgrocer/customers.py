@@ -85,6 +85,29 @@ def find_customer_by_phone(conn: sqlite3.Connection, phone: str) -> sqlite3.Row 
     ).fetchone()
 
 
+def search_customers(conn: sqlite3.Connection, query: str, limit: int = 8) -> list[sqlite3.Row]:
+    """Live suggestions for the checkout screen's phone-number box: matches
+    a customer whose phone STARTS WITH what's typed so far (the natural
+    way to narrow down while dialling digits), or whose name CONTAINS it
+    (so a cashier who half-remembers a name instead of the number can
+    still find the right account). Walk-in and inactive customers never
+    show up here - this is for finding a real, identifiable loyalty
+    account, exactly like find_customer_by_phone. Phone-prefix matches
+    are ranked first since that's what this box is primarily for."""
+    query = (query or "").strip()
+    if not query:
+        return []
+    prefix = f"{query}%"
+    like = f"%{query}%"
+    return conn.execute(
+        """SELECT * FROM customers
+           WHERE active=1 AND name != 'Walk-in' AND (phone LIKE ? OR name LIKE ?)
+           ORDER BY (phone LIKE ?) DESC, name
+           LIMIT ?""",
+        (prefix, like, prefix, limit),
+    ).fetchall()
+
+
 def update_customer(
     conn: sqlite3.Connection, customer_id: int, name: str, phone: str, address: str, credit_limit: float
 ) -> None:
@@ -106,6 +129,33 @@ def list_customers(conn: sqlite3.Connection, active_only: bool = True) -> list[s
 
 def get_customer(conn: sqlite3.Connection, customer_id: int) -> sqlite3.Row | None:
     return conn.execute("SELECT * FROM customers WHERE id=?", (customer_id,)).fetchone()
+
+
+def get_default_credit_limit(conn: sqlite3.Connection) -> float:
+    """The credit limit a brand-new customer starts with when a CASHIER
+    registers them (at the till or from the Customers screen) - only
+    Admin/Owner can change this shop-wide value (set_default_credit_limit)
+    or override it for one particular customer at registration time; see
+    open_customer_registration_dialog in the GUI. Falls back to 0 (no
+    credit sales allowed) if the single settings row is somehow missing,
+    same as a brand-new shop before anyone's touched this setting."""
+    row = conn.execute("SELECT default_credit_limit FROM shop_settings WHERE id=1").fetchone()
+    return row["default_credit_limit"] if row else 0.0
+
+
+def set_default_credit_limit(conn: sqlite3.Connection, value: float) -> None:
+    if value < 0:
+        raise ValueError("Default credit limit can't be negative.")
+    # Upsert rather than a plain UPDATE - the single settings row is seeded
+    # by db.init_db on a normal launch, but this stays correct even against
+    # an older database file that predates shop_settings and was opened
+    # without going through init_db again for some reason.
+    conn.execute(
+        "INSERT INTO shop_settings (id, default_credit_limit) VALUES (1, ?) "
+        "ON CONFLICT(id) DO UPDATE SET default_credit_limit=excluded.default_credit_limit",
+        (value,),
+    )
+    conn.commit()
 
 
 def available_credit(conn: sqlite3.Connection, customer_id: int) -> float:

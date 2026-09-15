@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from . import customers as customers_module
+from . import suppliers as suppliers_module
 
 PRICE_FIELD = {"cash": "cash_price", "credit": "credit_price", "wholesale": "wholesale_price"}
 
@@ -76,6 +77,21 @@ def search_products(
     sql += " ORDER BY name_en LIMIT ?"
     params.append(limit)
     return conn.execute(sql, params).fetchall()
+
+
+def search_products_by_code(conn: sqlite3.Connection, query: str, limit: int = 8) -> list[sqlite3.Row]:
+    """Live suggestions for a dedicated barcode-entry box: matches active
+    products whose CODE starts with what's typed/scanned so far.
+    Deliberately code-only (unlike search_products, which also matches
+    name) - a box that's explicitly for a barcode shouldn't surface name
+    matches as if they were the same kind of thing."""
+    query = (query or "").strip()
+    if not query:
+        return []
+    return conn.execute(
+        "SELECT * FROM products WHERE active=1 AND code LIKE ? ORDER BY code LIMIT ?",
+        (f"{query}%", limit),
+    ).fetchall()
 
 
 def list_categories(conn: sqlite3.Connection) -> list[str]:
@@ -145,6 +161,10 @@ def add_product(
     child_target: bool = False,
     initial_qty: float = 0.0,
     expiry_date: str | None = None,
+    supplier_id: int | None = None,
+    payment_method: str = "cash",
+    cheque_number: str = "",
+    cheque_date: str | None = None,
 ) -> int:
     """Register a brand-new product in the catalog.
 
@@ -152,7 +172,16 @@ def add_product(
     scanning it with a USB barcode scanner (a scanner just types the digits
     into the focused field, same as a keyboard) or the phone scanner. Raises
     ValueError on bad/duplicate input. If initial_qty > 0, also creates an
-    opening stock batch so the product shows stock on hand immediately.
+    opening stock batch so the product shows stock on hand immediately -
+    supplier_id (optional) records who that opening batch came from, same
+    as any other batch receive_stock creates for a restock.
+
+    payment_method covers how that OPENING stock was paid for - same
+    meaning as receive_stock's own payment_method, and only relevant at
+    all when initial_qty > 0 (a brand-new product with no opening stock
+    hasn't actually cost anything yet, so payment_method is ignored in
+    that case, whatever it's set to). 'cheque'/'credit' need a real
+    supplier_id, same reasoning as receive_stock.
     """
     code = (code or "").strip()
     name_en = (name_en or "").strip()
@@ -186,6 +215,10 @@ def add_product(
         raise ValueError("Initial quantity cannot be negative")
     if expiry_date:
         datetime.strptime(expiry_date, "%Y-%m-%d")  # raises ValueError if malformed
+    if payment_method not in ("cash", "cheque", "credit"):
+        raise ValueError(f"Unknown payment method: {payment_method}")
+    if initial_qty > 0 and payment_method != "cash" and supplier_id is None:
+        raise ValueError("A cheque or credit purchase needs a supplier selected - who is it owed to?")
 
     cur = conn.execute(
         """INSERT INTO products
@@ -200,12 +233,19 @@ def add_product(
     product_id = cur.lastrowid
 
     if initial_qty > 0:
-        conn.execute(
+        payment_status = "credit" if payment_method == "credit" else "paid"
+        batch_cur = conn.execute(
             """INSERT INTO stock_batches (product_id,batch_no,qty_received,qty_remaining,
-               received_date,expiry_date,cost_price,supplier_id) VALUES (?,?,?,?,?,?,?,NULL)""",
+               received_date,expiry_date,cost_price,supplier_id,payment_status)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
             (product_id, f"OPENING-{datetime.now().date().isoformat()}", initial_qty, initial_qty,
-             datetime.now().date().isoformat(), expiry_date, cost_price),
+             datetime.now().date().isoformat(), expiry_date, cost_price, supplier_id, payment_status),
         )
+        if supplier_id is not None and payment_method != "cash":
+            suppliers_module.record_purchase_payment(
+                conn, supplier_id=supplier_id, batch_id=batch_cur.lastrowid, amount=initial_qty * cost_price,
+                method=payment_method, cheque_number=cheque_number, cheque_date=cheque_date,
+            )
 
     conn.commit()
     return product_id
@@ -314,12 +354,27 @@ def receive_stock(
     expiry_date: str | None = None,
     supplier_id: int | None = None,
     batch_no: str | None = None,
+    payment_method: str = "cash",
+    cheque_number: str = "",
+    cheque_date: str | None = None,
 ) -> int:
     """Add stock for a product that ALREADY exists in the catalog (a
     restock / GRN) - as opposed to add_product, which creates the catalog
     entry in the first place. Shared by the Inventory screen's "Receive
     Stock (GRN)" dialog and the "Add / Scan Item" dialog's existing-product
-    path, so both go through the same validated, tested code."""
+    path, so both go through the same validated, tested code.
+
+    payment_method covers how THIS delivery is being paid for - 'cash'
+    (the default, and the only option the Add/Scan Item dialog uses, to
+    keep that already heavily-used flow simple) means paid in full on the
+    spot, same as every restock before this existed. 'cheque' still marks
+    the batch paid, but logs the cheque's date/amount as a reminder (see
+    suppliers.record_purchase_payment / the Suppliers screen's "Cheques
+    Due"). 'credit' ("not paid yet") raises the supplier's payable balance
+    instead, to be settled later - see suppliers.pay_supplier. A
+    cheque/credit purchase needs a real supplier_id to attach the payment
+    to; skip payment_method (or pass 'cash') when there's no supplier on
+    the batch."""
     product = conn.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone()
     if product is None:
         raise ValueError("Product not found")
@@ -331,15 +386,27 @@ def receive_stock(
         raise ValueError("Cost price cannot be negative")
     if expiry_date:
         datetime.strptime(expiry_date, "%Y-%m-%d")  # raises ValueError if malformed
+    if payment_method not in ("cash", "cheque", "credit"):
+        raise ValueError(f"Unknown payment method: {payment_method}")
+    if payment_method != "cash" and supplier_id is None:
+        raise ValueError("A cheque or credit purchase needs a supplier selected - who is it owed to?")
 
     batch_no = batch_no or f"GRN-MANUAL-{datetime.now().date().isoformat()}"
+    payment_status = "credit" if payment_method == "credit" else "paid"
     cur = conn.execute(
         """INSERT INTO stock_batches (product_id,batch_no,qty_received,qty_remaining,
-           received_date,expiry_date,cost_price,supplier_id) VALUES (?,?,?,?,?,?,?,?)""",
-        (product_id, batch_no, qty, qty, datetime.now().date().isoformat(), expiry_date, cost_price, supplier_id),
+           received_date,expiry_date,cost_price,supplier_id,payment_status) VALUES (?,?,?,?,?,?,?,?,?)""",
+        (product_id, batch_no, qty, qty, datetime.now().date().isoformat(), expiry_date, cost_price,
+         supplier_id, payment_status),
     )
+    batch_id = cur.lastrowid
+    if supplier_id is not None and payment_method != "cash":
+        suppliers_module.record_purchase_payment(
+            conn, supplier_id=supplier_id, batch_id=batch_id, amount=qty * cost_price,
+            method=payment_method, cheque_number=cheque_number, cheque_date=cheque_date,
+        )
     conn.commit()
-    return cur.lastrowid
+    return batch_id
 
 
 def get_stock_on_hand(conn: sqlite3.Connection, product_id: int) -> float:
