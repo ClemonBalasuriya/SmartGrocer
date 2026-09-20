@@ -37,6 +37,7 @@ ALERT_COLORS = {
     "warning_7day": "#FBF3A2",
     "low": "#FBD9D9",
     "inactive": "#DADFE6",   # removed/deactivated item - greyed out, still visible so Owner can reactivate it
+    "needs_price": "#FBE7A2",  # price_verified=0 - a bulk-imported placeholder price, not yet checked
 }
 
 

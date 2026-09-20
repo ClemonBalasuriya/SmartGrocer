@@ -59,6 +59,10 @@ below) once you have one.
   - **Offline-first Cashier Till.** Before this, a Cashier Till that lost its connection to the Main Till either failed outright or (the previous fallback) silently opened a throwaway local database that never merged back. `offline_sync.OfflineConnection` replaces both: a drop-in stand-in for `netclient.RemoteConnection` that falls back to a local mirror database + write outbox the instant the Main Till can't be reached, so the till keeps selling, then replays everything queued back onto the Main Till automatically once it's reachable again (checked every 20s in the background, or "Sync Now" on the Network screen) - including handling the one real conflict this can cause (two tills offline at once independently minting the same next invoice number) by re-numbering and retrying rather than failing the sync. It deliberately does **not** attempt a full multi-device conflict-resolution system - see its module docstring for the exact scope line and what's explicitly left as future work.
   - **Lightweight RAG dashboard insights.** `rag_insights.py` retrieves from a small local knowledge base (the festival calendar, today's weather category, this shop's own low-stock/near-expiry state) and generates plain-language explanation cards via template-filling - genuinely "retrieval then generation," just without an external LLM call, so it needs no API key and works fully offline. Shown as an "Insights" panel on the Dashboard screen.
 
+- **Real item catalog import + free-text questions on the RAG dashboard** (`smartgrocer/import_products.py`, `rag_insights.answer_question`) - built once real POS export data existed, specifically because the shop owner asked to be able to just ask the dashboard a question rather than hunt through screens, in wording simple enough for someone not comfortable with technical software:
+  - **Real item list, from the shop's own real export.** `smartgrocer/data/real_catalog.csv` (9,118 real products) was built from Ranapriya Stores' own "Item List for Stock Take" export cross-referenced against a month of real invoice lines for actual selling prices, via the reusable, re-runnable `scripts/build_real_catalog.py` (documented there for regenerating it from a newer export later). `import_products.py` loads that CSV into the live `products` table - safe to run more than once (matches by code: updates an existing item, inserts a new one, never touches stock already received or sales history) - via a new **"Import Item List (CSV)"** button on the Inventory screen (Admin/Owner only). A `price_verified` column/flag marks which prices came from a real observed sale versus a same-category placeholder (only ~7% of the 9,118 SKUs appeared in the one month of real invoices available), surfaced as a **"CHECK PRICE"** status in Inventory so a placeholder is never mistaken for a checked price. This is the "real PLU/REP export" importer the original README anticipated, now built against this shop's actual export format. The original 66-item synthetic `catalog.py` is untouched - it still exists purely to drive the demo data generator and the test suite.
+  - **"Ask a question" on the Dashboard.** `rag_insights.answer_question(conn, question)` extends the same retrieval-then-template design (still no external LLM) to a typed question: a plain-language keyword classifier recognises three intents - what to buy (today's low-stock items - deliberately the fast SQL query, not the forecasting-based purchase list, which is too slow to run per keystroke across a real ~9,000-item catalog and stays a separate background report on the Forecasting screen), what's fast moving (last-30-days best sellers), and what promotion to give (the same expiry/velocity urgency ranking the Promotions & Expiry screen uses) - and answers in short sentences with none of the rest of the codebase's internal vocabulary ("urgency score", "SARIMA", "forecast", etc. never appear in an answer). A question matching none of the three falls back to today's dashboard insight cards plus a reminder of what it can answer, rather than a dead end; right after a real item-list import, when nearly the whole catalog technically has zero recorded stock, it says so plainly instead of listing thousands of item names. Shown as an "Ask a question" box under the Dashboard's Insights panel.
+
 These were added because this system is meant for the shop's actual day-to-day operation, not only as a decision-support/analytics layer - the four analytics objectives from the proposal are still there underneath, but the POS itself now behaves like a till a cashier would use every day.
 
 ## Project layout
@@ -70,6 +74,9 @@ smartgrocer/
   calendar_sl.py      Sri Lankan festival calendar (SARIMAX exogenous variable)
   weather_sl.py        Sri Lankan monsoon-climatology weather category (2nd SARIMAX exogenous variable, Objective 6)
   data_generator.py  synthetic ~9-month transaction history generator (demo data)
+  import_products.py real item-list CSV importer (safe to re-run) - loads smartgrocer/data/real_catalog.csv
+  data/
+    real_catalog.csv  real product catalog (9,118 SKUs) built from Ranapriya Stores' own POS export
   pos.py             checkout: search, cart, invoice, FIFO stock deduction, void,
                      item return, hold/resume cart, split payment
   customers.py       customer credit accounts: limit, balance, settlement, statement
@@ -86,6 +93,7 @@ smartgrocer/
   till_config.py     this till's saved networking role (standalone / server / client)
   forecasting.py     SARIMA/SARIMAX/Holt-Winters/Seasonal Naive + model selection (+ weather variant, Objective 6)
   rag_insights.py    Objective 6 - lightweight RAG dashboard insight cards (retrieval + template generation)
+                     + answer_question(): free-text owner Q&A in plain language, same retrieval+template approach
   promotions.py      urgency scoring, tiered expiry alerts, discount suggestion
   association.py     Apriori from scratch, bundle recommendations
   layout.py          4-layer layout optimiser + planogram rendering
@@ -98,6 +106,9 @@ smartgrocer/
                       Staff / Network / Activity Log screens
 tests/
   test_pipeline.py   end-to-end smoke tests (no GUI/display needed)
+scripts/
+  build_real_catalog.py  re-runnable: builds smartgrocer/data/real_catalog.csv from a stocktake +
+                          invoice-detail export (pdftotext -layout output) - re-run against a newer export
 main.py              entry point
 requirements.txt
 ```
@@ -618,13 +629,31 @@ pyinstaller --name SmartGrocer --onefile --windowed ^
 - The synthetic dataset's basket contents, seasonality and festival
   boosts are approximations meant to exercise every module realistically,
   not a substitute for your real shop's data.
+- **The real item catalog's category and price for most SKUs are
+  reconstructed, not observed** (`scripts/build_real_catalog.py`): the
+  source stocktake export carries no price list, so category comes from a
+  keyword classifier over the item name (imperfect on real, messy,
+  mixed-language data - about half of the 9,118 items fall into a
+  "General Grocery" catch-all rather than a wrong specific category) and
+  price is a same-category median placeholder for the ~93% of SKUs that
+  didn't appear in the one month of real invoices available. Both are
+  corrected the same way any catalog mistake is: Inventory -> Edit Item;
+  the `price_verified` column/"CHECK PRICE" status tells you exactly
+  which rows still need that pass.
 
 ## Extending
 
-- **Importing a real PLU/REP export**: add a `import_pos_export.py` that
-  parses the Sinhala-Unicode PLU/REP file format and calls the same
-  `pos.create_invoice` / stock_batches inserts the live checkout uses, so
-  every downstream module works unchanged.
+- **A real PLU/REP export importer**: built - see `import_products.py`
+  and `scripts/build_real_catalog.py` above, which parse Ranapriya
+  Stores' own stocktake + invoice-detail export format specifically. A
+  different POS system's export would need its own small parsing
+  function in `build_real_catalog.py` (the CSV shape it produces, and
+  everything downstream in `import_products.py`, stays the same).
+- **Improving the real-catalog category classifier**: `scripts/
+  build_real_catalog.py`'s `CATEGORY_RULES` keyword list is what decides
+  a real item's category - refining it (or just letting Inventory -> Edit
+  Item corrections accumulate over real usage) would shrink the "General
+  Grocery" catch-all bucket over time.
 - **Weekly retrain schedule**: `forecasting.select_best_model` is currently
   invoked on demand from the GUI; wire it to Windows Task Scheduler (or
   Python's `schedule` package) calling it for every product weekly, per the
@@ -636,13 +665,18 @@ pyinstaller --name SmartGrocer --onefile --windowed ^
   `build_weather_exog` for a call to a forecast/historical-weather API
   keyed to the shop's location; `log_weather` already gives logged days
   priority over climatology, so nothing else needs to change.
-- **A real LLM call for `rag_insights.generate()`** - the RETRIEVAL half
-  (what's actually relevant right now: `rag_insights.retrieve()`) doesn't
-  need to change at all; only the GENERATION half (currently fixed sentence
-  templates) would be replaced with a prompt built from the same retrieved
-  context, if/when an API key and a Sinhala/English-capable model are
-  available - this is the "RAG-based Sinhala/English assistant" from the
-  original presentation's Expected Outcomes, still deliberately deferred.
+- **A real LLM call for `rag_insights.generate()` and/or `answer_question()`**
+  - the RETRIEVAL half (what's actually relevant right now:
+  `rag_insights.retrieve()`, plus the low-stock/best-sellers/promotions
+  queries `answer_question()` already runs) doesn't need to change at
+  all; only the GENERATION half (currently fixed sentence templates, and
+  for `answer_question()` a fixed keyword-based intent classifier) would
+  be replaced with a prompt built from the same retrieved context, if/when
+  an API key and a Sinhala/English-capable model are available - this is
+  the "RAG-based Sinhala/English assistant" from the original
+  presentation's Expected Outcomes, still deliberately deferred, though
+  `answer_question()` now covers its most-requested use case (the shop
+  owner asking a plain-language question) without needing it.
 - **A full multi-device conflict-resolution system** (CRDTs or similar) in
   place of `offline_sync.py`'s simpler outbox-and-retry - worth doing if a
   shop regularly runs several Cashier Tills simultaneously offline for

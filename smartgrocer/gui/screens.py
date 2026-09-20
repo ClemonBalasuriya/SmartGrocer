@@ -8,7 +8,7 @@ from __future__ import annotations
 import threading
 import tkinter as tk
 from datetime import date
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 import customtkinter as ctk
 
@@ -27,6 +27,7 @@ from .. import rag_insights
 from .. import audit
 from .. import notifications
 from .. import db as db_module
+from .. import import_products
 from . import theme
 from .theme import tree_clear, tree_insert
 
@@ -1067,6 +1068,35 @@ class DashboardScreen(BaseScreen):
         self.insights_container = ctk.CTkFrame(insights_frame, fg_color="transparent")
         self.insights_container.pack(fill="x", padx=16, pady=(0, 14))
 
+        # Ask-a-question box (rag_insights.answer_question) - added because
+        # the shop owner this app is for isn't comfortable hunting through
+        # menus (Best Sellers, Promotions & Expiry, etc.) for an answer;
+        # typing a plain question here and reading a plain-language answer
+        # back is a much shorter path for someone who just wants to know
+        # what to buy today.
+        ask_frame = ctk.CTkFrame(body, corner_radius=10, fg_color=theme.CARD_BG,
+                                  border_width=1, border_color=theme.BORDER)
+        ask_frame.pack(fill="x", padx=24, pady=(0, 10))
+        ctk.CTkLabel(ask_frame, text="Ask a question", font=ctk.CTkFont(size=13, weight="bold"),
+                     text_color=theme.TEXT_MUTED).pack(anchor="w", padx=16, pady=(12, 0))
+        ctk.CTkLabel(
+            ask_frame, text='Try: "What do I need to buy?"  ·  "What is fast moving?"  ·  '
+                            '"What promotion should I give?"',
+            font=ctk.CTkFont(size=11), text_color=theme.TEXT_MUTED, wraplength=900, justify="left",
+        ).pack(anchor="w", padx=16, pady=(2, 8))
+        ask_row = ctk.CTkFrame(ask_frame, fg_color="transparent")
+        ask_row.pack(fill="x", padx=16)
+        self.ask_entry = ctk.CTkEntry(ask_row, placeholder_text="Type your question here...")
+        self.ask_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self.ask_entry.bind("<Return>", lambda _event: self.ask_question())
+        self.ask_btn = styled_button(ask_row, "Ask", self.ask_question, kind="primary")
+        self.ask_btn.pack(side="left")
+        self.ask_answer_label = ctk.CTkLabel(
+            ask_frame, text="", font=ctk.CTkFont(size=12), text_color=theme.TEXT_DARK,
+            wraplength=900, justify="left", anchor="w",
+        )
+        self.ask_answer_label.pack(fill="x", padx=16, pady=(10, 14))
+
         btn_row = ctk.CTkFrame(body, fg_color="transparent")
         btn_row.pack(fill="x", padx=24, pady=10)
         styled_button(btn_row, "Refresh", self.refresh, kind="secondary").pack(side="left", padx=(0, 10))
@@ -1092,6 +1122,26 @@ class DashboardScreen(BaseScreen):
             ctk.CTkLabel(self.insights_container, text="\u2022 " + card["text"], font=ctk.CTkFont(size=12),
                          text_color=theme.TEXT_DARK, wraplength=900, justify="left", anchor="w").pack(
                 fill="x", pady=3)
+
+    def ask_question(self):
+        question = self.ask_entry.get().strip()
+        if not question:
+            return
+        self.ask_btn.configure(state="disabled", text="Thinking...")
+        self.ask_answer_label.configure(text="")
+
+        def work():
+            return rag_insights.answer_question(self.conn, question)
+
+        def done(result: dict):
+            self.ask_btn.configure(state="normal", text="Ask")
+            self.ask_answer_label.configure(text=result["text"])
+
+        def on_error(exc: Exception):
+            self.ask_btn.configure(state="normal", text="Ask")
+            self.ask_answer_label.configure(text=f"Sorry, something went wrong answering that: {exc}")
+
+        run_in_background(self, work, done, on_error)
 
     def rebuild_demo_data(self):
         if not messagebox.askyesno(
@@ -2788,6 +2838,10 @@ class InventoryScreen(BaseScreen):
         btn_row.pack(fill="x", padx=24)
         styled_button(btn_row, "Refresh", self.refresh, kind="secondary").pack(side="left")
         styled_button(btn_row, "Export CSV", self.export, kind="secondary").pack(side="left", padx=8)
+        self.import_btn = styled_button(
+            btn_row, "Import Item List (CSV)", self.open_import_dialog, kind="secondary",
+        )
+        self.import_btn.pack(side="left", padx=8)
         # "Add / Scan Item" alone now covers what used to be two separate
         # buttons - it already told a brand-new barcode apart from an
         # existing one automatically; the "Don't have the barcode? Pick
@@ -2848,10 +2902,11 @@ class InventoryScreen(BaseScreen):
         self.add_btn.configure(state="normal" if is_admin else "disabled")
         self.edit_btn.configure(state="normal" if is_admin else "disabled")
         self.remove_btn.configure(state="normal" if is_owner else "disabled")
+        self.import_btn.configure(state="normal" if is_admin else "disabled")
 
         raw = self.conn.execute(
             """SELECT p.id, p.code, p.name_en, p.category, p.reorder_level, p.active,
-                      COALESCE(SUM(b.qty_remaining),0) on_hand
+                      p.price_verified, COALESCE(SUM(b.qty_remaining),0) on_hand
                FROM products p LEFT JOIN stock_batches b ON b.product_id = p.id
                GROUP BY p.id ORDER BY p.active DESC, p.category, p.name_en"""
         ).fetchall()
@@ -2860,6 +2915,11 @@ class InventoryScreen(BaseScreen):
         for r in raw:
             if not r["active"]:
                 status, tag = "REMOVED", "inactive"
+            elif not r["price_verified"]:
+                # Set by a bulk item-list import (see import_products.py) when no
+                # real sale gave us this item's actual price - flagged ahead of a
+                # plain low-stock warning so it gets checked before it's sold.
+                status, tag = "CHECK PRICE", "needs_price"
             elif r["on_hand"] < r["reorder_level"]:
                 status, tag = "LOW STOCK", "low"
             else:
@@ -2873,6 +2933,57 @@ class InventoryScreen(BaseScreen):
             if hasattr(self, "_rows") else None
         if path:
             messagebox.showinfo("Exported", f"Saved to {path}")
+
+    def open_import_dialog(self):
+        """Bulk-load a real item-list CSV (code, name, category, prices - see
+        import_products.py's own docstring for the exact shape) into the
+        products table. Meant for the shop's own real item list - built once
+        from a real POS export via scripts/build_real_catalog.py and shipped
+        at smartgrocer/data/real_catalog.csv, or a newer CSV built the same
+        way later. Safe to run more than once: an item already in the
+        catalog (matched by its code) gets its details refreshed rather than
+        being duplicated, and nothing about stock already received or past
+        sales is touched."""
+        if not self._is_admin():
+            messagebox.showwarning("Admin required", "Log in as Admin or Owner (sidebar) to import items.")
+            return
+        default_dir = str(import_products.DEFAULT_CSV_PATH.parent)
+        path = filedialog.askopenfilename(
+            title="Choose an item-list CSV to import",
+            initialdir=default_dir,
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        if not messagebox.askyesno(
+            "Import item list",
+            "This will add any new item codes in that file to your catalog, and "
+            "update the name/category/price of any item you already have (its "
+            "stock on hand and sales history are not touched). Continue?",
+        ):
+            return
+
+        def work():
+            return import_products.import_from_csv(self.conn, path)
+
+        def done(summary: dict):
+            self.refresh()
+            msg = f"Added {summary['inserted']} new item(s), updated {summary['updated']}."
+            if summary["needs_price_review"]:
+                msg += (
+                    "\n\n" + str(summary["needs_price_review"]) + " item(s) had no real "
+                    "price on record, so a placeholder price was used - look for "
+                    "'CHECK PRICE' in the list below and fix the price (Edit Item) "
+                    "before selling them."
+                )
+            if summary["skipped"]:
+                msg += "\n\n" + str(summary["skipped"]) + " row(s) in the file were skipped (bad data)."
+            messagebox.showinfo("Import finished", msg)
+
+        def on_error(exc: Exception):
+            messagebox.showerror("Import failed", str(exc))
+
+        run_in_background(self, work, done, on_error)
 
     def open_edit_product_dialog(self):
         if not self._is_admin():

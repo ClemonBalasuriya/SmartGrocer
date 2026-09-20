@@ -54,7 +54,10 @@ CREATE TABLE IF NOT EXISTS products (
     is_perishable   INTEGER NOT NULL DEFAULT 0, -- 1/0
     is_staple       INTEGER NOT NULL DEFAULT 0, -- 1/0, used by layout module
     child_target    INTEGER NOT NULL DEFAULT 0, -- 1/0, used by layout module
-    active          INTEGER NOT NULL DEFAULT 1
+    active          INTEGER NOT NULL DEFAULT 1,
+    price_verified  INTEGER NOT NULL DEFAULT 1  -- 0 = price is a placeholder from a bulk
+                                                 -- import (import_products.py), not a real
+                                                 -- checked price yet - see Inventory screen
 );
 
 CREATE TABLE IF NOT EXISTS stock_batches (
@@ -351,6 +354,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # explicitly marked 'cheque' or 'not paid yet' (see
         # pos.receive_stock) sets anything else.
         conn.execute("ALTER TABLE stock_batches ADD COLUMN payment_status TEXT NOT NULL DEFAULT 'paid'")
+    product_cols = {r["name"] for r in conn.execute("PRAGMA table_info(products)")}
+    if "price_verified" not in product_cols:
+        # Existing rows (hand-entered by an Admin, or from a prior version
+        # of this database) default to 1 - it's only a bulk CSV import
+        # (import_products.py) that knowingly sets 0 for a placeholder
+        # price, so there's nothing to doubt about rows that predate it.
+        conn.execute("ALTER TABLE products ADD COLUMN price_verified INTEGER NOT NULL DEFAULT 1")
     conn.commit()
 
 

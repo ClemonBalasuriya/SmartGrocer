@@ -1,5 +1,9 @@
 # Runtime shop data - real transactions, not source code. Never commit this.
-data/
+# Anchored to the repo root (leading /) so it does NOT also match
+# smartgrocer/data/ - that folder ships real_catalog.csv (see
+# import_products.py), which is source data the app reads, not runtime
+# output, and must stay tracked.
+/data/
 
 # Runtime config/certs generated on first run - notify_config.json holds the
 # real Gmail app password and Twilio auth token in plain text; the .pem

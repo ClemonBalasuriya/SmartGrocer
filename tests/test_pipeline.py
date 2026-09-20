@@ -21,9 +21,9 @@ import json
 import ssl
 
 from smartgrocer import (
-    association, cash_drawer, customers, data_generator, db, forecasting, layout, mobile_scan, netclient,
-    netserver, offers, offline_sync, pos, promotions, rag_insights, receipts, reports, staff, suppliers,
-    weather_sl,
+    association, cash_drawer, customers, data_generator, db, forecasting, import_products, layout,
+    mobile_scan, netclient, netserver, offers, offline_sync, pos, promotions, rag_insights, receipts,
+    reports, staff, suppliers, weather_sl,
 )
 
 
@@ -768,6 +768,141 @@ def test_rag_insights_generate_falls_back_when_nothing_is_relevant():
     }
     cards = rag_insights.generate(context)
     assert len(cards) == 1 and cards[0]["kind"] == "ok"
+
+
+def _write_csv(tmp_path, rows, header=None):
+    import csv as _csv
+    header = header or ["code", "name_en", "category", "unit", "cost_price", "cash_price",
+                         "margin_pct", "pack_size", "reorder_level", "is_perishable",
+                         "is_staple", "child_target", "price_verified", "source_group"]
+    with open(tmp_path, "w", newline="", encoding="utf-8") as f:
+        writer = _csv.DictWriter(f, fieldnames=header)
+        writer.writeheader()
+        writer.writerows(rows)
+    return tmp_path
+
+
+def test_import_products_inserts_and_is_idempotent():
+    conn = db.reset_db(Path(tempfile.mkdtemp()) / "import_test.db")
+    csv_path = _write_csv(Path(tempfile.mkdtemp()) / "mini.csv", [
+        {"code": "90101", "name_en": "Test Rice 1kg", "category": "Rice & Grains", "unit": "pcs",
+         "cost_price": 200, "cash_price": 240, "margin_pct": 0.2, "pack_size": 1, "reorder_level": 10,
+         "is_perishable": 0, "is_staple": 1, "child_target": 0, "price_verified": 1, "source_group": ""},
+        {"code": "90102", "name_en": "Test Snack Bar", "category": "Snacks & Confectionery", "unit": "pcs",
+         "cost_price": 60, "cash_price": 90, "margin_pct": 0.28, "pack_size": 1, "reorder_level": 10,
+         "is_perishable": 0, "is_staple": 0, "child_target": 1, "price_verified": 0, "source_group": "XYZ"},
+    ])
+
+    summary = import_products.import_from_csv(conn, csv_path)
+    assert summary == {"inserted": 2, "updated": 0, "skipped": 0, "needs_price_review": 1, "errors": []}
+
+    rice = dict(conn.execute("SELECT * FROM products WHERE code='90101'").fetchone())
+    assert rice["category"] == "Rice & Grains" and rice["cash_price"] == 240.0 and rice["price_verified"] == 1
+    snack = dict(conn.execute("SELECT * FROM products WHERE code='90102'").fetchone())
+    assert snack["price_verified"] == 0
+
+    # Re-importing after "fixing" a price updates in place, no duplicate row.
+    csv_path2 = _write_csv(Path(tempfile.mkdtemp()) / "mini2.csv", [
+        {"code": "90102", "name_en": "Test Snack Bar", "category": "Snacks & Confectionery", "unit": "pcs",
+         "cost_price": 60, "cash_price": 95, "margin_pct": 0.28, "pack_size": 1, "reorder_level": 10,
+         "is_perishable": 0, "is_staple": 0, "child_target": 1, "price_verified": 1, "source_group": "XYZ"},
+    ])
+    summary2 = import_products.import_from_csv(conn, csv_path2)
+    assert summary2["inserted"] == 0 and summary2["updated"] == 1 and summary2["needs_price_review"] == 0
+    total = conn.execute("SELECT COUNT(*) c FROM products").fetchone()["c"]
+    assert total == 2, "re-import must not duplicate an existing code"
+    snack = dict(conn.execute("SELECT * FROM products WHERE code='90102'").fetchone())
+    assert snack["cash_price"] == 95.0 and snack["price_verified"] == 1
+
+
+def test_import_products_skips_bad_rows_without_failing_the_batch():
+    conn = db.reset_db(Path(tempfile.mkdtemp()) / "import_test2.db")
+    csv_path = _write_csv(Path(tempfile.mkdtemp()) / "bad.csv", [
+        {"code": "", "name_en": "No code", "category": "General Grocery", "unit": "pcs",
+         "cost_price": 10, "cash_price": 20, "margin_pct": 0.2, "pack_size": 1, "reorder_level": 10,
+         "is_perishable": 0, "is_staple": 0, "child_target": 0, "price_verified": 1, "source_group": ""},
+        {"code": "90201", "name_en": "Zero price item", "category": "General Grocery", "unit": "pcs",
+         "cost_price": 10, "cash_price": 0, "margin_pct": 0.2, "pack_size": 1, "reorder_level": 10,
+         "is_perishable": 0, "is_staple": 0, "child_target": 0, "price_verified": 1, "source_group": ""},
+        {"code": "90202", "name_en": "Good item", "category": "General Grocery", "unit": "pcs",
+         "cost_price": 10, "cash_price": 20, "margin_pct": 0.2, "pack_size": 1, "reorder_level": 10,
+         "is_perishable": 0, "is_staple": 0, "child_target": 0, "price_verified": 1, "source_group": ""},
+    ])
+    summary = import_products.import_from_csv(conn, csv_path)
+    assert summary["inserted"] == 1 and summary["skipped"] == 2 and len(summary["errors"]) == 2
+    assert conn.execute("SELECT COUNT(*) c FROM products").fetchone()["c"] == 1
+
+
+def test_import_products_rejects_csv_missing_required_columns():
+    conn = db.reset_db(Path(tempfile.mkdtemp()) / "import_test3.db")
+    csv_path = Path(tempfile.mkdtemp()) / "incomplete.csv"
+    csv_path.write_text("code,name_en\n90301,Incomplete Row\n", encoding="utf-8")
+    try:
+        import_products.import_from_csv(conn, csv_path)
+        assert False, "expected ValueError for a CSV missing required columns"
+    except ValueError as exc:
+        assert "missing required column" in str(exc)
+
+
+def test_import_products_shipped_real_catalog_loads_cleanly():
+    # Regression check on the actual file the app ships (smartgrocer/data/
+    # real_catalog.csv, built from Ranapriya Stores' real item list by
+    # scripts/build_real_catalog.py) - not just a synthetic fixture, so a
+    # future edit to that CSV (or to import_products.py) that breaks real
+    # rows gets caught here rather than only when a real shop imports it.
+    conn = db.reset_db(Path(tempfile.mkdtemp()) / "import_real.db")
+    summary = import_products.import_from_csv(conn)  # default path = the shipped CSV
+    assert summary["errors"] == []
+    assert summary["inserted"] > 5000, "expected several thousand real SKUs"
+    total = conn.execute("SELECT COUNT(*) c FROM products").fetchone()["c"]
+    assert total == summary["inserted"]
+    verified = conn.execute("SELECT COUNT(*) c FROM products WHERE price_verified=1").fetchone()["c"]
+    assert 0 < verified < total, "expected a real mix of verified and placeholder prices"
+
+
+def test_rag_answer_question_classifies_and_answers_each_intent():
+    conn = _fresh_db()  # synthetic shop with real sales/stock/expiry history
+    purchase = rag_insights.answer_question(conn, "What do I need to buy?")
+    assert purchase["intent"] == "purchase"
+    assert "buy" in purchase["text"].lower() or "low" in purchase["text"].lower()
+
+    fast = rag_insights.answer_question(conn, "what are fast moving items")
+    assert fast["intent"] == "fast_moving"
+
+    # The literal phrasing from the shop owner's own request that started this
+    # feature ("what promotion beter togive") - typos and all, it still hits
+    # the "promotion" keyword and gets a real answer, not a shrug.
+    promo = rag_insights.answer_question(conn, "what promotion beter togive")
+    assert promo["intent"] == "promotion"
+
+    unknown = rag_insights.answer_question(conn, "how is the weather today")
+    assert unknown["intent"] is None
+    assert "not sure exactly what you're asking" in unknown["text"]
+    assert "what do I need to buy?" in unknown["text"]
+
+
+def test_rag_answer_question_plain_language_has_no_jargon():
+    # The whole point (per the shop owner's own request) is that the answer
+    # reads in plain words, not the internal vocabulary the rest of the
+    # codebase uses for the same ideas.
+    conn = _fresh_db()
+    banned = ["urgency", "sarima", "exog", "nrmse", "z-score", "forecast_demand"]
+    for question in ("what do i need to buy", "what is fast moving", "what promotion should i give"):
+        text = rag_insights.answer_question(conn, question)["text"].lower()
+        for term in banned:
+            assert term not in text, f"jargon leaked into the answer to {question!r}: {term!r}"
+
+
+def test_rag_answer_question_handles_mostly_unstocked_catalog_gracefully():
+    # A shop that just ran a real item-list import (import_products.py) has
+    # ~0 stock recorded for almost everything - the answer should say that
+    # plainly instead of listing thousands of item names.
+    conn = db.reset_db(Path(tempfile.mkdtemp()) / "mostly_empty.db")
+    import_products.import_from_csv(conn)
+    result = rag_insights.answer_question(conn, "what do i need to buy")
+    assert result["intent"] == "purchase"
+    assert "haven't been recorded" in result["text"]
+    assert len(result["text"]) < 500, "should be a short, calm message, not a dump of item names"
 
 
 def test_offline_connection_falls_back_and_syncs_on_reconnect():
