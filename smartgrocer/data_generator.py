@@ -32,6 +32,7 @@ import numpy as np
 from . import customers as customers_module
 from . import db
 from .calendar_sl import festival_multiplier
+from .weather_sl import climatology_category, WEATHER_SENSITIVE_CATEGORIES
 from .catalog import AFFINITY_GROUPS, CATALOG, COLUMNS
 
 RNG_SEED = 42
@@ -155,6 +156,12 @@ def generate_history(
     for day_offset in range(days):
         d = start_date + timedelta(days=day_offset)
         fmult = festival_multiplier(d)
+        # Coarse monsoon-climatology weather boost (Objective 6 - gives the
+        # weather-aware SARIMAX variant a genuine, if modest, signal to find
+        # in the demo data, the same way FESTIVE_CATEGORIES does for the
+        # festival regressor). A real shop's weather_log entries (or a
+        # future weather-API feed) replace this for real evaluation.
+        weather_boost = WEATHER_SENSITIVE_CATEGORIES.get(climatology_category(d), {})
         dmult = DOW_MULT[d.weekday()]
         lam = avg_invoices_per_day * fmult * dmult
         # one artificial demand-shock day for the anomaly detector to catch
@@ -178,6 +185,8 @@ def generate_history(
                 w = base_weight[code]
                 if fmult > 1.05 and products[code]["category"] in FESTIVE_CATEGORIES:
                     w *= fmult
+                if products[code]["category"] in weather_boost:
+                    w *= weather_boost[products[code]["category"]]
                 if code in slow_movers and day_offset > days - 30:
                     w *= 0.25
                 weights.append(w)

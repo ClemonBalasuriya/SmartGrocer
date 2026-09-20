@@ -13,17 +13,17 @@ from __future__ import annotations
 
 from datetime import date
 
-FESTIVALS = [  # (month, day, half_width_days, peak_multiplier)
-    (4, 14, 6, 1.8),   # Sinhala & Tamil New Year
-    (5, 22, 4, 1.4),   # Vesak (approximate fixed date)
-    (12, 25, 5, 1.6),  # Christmas
+FESTIVALS = [  # (month, day, half_width_days, peak_multiplier, name)
+    (4, 14, 6, 1.8, "Sinhala & Tamil New Year"),
+    (5, 22, 4, 1.4, "Vesak"),  # approximate fixed date - see module docstring
+    (12, 25, 5, 1.6, "Christmas"),
 ]
 
 
 def festival_multiplier(d: date) -> float:
     """Smooth 1.0..peak multiplier, higher the closer d is to a festival date."""
     mult = 1.0
-    for month, day, half_width, peak in FESTIVALS:
+    for month, day, half_width, peak, _name in FESTIVALS:
         for year in (d.year - 1, d.year, d.year + 1):
             try:
                 anchor = date(year, month, day)

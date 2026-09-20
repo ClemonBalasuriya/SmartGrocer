@@ -25,6 +25,7 @@ from .. import cash_drawer
 from .. import db
 from .. import netclient
 from .. import netserver
+from .. import offline_sync
 from .. import notifications
 from .. import staff as staff_module
 from .. import till_config
@@ -89,30 +90,28 @@ class SmartGrocerApp(ctk.CTk):
         self.till_config = till_config.load()
 
         if self.till_config["mode"] == "client":
-            # This till has no database of its own - it connects to
-            # another till (the "Main Till") over the shop's network
-            # instead. If that till isn't reachable right now (network
-            # hiccup, it hasn't been switched on yet), fall back to a
-            # local database rather than refusing to open at all - a
-            # cashier shouldn't be locked out of ringing up sales just
-            # because Wi-Fi blipped. Anything rung up during that fallback
-            # stays local only (it does NOT get merged into the shared
-            # data automatically) until reconnected, which the warning
-            # below says plainly.
-            try:
-                self.conn = netclient.RemoteConnection(
-                    self.till_config["server_host"], self.till_config["server_port"],
-                    self.till_config["pairing_code"],
-                )
-            except netclient.RemoteError as e:
+            # This till has no database of its own - it connects to another
+            # till (the "Main Till") over the shop's network instead.
+            # offline_sync.OfflineConnection (Objective 6) handles the case
+            # where that till isn't reachable right now (network hiccup, it
+            # hasn't been switched on yet, or it drops mid-session): rather
+            # than refusing to open, or the old behavior of a throwaway
+            # local copy that never merged back, it queues everything rung
+            # up while disconnected and replays it onto the Main Till
+            # automatically the moment it's reachable again - see
+            # offline_sync.py. It never raises - if the Main Till can't be
+            # reached at all right now, it just starts in offline mode.
+            self.conn = offline_sync.OfflineConnection(
+                self.till_config["server_host"], self.till_config["server_port"],
+                self.till_config["pairing_code"], offline_sync.mirror_db_path(self.db_path),
+            )
+            if not self.conn.is_online:
                 messagebox.showwarning(
-                    "Can't reach the Main Till",
-                    f"{e}\n\nOpening a temporary local copy instead so this till can still be used. "
-                    "Anything rung up while disconnected will NOT appear on the Main Till or other "
-                    "tills - reconnect from the Network screen as soon as possible.",
+                    "Can't reach the Main Till right now",
+                    "This till will keep working offline - anything rung up now is queued locally and "
+                    "will sync to the Main Till automatically once it's reachable again (Network screen "
+                    "shows the queue, and has a \"Sync Now\" button).",
                 )
-                self.conn = db.get_conn(self.db_path)
-                db.init_db(self.conn)
         else:
             self.conn = db.get_conn(self.db_path)
             db.init_db(self.conn)
@@ -121,6 +120,7 @@ class SmartGrocerApp(ctk.CTk):
         self.logged_in = False
         self.mobile_scan_server = None  # lazily created the first time POS opens "Phone Scanner"
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._schedule_offline_sync_check()  # no-op unless this is a Cashier Till currently offline
 
         theme.apply_global_style()
         self.configure(fg_color=theme.BG_LIGHT)
@@ -705,8 +705,9 @@ class SmartGrocerApp(ctk.CTk):
 
     def is_client_till(self) -> bool:
         """True when this till has no database of its own and is talking
-        to another till's server instead (see connect_to_till)."""
-        return isinstance(self.conn, netclient.RemoteConnection)
+        to another till's server instead (see connect_to_till) - whether
+        or not it currently has to serve that from its offline mirror."""
+        return isinstance(self.conn, (netclient.RemoteConnection, offline_sync.OfflineConnection))
 
     def start_sharing(self, pairing_code: str | None = None) -> None:
         """Turn this till into the "Main Till" other cashier tills connect
@@ -727,10 +728,14 @@ class SmartGrocerApp(ctk.CTk):
 
     def connect_to_till(self, host: str, port: int, pairing_code: str) -> None:
         """Switch THIS till into a Cashier Till connected to another one.
-        Raises netclient.RemoteError if the other till can't be reached -
-        callers should show that message and leave the current connection
-        (local or remote) in place rather than assume this succeeded."""
-        new_conn = netclient.RemoteConnection(host, port, pairing_code)  # raises before anything is torn down
+        Raises netclient.RemoteError if the other till can't be reached at
+        all right now (a plain RemoteConnection probe, so a typo'd address/
+        pairing code is still reported immediately here rather than
+        silently accepted into offline mode) - callers should show that
+        message and leave the current connection (local or remote) in
+        place rather than assume this succeeded."""
+        netclient.RemoteConnection(host, port, pairing_code).close()  # raises before anything is torn down
+        new_conn = offline_sync.OfflineConnection(host, port, pairing_code, offline_sync.mirror_db_path(self.db_path))
         old_conn = self.conn
         self.conn = new_conn
         try:
@@ -761,6 +766,36 @@ class SmartGrocerApp(ctk.CTk):
         self.current_staff_id = 1
         self.refresh_day_status()
         self.refresh_current_frame()
+
+    _OFFLINE_SYNC_CHECK_INTERVAL_MS = 20_000  # only ever does anything while this till is offline
+
+    def _schedule_offline_sync_check(self):
+        self.after(self._OFFLINE_SYNC_CHECK_INTERVAL_MS, self._offline_sync_tick)
+
+    def _offline_sync_tick(self):
+        """Background heartbeat (Objective 6): while this till is a Cashier
+        Till running offline (see offline_sync.py), quietly retries the
+        Main Till every 20s and replays the queued outbox the moment it's
+        reachable again - a cashier shouldn't have to remember to press
+        "Sync Now" themselves. Runs the actual network attempt off the
+        Tkinter thread so a still-unreachable Main Till never freezes the
+        window while its connection attempt times out."""
+        conn = self.conn
+        if isinstance(conn, offline_sync.OfflineConnection) and not conn.is_online:
+            def work():
+                return conn.try_reconnect()
+
+            def done(outcome):
+                if not outcome["still_offline"]:
+                    messagebox.showinfo(
+                        "Back online",
+                        f"Reconnected to the Main Till - {outcome['synced']} queued transaction(s) synced."
+                        if outcome["synced"] else "Reconnected to the Main Till - nothing was queued.",
+                    )
+                self.refresh_current_frame()
+
+            screens.run_in_background(self, work, done, lambda e: None)  # a failed attempt just retries next tick
+        self._schedule_offline_sync_check()
 
     def _on_close(self):
         if self.mobile_scan_server is not None and self.mobile_scan_server.running:

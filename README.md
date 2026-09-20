@@ -54,6 +54,11 @@ below) once you have one.
 - **Add / Edit / Remove Item, with matching permissions** (`pos.add_product` / `update_product` / `deactivate_product` / `reactivate_product`, Inventory screen) - **Admin or Owner** can add a new item, receive stock (GRN), and edit an existing item's details (name, category, unit, all four prices, pack size, reorder level, perishable/staple/child-target flags) - a cashier can view stock levels but not change the catalog, closing what was previously an open door (Add/Scan Item and Receive Stock had no login check at all). The barcode itself isn't editable via "Edit Item" (it's what every scan/receipt/stock batch identifies the item by - add a fresh item instead if a code was genuinely wrong). Removing an item is **Owner-only** and, exactly like staff, never actually deletes anything - stock_batches and invoice_items reference a product by id, so a real delete would either fail or orphan real sales/stock history. Instead it's marked inactive (disappears from the active catalog and checkout lookup, same as a deactivated cashier) **and its stock on hand is zeroed** rather than left as stale phantom quantity - the same button restores it later (stock stays at zero until restocked; past batch/sale history for it was never touched). All of these actions are written to the Activity Log.
 - **Self-service-only PIN changes, with email recovery** (`staff.generate_temp_pin`/`update_contact`, sidebar's "Change My PIN", Login dialog's "Forgot PIN?", Staff screen's "Edit Contact Info") - **nobody manages anyone else's PIN anymore, not even the Owner.** An earlier version let an Admin/Owner force-reset someone else's PIN directly; it was removed on the shop owner's own instinct that it was a real weak point (an Admin/Owner account being able to silently hand itself access to any other account is exactly the kind of privileged lever worth not having at all). What's left: (1) **"Change My PIN"**, next to Login/Close Day in the sidebar - anyone logged in changes their own PIN, knowing their current one, any role; (2) **"Forgot PIN?"** on the Login screen - if someone's locked out entirely, picking their name and clicking it emails (or texts, if phone + Twilio are set up) a fresh random PIN straight to the address saved on their account, never shown on screen; **the PIN is only changed once delivery actually succeeds** - if sending fails, nothing about the account changes and the person is told plainly why (most often the shop hasn't finished Notification Settings yet) rather than being left with a new PIN nobody, including them, knows. If someone has no email/phone on file yet, an Admin/Owner can add one via Staff screen's new **"Edit Contact Info"** - which only ever touches contact details, never the PIN itself. Every one of these actions notifies **two** people, not just one: the Owner always gets a "who did what" copy, and the **individual whose own account changed** - PIN changed (self-service or forgotten), contact info edited, activated/deactivated - gets their own copy too, addressed to whatever email/phone is on file for THEM specifically, so a change to someone's account is never something only the Owner hears about.
 
+- **Objective 6 - event/weather-aware forecasting, offline-first Cashier Till, and dashboard insights** (`smartgrocer/weather_sl.py`, `offline_sync.py`, `rag_insights.py`) - a research objective added after real POS data from two shops (one with only a month of history, one with a full year) and the resulting literature review made three gaps worth closing, scoped deliberately narrower than the "advanced AI" version originally floated - see the PPRS plan for the full reasoning:
+  - **Weather as a second SARIMAX exogenous regressor, alongside the existing festival calendar.** `weather_sl.py` gives every date a `rain`/`dry`/`hot` category - a shop-logged actual (Forecasting screen's "Log Weather") if one exists for that date, else a fixed Sri Lankan monsoon-climatology fallback. `forecasting.py` now runs **two** SARIMAX variants side by side in the same model-selection table it already had - `SARIMAX (festival)` and `SARIMAX (festival+weather)` - so whether the weather regressor actually helps a given product's forecast is a plain, visible row-vs-row nRMSE comparison, not a separate experiment bolted on afterward.
+  - **Offline-first Cashier Till.** Before this, a Cashier Till that lost its connection to the Main Till either failed outright or (the previous fallback) silently opened a throwaway local database that never merged back. `offline_sync.OfflineConnection` replaces both: a drop-in stand-in for `netclient.RemoteConnection` that falls back to a local mirror database + write outbox the instant the Main Till can't be reached, so the till keeps selling, then replays everything queued back onto the Main Till automatically once it's reachable again (checked every 20s in the background, or "Sync Now" on the Network screen) - including handling the one real conflict this can cause (two tills offline at once independently minting the same next invoice number) by re-numbering and retrying rather than failing the sync. It deliberately does **not** attempt a full multi-device conflict-resolution system - see its module docstring for the exact scope line and what's explicitly left as future work.
+  - **Lightweight RAG dashboard insights.** `rag_insights.py` retrieves from a small local knowledge base (the festival calendar, today's weather category, this shop's own low-stock/near-expiry state) and generates plain-language explanation cards via template-filling - genuinely "retrieval then generation," just without an external LLM call, so it needs no API key and works fully offline. Shown as an "Insights" panel on the Dashboard screen.
+
 These were added because this system is meant for the shop's actual day-to-day operation, not only as a decision-support/analytics layer - the four analytics objectives from the proposal are still there underneath, but the POS itself now behaves like a till a cashier would use every day.
 
 ## Project layout
@@ -63,6 +68,7 @@ smartgrocer/
   db.py              database schema + connection helpers
   catalog.py         static product catalogue + basket "affinity groups"
   calendar_sl.py      Sri Lankan festival calendar (SARIMAX exogenous variable)
+  weather_sl.py        Sri Lankan monsoon-climatology weather category (2nd SARIMAX exogenous variable, Objective 6)
   data_generator.py  synthetic ~9-month transaction history generator (demo data)
   pos.py             checkout: search, cart, invoice, FIFO stock deduction, void,
                      item return, hold/resume cart, split payment
@@ -76,8 +82,10 @@ smartgrocer/
   mobile_scan.py     phone-as-barcode-scanner companion (local HTTP server + OpenCV decode)
   netserver.py       multi-till server: exposes this PC's database to other cashier tills over the network
   netclient.py       multi-till client: makes a remote till's database look like a local one everywhere else
+  offline_sync.py    Objective 6 - offline-first Cashier Till: local mirror + write outbox + sync-on-reconnect
   till_config.py     this till's saved networking role (standalone / server / client)
-  forecasting.py     SARIMA/SARIMAX/Holt-Winters/Seasonal Naive + model selection
+  forecasting.py     SARIMA/SARIMAX/Holt-Winters/Seasonal Naive + model selection (+ weather variant, Objective 6)
+  rag_insights.py    Objective 6 - lightweight RAG dashboard insight cards (retrieval + template generation)
   promotions.py      urgency scoring, tiered expiry alerts, discount suggestion
   association.py     Apriori from scratch, bundle recommendations
   layout.py          4-layer layout optimiser + planogram rendering
@@ -621,9 +629,23 @@ pyinstaller --name SmartGrocer --onefile --windowed ^
   invoked on demand from the GUI; wire it to Windows Task Scheduler (or
   Python's `schedule` package) calling it for every product weekly, per the
   proposal's methodology.
-- **RAG-based Sinhala/English assistant** (from your presentation's Expected
-  Outcomes): deliberately left out of this build - it needs an LLM API key
-  and is its own sub-project; a natural next phase once the core analytics
-  are marking-ready.
 - **`pmdarima`-style automatic SARIMA order search**, if you want to move
   beyond the fixed `(1,1,1)(0,1,1,7)` order.
+- **A real weather-API feed** in place of (or alongside) `weather_sl.py`'s
+  climatology fallback - swap `climatology_category`'s call site in
+  `build_weather_exog` for a call to a forecast/historical-weather API
+  keyed to the shop's location; `log_weather` already gives logged days
+  priority over climatology, so nothing else needs to change.
+- **A real LLM call for `rag_insights.generate()`** - the RETRIEVAL half
+  (what's actually relevant right now: `rag_insights.retrieve()`) doesn't
+  need to change at all; only the GENERATION half (currently fixed sentence
+  templates) would be replaced with a prompt built from the same retrieved
+  context, if/when an API key and a Sinhala/English-capable model are
+  available - this is the "RAG-based Sinhala/English assistant" from the
+  original presentation's Expected Outcomes, still deliberately deferred.
+- **A full multi-device conflict-resolution system** (CRDTs or similar) in
+  place of `offline_sync.py`'s simpler outbox-and-retry - worth doing if a
+  shop regularly runs several Cashier Tills simultaneously offline for
+  long stretches; the current design handles the common single-till-drops
+  case (and the specific invoice-number-collision case) but stops and
+  waits rather than guessing through any other conflict.

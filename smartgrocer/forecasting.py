@@ -29,6 +29,7 @@ import numpy as np
 import pandas as pd
 
 from .calendar_sl import is_festival_window
+from . import weather_sl
 
 try:
     from statsmodels.tsa.statespace.sarimax import SARIMAX
@@ -63,6 +64,30 @@ def daily_sales_series(conn: sqlite3.Connection, product_id: int) -> pd.Series:
 
 def build_festival_exog(date_index: pd.DatetimeIndex) -> np.ndarray:
     return np.array([[is_festival_window(d.date())] for d in date_index], dtype=float)
+
+
+def build_exog_variants(conn: sqlite3.Connection | None, train_index: pd.DatetimeIndex,
+                        future_index: pd.DatetimeIndex) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """The exogenous-regressor sets Objective 6 evaluates SARIMAX against:
+    festival-calendar alone (the original proposal), and festival+weather
+    (the new event/weather-aware extension - see weather_sl.py). Returning
+    both, keyed by name, lets MODEL_REGISTRY run a SARIMAX variant per set,
+    so the "with vs without the extra regressor" comparison Objective 6
+    calls for falls directly out of the normal per-model nRMSE table
+    instead of needing a separate evaluation path. conn=None (e.g. a plain
+    pandas-only unit test) skips the weather variant and behaves exactly
+    as this module did before Objective 6."""
+    fest_train = build_festival_exog(train_index)
+    fest_future = build_festival_exog(future_index)
+    variants: dict[str, tuple[np.ndarray, np.ndarray]] = {"festival": (fest_train, fest_future)}
+    if conn is not None:
+        weather_train = weather_sl.build_weather_exog(conn, train_index)
+        weather_future = weather_sl.build_weather_exog(conn, future_index)
+        variants["festival_weather"] = (
+            np.hstack([fest_train, weather_train]),
+            np.hstack([fest_future, weather_future]),
+        )
+    return variants
 
 
 # --------------------------------------------------------------------------- #
@@ -154,12 +179,24 @@ def forecast_sarimax(train: pd.Series, horizon: int, exog_train: np.ndarray, exo
         return None
 
 
+# Each entry takes (train, horizon, exog) where exog is the dict
+# build_exog_variants() returns - {"festival": (train_arr, future_arr),
+# "festival_weather": (...)}. The two SARIMAX variants below are the
+# Objective 6 with-vs-without-the-weather-regressor comparison: same
+# order, same festival regressor, the only difference is the added
+# weather columns - so a lower nRMSE for the "+weather" row is direct
+# evidence the weather signal helps this product, and a higher/equal one
+# is equally valid evidence that it doesn't, without needing a bespoke
+# experiment outside the normal model-selection pipeline.
 MODEL_REGISTRY = {
-    "Seasonal Naive": lambda train, horizon, exog_f, exog_t: forecast_seasonal_naive(train, horizon),
-    "Holt-Winters": lambda train, horizon, exog_f, exog_t: forecast_holt_winters(train, horizon),
-    "SARIMA": lambda train, horizon, exog_f, exog_t: forecast_sarima(train, horizon),
-    "SARIMAX": lambda train, horizon, exog_f, exog_t: (
-        forecast_sarimax(train, horizon, exog_f, exog_t) if exog_f is not None else None
+    "Seasonal Naive": lambda train, horizon, exog: forecast_seasonal_naive(train, horizon),
+    "Holt-Winters": lambda train, horizon, exog: forecast_holt_winters(train, horizon),
+    "SARIMA": lambda train, horizon, exog: forecast_sarima(train, horizon),
+    "SARIMAX (festival)": lambda train, horizon, exog: (
+        forecast_sarimax(train, horizon, *exog["festival"]) if "festival" in exog else None
+    ),
+    "SARIMAX (festival+weather)": lambda train, horizon, exog: (
+        forecast_sarimax(train, horizon, *exog["festival_weather"]) if "festival_weather" in exog else None
     ),
 }
 
@@ -176,10 +213,13 @@ def nrmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return rmse / mean_y if mean_y > 1e-9 else rmse
 
 
-def rolling_origin_cv(series: pd.Series, horizon: int = 7, n_folds: int = 3,
-                       min_train: int = 60) -> dict[str, float]:
+def rolling_origin_cv(series: pd.Series, conn: sqlite3.Connection | None = None, horizon: int = 7,
+                       n_folds: int = 3, min_train: int = 60) -> dict[str, float]:
     """Average nRMSE per model across n_folds walk-forward folds.
-    A model missing from the result was unavailable/failed on at least one fold."""
+    A model missing from the result was unavailable/failed on at least one fold.
+    conn is only used to look up logged weather (weather_sl.py) for the
+    "festival+weather" SARIMAX variant - pass None to skip that variant
+    (e.g. a plain pandas-only unit test with no database)."""
     n = len(series)
     origins = [n - horizon * k for k in range(n_folds, 0, -1)]
     origins = [o for o in origins if o >= min_train]
@@ -192,10 +232,9 @@ def rolling_origin_cv(series: pd.Series, horizon: int = 7, n_folds: int = 3,
         test = series.iloc[origin:origin + horizon]
         if len(test) < horizon:
             continue
-        exog_train = build_festival_exog(train.index)
-        exog_test = build_festival_exog(test.index)
+        exog = build_exog_variants(conn, train.index, test.index)
         for name, fn in MODEL_REGISTRY.items():
-            pred = fn(train, horizon, exog_train, exog_test)
+            pred = fn(train, horizon, exog)
             if pred is None or len(pred) != horizon:
                 continue
             scores[name].append(nrmse(test.values, pred))
@@ -218,7 +257,7 @@ def select_best_model(conn: sqlite3.Connection, product_id: int, horizon: int = 
     for d in result["anomalies"]:
         clean_series.loc[d] = clean_series.rolling(7, min_periods=1).median().loc[d]
 
-    scores = rolling_origin_cv(clean_series, horizon=horizon, n_folds=n_folds)
+    scores = rolling_origin_cv(clean_series, conn, horizon=horizon, n_folds=n_folds)
     result["model_scores"] = scores
     if not scores:
         # fall back to the one model that always works
@@ -228,10 +267,9 @@ def select_best_model(conn: sqlite3.Connection, product_id: int, horizon: int = 
         return result
 
     best_model = min(scores, key=scores.get)
-    exog_train = build_festival_exog(clean_series.index)
     future_dates = pd.date_range(clean_series.index[-1] + timedelta(days=1), periods=horizon, freq="D")
-    exog_future = build_festival_exog(future_dates)
-    pred = MODEL_REGISTRY[best_model](clean_series, horizon, exog_train, exog_future)
+    exog = build_exog_variants(conn, clean_series.index, future_dates)
+    pred = MODEL_REGISTRY[best_model](clean_series, horizon, exog)
     if pred is None:  # extremely unlikely re-fit failure - fall back
         best_model = "Seasonal Naive"
         pred = forecast_seasonal_naive(clean_series, horizon)

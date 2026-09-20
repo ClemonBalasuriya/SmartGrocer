@@ -22,7 +22,8 @@ import ssl
 
 from smartgrocer import (
     association, cash_drawer, customers, data_generator, db, forecasting, layout, mobile_scan, netclient,
-    netserver, offers, pos, promotions, receipts, reports, staff, suppliers,
+    netserver, offers, offline_sync, pos, promotions, rag_insights, receipts, reports, staff, suppliers,
+    weather_sl,
 )
 
 
@@ -125,6 +126,45 @@ def test_anomaly_detection_flags_something():
     series = forecasting.daily_sales_series(conn, p["id"])
     anomalies = forecasting.detect_anomalies(series)
     assert isinstance(anomalies, list)  # not asserting count - depends on random seed/window
+
+
+def test_weather_climatology_covers_every_month():
+    from datetime import date
+    for month in range(1, 13):
+        cat = weather_sl.climatology_category(date(2026, month, 15))
+        assert cat in weather_sl.CATEGORIES
+
+
+def test_weather_log_overrides_climatology():
+    conn = _fresh_db()
+    from datetime import date
+    d = date(2026, 3, 10)  # climatology says "hot" for March
+    assert weather_sl.weather_category(conn, d) == "hot"
+    weather_sl.log_weather(conn, d, "rain")
+    assert weather_sl.weather_category(conn, d) == "rain"
+    # logging again for the same date replaces rather than duplicating
+    weather_sl.log_weather(conn, d, "dry")
+    assert weather_sl.weather_category(conn, d) == "dry"
+    assert conn.execute("SELECT COUNT(*) c FROM weather_log WHERE log_date=?", (d.isoformat(),)).fetchone()["c"] == 1
+
+
+def test_forecast_includes_weather_variant_and_matches_without_conn():
+    conn = _fresh_db()
+    p = conn.execute(
+        "SELECT p.* FROM products p WHERE p.is_staple=1 ORDER BY RANDOM() LIMIT 1"
+    ).fetchone()
+    result = forecasting.select_best_model(conn, p["id"])
+    assert result["best_model"] is not None
+    # every scored model came from MODEL_REGISTRY, which now includes both
+    # SARIMAX variants when statsmodels is available
+    if forecasting.STATSMODELS_AVAILABLE:
+        assert any("SARIMAX" in name for name in result["model_scores"])
+    # rolling_origin_cv must still work with conn=None (pure pandas, e.g. a
+    # notebook/unit test with no database) - just skips the weather variant
+    series = forecasting.daily_sales_series(conn, p["id"])
+    scores_no_conn = forecasting.rolling_origin_cv(series, None)
+    assert "SARIMAX (festival+weather)" not in scores_no_conn
+
 
 
 def test_association_rules_recover_known_affinity():
@@ -694,6 +734,130 @@ def test_netserver_lets_a_remote_till_share_the_same_database():
             assert any(s["id"] == new_staff_id for s in staff.list_staff(conn))
         finally:
             remote.close()
+    finally:
+        server.stop()
+
+
+def test_rag_insights_retrieve_and_generate_end_to_end():
+    conn = _fresh_db()
+    cards = rag_insights.dashboard_insights(conn)
+    assert isinstance(cards, list) and len(cards) >= 1
+    assert all({"kind", "text"} <= set(c) for c in cards)
+
+
+def test_rag_insights_generate_covers_every_signal():
+    from datetime import date as _date
+    context = {
+        "as_of": _date(2026, 4, 10),
+        "upcoming_festivals": [{"name": "Sinhala & Tamil New Year", "date": _date(2026, 4, 14), "days_until": 4}],
+        "weather_today": "hot",
+        "weather_sensitive_categories": {"Beverages": 1.3},
+        "low_stock": [{"name_en": "Test Item"}],
+        "urgent_batches": [{"name": "Yoghurt Cup", "days_to_expiry": 2}],
+    }
+    cards = rag_insights.generate(context)
+    kinds = {c["kind"] for c in cards}
+    assert kinds == {"festival", "weather", "expiry", "stock"}
+    assert "Sinhala & Tamil New Year" in next(c["text"] for c in cards if c["kind"] == "festival")
+
+
+def test_rag_insights_generate_falls_back_when_nothing_is_relevant():
+    context = {
+        "as_of": None, "upcoming_festivals": [], "weather_today": "dry",
+        "weather_sensitive_categories": {}, "low_stock": [], "urgent_batches": [],
+    }
+    cards = rag_insights.generate(context)
+    assert len(cards) == 1 and cards[0]["kind"] == "ok"
+
+
+def test_offline_connection_falls_back_and_syncs_on_reconnect():
+    # Objective 6 - a Cashier Till (offline_sync.OfflineConnection) must
+    # keep selling when the Main Till drops, then reconcile automatically
+    # once it's back, without losing or duplicating anything.
+    conn, db_path = _fresh_db_with_path()
+    server = netserver.NetDBServer(db_path)
+    server.start(port=18790)  # fixed port - this test stops/restarts the server and must reconnect to the same one
+    mirror_path = Path(tempfile.mkdtemp()) / "offline_mirror.db"
+    try:
+        till = offline_sync.OfflineConnection("127.0.0.1", server.port, server.pairing_code, mirror_path)
+        assert till.is_online is True
+        assert till.pending_count == 0
+
+        product = _product_with_stock(till, min_qty=5)  # works like a normal connection while online
+        on_hand_before = pos.get_stock_on_hand(conn, product["id"])
+
+        server.stop()  # simulate the network/Main Till dropping
+
+        # First attempt after the drop still fails visibly (matches the
+        # pre-offline-sync behavior for THIS attempt) - but flips the till
+        # into offline mode so the retry works.
+        try:
+            pos.create_invoice(till, staff_id=1, cart=[pos.CartLine(product_id=product["id"], qty=2)])
+            assert False, "expected the first post-drop call to raise while still marked online"
+        except netclient.RemoteError:
+            pass
+        assert till.is_online is False
+
+        result = pos.create_invoice(till, staff_id=1, cart=[pos.CartLine(product_id=product["id"], qty=2)])
+        assert result.net_total > 0
+        assert till.pending_count == 1  # one queued transaction (batch), regardless of its statement count
+
+        # Reads while offline reflect this till's OWN offline sale (served
+        # from the mirror, which this till's own writes also updated).
+        assert pos.get_stock_on_hand(till, product["id"]) == on_hand_before - 2
+
+        server.start(port=18790)  # Main Till is back
+        outcome = till.try_reconnect()
+        assert outcome == {"synced": outcome["synced"], "failed": 0, "still_offline": False}
+        assert till.is_online is True
+        assert till.pending_count == 0
+
+        # The offline sale actually reached the Main Till's real database.
+        synced_total = conn.execute(
+            "SELECT COUNT(*) c FROM invoices WHERE net_total=?", (result.net_total,)
+        ).fetchone()["c"]
+        assert synced_total >= 1
+        assert pos.get_stock_on_hand(conn, product["id"]) == on_hand_before - 2
+    finally:
+        server.stop()
+
+
+def test_offline_sync_remints_invoice_no_on_collision():
+    # Two Cashier Tills both go offline at the same moment (same last-seen
+    # invoice in their mirrors) and both ring up a sale, so both mint the
+    # SAME next invoice_no locally. Whichever syncs second must not fail -
+    # it should get a fresh invoice_no from the Main Till and land anyway.
+    conn, db_path = _fresh_db_with_path()
+    server = netserver.NetDBServer(db_path)
+    server.start(port=18791)
+    till_a_mirror = Path(tempfile.mkdtemp()) / "offline_mirror_a.db"
+    till_b_mirror = Path(tempfile.mkdtemp()) / "offline_mirror_b.db"
+    try:
+        till_a = offline_sync.OfflineConnection("127.0.0.1", server.port, server.pairing_code, till_a_mirror)
+        till_b = offline_sync.OfflineConnection("127.0.0.1", server.port, server.pairing_code, till_b_mirror)
+        product = _product_with_stock(till_a, min_qty=10)
+
+        server.stop()
+        for till in (till_a, till_b):
+            try:
+                pos.create_invoice(till, staff_id=1, cart=[pos.CartLine(product_id=product["id"], qty=1)])
+            except netclient.RemoteError:
+                pass  # expected first-failure, see test above
+
+        result_a = pos.create_invoice(till_a, staff_id=1, cart=[pos.CartLine(product_id=product["id"], qty=1)])
+        result_b = pos.create_invoice(till_b, staff_id=1, cart=[pos.CartLine(product_id=product["id"], qty=1)])
+        assert result_a.invoice_no == result_b.invoice_no  # both minted the same number offline, as expected
+
+        server.start(port=18791)
+        outcome_a = till_a.try_reconnect()
+        outcome_b = till_b.try_reconnect()
+        assert outcome_a["still_offline"] is False
+        assert outcome_b["still_offline"] is False  # the collision was handled, not left queued
+
+        real_numbers = [r["invoice_no"] for r in conn.execute(
+            "SELECT invoice_no FROM invoices WHERE net_total=?", (result_a.net_total,)
+        ).fetchall()]
+        assert len(real_numbers) == len(set(real_numbers)), "both offline sales landed but were re-numbered uniquely"
     finally:
         server.stop()
 

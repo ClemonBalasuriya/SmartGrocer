@@ -133,6 +133,18 @@ CREATE TABLE IF NOT EXISTS waste_events (
     reason       TEXT NOT NULL DEFAULT 'expired_unsold'
 );
 
+-- One row per date the shop has an ACTUAL observed weather category for
+-- (Objective 6's weather-aware forecasting - see weather_sl.py). Any date
+-- with no row here falls back to weather_sl.climatology_category(), a
+-- fixed Sri Lankan monsoon-season approximation - logging real days here
+-- is what lets the SARIMAX-with-weather forecast variant improve on it.
+CREATE TABLE IF NOT EXISTS weather_log (
+    log_date   TEXT PRIMARY KEY,               -- ISO date
+    category   TEXT NOT NULL,                  -- 'rain' | 'dry' | 'hot'
+    source     TEXT NOT NULL DEFAULT 'manual',  -- 'manual' | 'climatology'
+    logged_at  TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS layout_assignments (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     product_id   INTEGER NOT NULL REFERENCES products(id),

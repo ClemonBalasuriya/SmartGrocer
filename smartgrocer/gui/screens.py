@@ -21,6 +21,9 @@ from .. import staff as staff_module
 from .. import mobile_scan
 from .. import netclient
 from .. import netserver
+from .. import weather_sl
+from .. import offline_sync
+from .. import rag_insights
 from .. import audit
 from .. import notifications
 from .. import db as db_module
@@ -1051,6 +1054,19 @@ class DashboardScreen(BaseScreen):
                                               font=ctk.CTkFont(size=14), text_color=theme.TEXT_DARK)
         self.top_seller_label.pack(anchor="w", padx=16, pady=12)
 
+        # Objective 6 - lightweight RAG insight cards (see rag_insights.py):
+        # plain-language, template-generated explanations grounded in the
+        # festival calendar, weather, and this shop's own current low-stock/
+        # expiry state - not a chat box, just "here's what's worth knowing
+        # today and why".
+        insights_frame = ctk.CTkFrame(body, corner_radius=10, fg_color=theme.CARD_BG,
+                                       border_width=1, border_color=theme.BORDER)
+        insights_frame.pack(fill="x", padx=24, pady=(0, 10))
+        ctk.CTkLabel(insights_frame, text="Insights", font=ctk.CTkFont(size=13, weight="bold"),
+                     text_color=theme.TEXT_MUTED).pack(anchor="w", padx=16, pady=(12, 4))
+        self.insights_container = ctk.CTkFrame(insights_frame, fg_color="transparent")
+        self.insights_container.pack(fill="x", padx=16, pady=(0, 14))
+
         btn_row = ctk.CTkFrame(body, fg_color="transparent")
         btn_row.pack(fill="x", padx=24, pady=10)
         styled_button(btn_row, "Refresh", self.refresh, kind="secondary").pack(side="left", padx=(0, 10))
@@ -1069,6 +1085,13 @@ class DashboardScreen(BaseScreen):
         self.card_labels["expiring_within_7_days"].configure(text=str(kpis["expiring_within_7_days"]))
         self.card_labels["historical_waste_value_lkr"].configure(text=f"{kpis['historical_waste_value_lkr']:,.0f}")
         self.top_seller_label.configure(text=f"Top seller (30d): {kpis['top_seller_30d'] or '-'}")
+
+        for w in self.insights_container.winfo_children():
+            w.destroy()
+        for card in rag_insights.dashboard_insights(self.conn):
+            ctk.CTkLabel(self.insights_container, text="\u2022 " + card["text"], font=ctk.CTkFont(size=12),
+                         text_color=theme.TEXT_DARK, wraplength=900, justify="left", anchor="w").pack(
+                fill="x", pady=3)
 
     def rebuild_demo_data(self):
         if not messagebox.askyesno(
@@ -1155,6 +1178,13 @@ class POSScreen(BaseScreen):
         header_row.pack(fill="x", padx=24, pady=(20, 12))
         ctk.CTkLabel(header_row, text="POS / Checkout", font=ctk.CTkFont(size=22, weight="bold"),
                      text_color=theme.NAVY_DARK).pack(side="left")
+        # Objective 6 - a cashier ringing up sales needs to see offline
+        # mode from THIS screen, not just the Network screen they'd have
+        # no reason to visit mid-sale. Blank whenever this till isn't an
+        # offline-capable Cashier Till or is online with nothing queued.
+        self.offline_badge = ctk.CTkLabel(header_row, text="", font=ctk.CTkFont(size=13, weight="bold"),
+                                           text_color=theme.DANGER_RED)
+        self.offline_badge.pack(side="left", padx=(16, 0))
         self.cart: list[dict] = []
 
         # Everything below goes in a scrollable frame, not straight into
@@ -1578,6 +1608,15 @@ class POSScreen(BaseScreen):
         self._mark_focus("search")
 
     def on_show(self):
+        if isinstance(self.app.conn, offline_sync.OfflineConnection) and not self.app.conn.is_online:
+            pending = self.app.conn.pending_count
+            self.offline_badge.configure(
+                text=f"\u26a0 OFFLINE - {pending} queued, will sync automatically" if pending
+                     else "\u26a0 OFFLINE - sales queue locally until reconnected"
+            )
+        else:
+            self.offline_badge.configure(text="")
+
         # No dropdown to refresh any more - just make sure whoever was
         # attached to the sale (if not Walk-in) is still a real, active
         # customer before trusting that name for pricing/quick-items.
@@ -3779,6 +3818,26 @@ class ForecastingScreen(BaseScreen):
                                                 kind="secondary")
         self.purchase_list_btn.pack(side="left", padx=20)
 
+        # Objective 6 - lets the shop log today's ACTUAL weather category so
+        # the SARIMAX (festival+weather) variant above has real data to use
+        # instead of only the climatology fallback (see weather_sl.py).
+        weather_row = ctk.CTkFrame(self, fg_color="transparent")
+        weather_row.pack(fill="x", padx=24, pady=(10, 0))
+        ctk.CTkLabel(weather_row, text="Today's weather:", text_color=theme.TEXT_DARK).pack(side="left")
+        today_logged = weather_sl.logged_categories(self.conn).get(date.today().isoformat())
+        self.weather_var = tk.StringVar(
+            value=today_logged or weather_sl.climatology_category(date.today())
+        )
+        ctk.CTkOptionMenu(weather_row, values=list(weather_sl.CATEGORIES), variable=self.weather_var,
+                          width=100).pack(side="left", padx=8)
+        styled_button(weather_row, "Log Weather", self.log_weather, kind="secondary").pack(side="left")
+        self.weather_hint = ctk.CTkLabel(
+            weather_row,
+            text=("(logged)" if today_logged else "(climatology estimate - not yet logged today)"),
+            font=ctk.CTkFont(size=11), text_color=theme.TEXT_MUTED,
+        )
+        self.weather_hint.pack(side="left", padx=10)
+
         self.status_label = ctk.CTkLabel(self, text="", text_color=theme.TEXT_MUTED)
         self.status_label.pack(anchor="w", padx=24, pady=(6, 0))
 
@@ -3804,6 +3863,12 @@ class ForecastingScreen(BaseScreen):
                 conn.close()
 
         run_in_background(self, work, self._on_forecast_done, self._on_forecast_error)
+
+    def log_weather(self):
+        weather_sl.log_weather(self.conn, date.today(), self.weather_var.get())
+        self.weather_hint.configure(text="(logged)")
+        messagebox.showinfo("Weather logged", f"Logged today ({date.today().isoformat()}) as \"{self.weather_var.get()}\". "
+                             "The SARIMAX (festival+weather) forecast will use this from now on.")
 
     def _on_forecast_error(self, err):
         self.run_forecast_btn.configure(state="normal")
@@ -5350,6 +5415,8 @@ class NetworkScreen(BaseScreen):
         self.connect_btn = styled_button(btn_row, "Connect to Another Till", self.open_connect_dialog,
                                           kind="secondary")
         self.connect_btn.pack(side="left", padx=8)
+        self.sync_now_btn = styled_button(btn_row, "Sync Now", self.sync_now, kind="primary")
+        self.sync_now_btn.pack(side="left", padx=8)
         self.disconnect_btn = styled_button(btn_row, "Disconnect (Use This PC's Own Data)",
                                              self.disconnect, kind="danger")
         self.disconnect_btn.pack(side="left", padx=8)
@@ -5377,17 +5444,32 @@ class NetworkScreen(BaseScreen):
             host = self.app.till_config.get("server_host")
             port = self.app.till_config.get("server_port")
             reachable = self.app.conn.ping() if hasattr(self.app.conn, "ping") else False
+            is_offline_conn = isinstance(self.app.conn, offline_sync.OfflineConnection)
+            pending = self.app.conn.pending_count if is_offline_conn else 0
             self.status_label.configure(
-                text=f"Cashier Till - connected to {host}:{port}" + ("" if reachable else " (unreachable right now)")
+                text=f"Cashier Till - connected to {host}:{port}" if reachable else
+                     f"Cashier Till - OFFLINE ({host}:{port} unreachable right now)"
             )
-            self.status_detail.configure(
-                text="This till is using the Main Till's shared data. Disconnect to go back to a "
-                     "database that only this PC uses."
-                if reachable else
-                "Can't reach the Main Till right now - check it's turned on and both PCs are on the "
-                "same network. This till may be showing a temporary local fallback copy in the "
-                "meantime (see the warning shown when it lost the connection)."
-            )
+            if reachable:
+                self.status_detail.configure(
+                    text="This till is using the Main Till's shared data. Disconnect to go back to a "
+                         "database that only this PC uses."
+                )
+            elif is_offline_conn:
+                self.status_detail.configure(
+                    text=(f"Working offline - {pending} transaction(s) queued and will sync automatically "
+                          f"once the Main Till is reachable again (checked every 20s), or press \"Sync Now\". "
+                          "Sales, stock and everything else keep working meanwhile from this till's own "
+                          "local copy of the shop's data."
+                          if pending else
+                          "Working offline - nothing queued yet. Sales made now will sync automatically "
+                          "once the Main Till is reachable again, or press \"Sync Now\".")
+                )
+            else:
+                self.status_detail.configure(
+                    text="Can't reach the Main Till right now - check it's turned on and both PCs are on the "
+                         "same network."
+                )
         elif server is not None and server.running:
             self.status_label.configure(text="Main Till - sharing this PC's data")
             self.status_detail.configure(
@@ -5408,6 +5490,10 @@ class NetworkScreen(BaseScreen):
         self.stop_share_btn.configure(state="normal" if (server and server.running) else "disabled")
         self.connect_btn.configure(state="disabled" if (is_client or (server and server.running)) else "normal")
         self.disconnect_btn.configure(state="normal" if is_client else "disabled")
+        self.sync_now_btn.configure(
+            state="normal" if (is_client and isinstance(self.app.conn, offline_sync.OfflineConnection)
+                                and not self.app.conn.is_online) else "disabled"
+        )
 
     def start_sharing(self):
         try:
@@ -5487,11 +5573,38 @@ class NetworkScreen(BaseScreen):
         dialog.bind("<Return>", lambda e: connect())
         styled_button(dialog, "Connect", connect, kind="primary", width=140).pack(pady=18)
 
+    def sync_now(self):
+        conn = self.app.conn
+        if not isinstance(conn, offline_sync.OfflineConnection):
+            return
+        self.sync_now_btn.configure(state="disabled")
+
+        def work():
+            return conn.try_reconnect()
+
+        def done(outcome):
+            if outcome["still_offline"]:
+                messagebox.showwarning(
+                    "Still can't reach the Main Till",
+                    "No luck this time" + (f" - {outcome['failed']} transaction(s) remain queued."
+                                            if outcome["failed"] else ".") + " Will keep retrying automatically.",
+                )
+            else:
+                messagebox.showinfo(
+                    "Synced",
+                    f"Reconnected - {outcome['synced']} queued transaction(s) synced to the Main Till."
+                    if outcome["synced"] else "Reconnected to the Main Till.",
+                )
+            self.refresh()
+
+        run_in_background(self, work, done, lambda e: (self.sync_now_btn.configure(state="normal"), self.refresh()))
+
     def disconnect(self):
         if not messagebox.askyesno(
             "Disconnect this till?",
             "This till will go back to using a database that only this PC can see, starting empty "
-            "unless it had one before. Any sales made while connected stay on the Main Till - they "
+            "unless it had one before. Any sales made while connected (including anything still queued "
+            "offline and not yet synced) stay on the Main Till/this till's own offline queue - they "
             "won't be copied here. Continue?",
         ):
             return
