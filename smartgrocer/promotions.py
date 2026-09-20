@@ -30,6 +30,20 @@ from __future__ import annotations
 import sqlite3
 from datetime import date, timedelta
 
+# SQLite has a per-statement limit on the number of "?" placeholders (the
+# historical default is 999; newer SQLite builds raise it to 32766, but
+# this shouldn't depend on which one happens to ship with a given Python
+# install) - a real shop's real catalogue (import_products.py: thousands
+# of SKUs) can easily have more products-with-expiry-dates than that in
+# one compute_promotions() call, so the IN (...) queries below are chunked
+# into batches of this size rather than built as one huge query.
+_SQL_IN_CHUNK_SIZE = 500
+
+
+def _chunked(items: list, size: int):
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
 
 def _margin_scores(conn: sqlite3.Connection) -> dict[int, float]:
     rows = conn.execute("SELECT id, cost_price, cash_price FROM products WHERE active=1").fetchall()
@@ -43,23 +57,66 @@ def _margin_scores(conn: sqlite3.Connection) -> dict[int, float]:
 
 
 def _velocity(conn: sqlite3.Connection, product_id: int, days: int, as_of: date) -> float:
+    """Single-product convenience wrapper around `_velocity_map` - kept for
+    any external/one-off caller that only needs one product; internally,
+    `compute_promotions` uses the batched map version instead (see its
+    docstring note below for why)."""
+    return _velocity_map(conn, [product_id], days, as_of)[product_id]
+
+
+def _velocity_map(conn: sqlite3.Connection, product_ids: list[int], days: int, as_of: date) -> dict[int, float]:
+    """Same calculation as `_velocity`, for every product in `product_ids`
+    in ONE query instead of one query per product. `compute_promotions`
+    used to call `_velocity` per batch (2x - recent + historical window),
+    which meant 2 full aggregate scans of invoice_items PER STOCK BATCH -
+    fine against the small synthetic demo dataset, but it scales with real
+    production history (invoice_items only grows) and with a real shop's
+    real item count (thousands of SKUs, many with expiry dates, after
+    import_products.py), which is exactly what made the RAG dashboard
+    ("Ask a question", and the ordinary Insights panel before it) feel
+    slow once used against Balasuriya Group's real, growing database."""
+    if not product_ids:
+        return {}
     since = (as_of - timedelta(days=days)).isoformat()
     until = (as_of + timedelta(days=1)).isoformat()  # exclusive upper bound, avoids wrapping the column in date()
-    row = conn.execute(
-        """SELECT COALESCE(SUM(ii.qty),0) q FROM invoice_items ii JOIN invoices i ON i.id=ii.invoice_id
-           WHERE ii.product_id=? AND i.voided=0 AND i.datetime >= ? AND i.datetime < ?""",
-        (product_id, since, until),
-    ).fetchone()
-    return row["q"] / days
+    sums: dict[int, float] = {}
+    for chunk in _chunked(product_ids, _SQL_IN_CHUNK_SIZE):
+        placeholders = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"""SELECT ii.product_id pid, COALESCE(SUM(ii.qty),0) q FROM invoice_items ii
+                JOIN invoices i ON i.id=ii.invoice_id
+                WHERE ii.product_id IN ({placeholders}) AND i.voided=0 AND i.datetime >= ? AND i.datetime < ?
+                GROUP BY ii.product_id""",
+            (*chunk, since, until),
+        ).fetchall()
+        sums.update({r["pid"]: r["q"] for r in rows})
+    return {pid: sums.get(pid, 0.0) / days for pid in product_ids}
 
 
 def _typical_shelf_life(conn: sqlite3.Connection, product_id: int) -> float:
-    row = conn.execute(
-        """SELECT AVG(julianday(expiry_date) - julianday(received_date)) d FROM stock_batches
-           WHERE product_id=? AND expiry_date IS NOT NULL""",
-        (product_id,),
-    ).fetchone()
-    return row["d"] if row["d"] else 14.0
+    """Single-product convenience wrapper around `_shelf_life_map` - see
+    that function's docstring for why `compute_promotions` itself calls
+    the batched version instead."""
+    return _shelf_life_map(conn, [product_id])[product_id]
+
+
+def _shelf_life_map(conn: sqlite3.Connection, product_ids: list[int]) -> dict[int, float]:
+    """Same calculation as `_typical_shelf_life`, for every product in
+    `product_ids` in ONE query instead of one per product - see
+    `_velocity_map`'s docstring for why this matters at real-shop scale."""
+    if not product_ids:
+        return {}
+    avgs: dict[int, float] = {}
+    for chunk in _chunked(product_ids, _SQL_IN_CHUNK_SIZE):
+        placeholders = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"""SELECT product_id pid, AVG(julianday(expiry_date) - julianday(received_date)) d
+                FROM stock_batches WHERE product_id IN ({placeholders}) AND expiry_date IS NOT NULL
+                GROUP BY product_id""",
+            chunk,
+        ).fetchall()
+        avgs.update({r["pid"]: r["d"] for r in rows})
+    return {pid: (avgs.get(pid) or 14.0) for pid in product_ids}
 
 
 def compute_promotions(conn: sqlite3.Connection, as_of: date | None = None,
@@ -74,17 +131,26 @@ def compute_promotions(conn: sqlite3.Connection, as_of: date | None = None,
            WHERE b.qty_remaining > 0 AND b.expiry_date IS NOT NULL AND p.active=1"""
     ).fetchall()
 
+    # Look up shelf life and both velocity windows for every batch's product
+    # in 3 queries total, not 3 PER BATCH (see _velocity_map's docstring) -
+    # this is what made a real shop's-worth of batches (versus the small
+    # synthetic demo dataset) fast again.
+    product_ids = sorted({b["product_id"] for b in batches})
+    shelf_life_map = _shelf_life_map(conn, product_ids)
+    recent_v_map = _velocity_map(conn, product_ids, recent_window, as_of)
+    hist_v_map = _velocity_map(conn, product_ids, historical_window, as_of)
+
     out = []
     for b in batches:
         expiry = date.fromisoformat(b["expiry_date"])
         days_to_expiry = (expiry - as_of).days
-        shelf_life = _typical_shelf_life(conn, b["product_id"])
+        shelf_life = shelf_life_map[b["product_id"]]
         se = max(0.0, min(1.0, 1 - max(days_to_expiry, 0) / shelf_life)) if shelf_life > 0 else 1.0
         if days_to_expiry <= 0:
             se = 1.0
 
-        recent_v = _velocity(conn, b["product_id"], recent_window, as_of)
-        hist_v = _velocity(conn, b["product_id"], historical_window, as_of)
+        recent_v = recent_v_map[b["product_id"]]
+        hist_v = hist_v_map[b["product_id"]]
         if hist_v <= 1e-6:
             sv = 1.0 if recent_v <= 1e-6 else 0.0
         else:

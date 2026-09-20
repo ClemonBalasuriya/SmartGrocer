@@ -184,6 +184,61 @@ def test_promotions_scores_are_bounded():
         assert r["suggested_price"] >= 0
 
 
+def test_compute_promotions_scales_to_a_real_shops_worth_of_products():
+    # Regression test for a real N+1-query bug: compute_promotions used to
+    # run 3 separate SQL queries PER STOCK BATCH (velocity x2, shelf life
+    # x1), invisible against the ~66-item synthetic demo dataset but
+    # painfully slow once a real shop imported thousands of real SKUs
+    # (import_products.py) and had months of real sales history - this is
+    # exactly what made the RAG "Ask a question" box (and the ordinary
+    # Insights panel before it) feel slow in real production use.
+    # _velocity_map/_shelf_life_map batch those into 3 queries TOTAL,
+    # chunked to stay under SQLite's per-statement placeholder limit. This
+    # test builds a comparably-sized synthetic dataset (2,000 perishable
+    # products, a third with real sales history) and asserts it still
+    # completes in well under a second - a regression back to per-batch
+    # queries would make this take many seconds instead.
+    import time as _time
+    from datetime import date, timedelta
+    conn = db.reset_db(Path(tempfile.mkdtemp()) / "promo_scale_test.db")
+    today = date.today()
+    product_ids = []
+    for i in range(2000):
+        cur = conn.execute(
+            """INSERT INTO products (code, name_en, name_si, category, unit, cost_price, cash_price,
+               credit_price, wholesale_price, pack_size, reorder_level, is_perishable, is_staple,
+               child_target, active) VALUES (?,?,'','Test','pcs',50,80,82,55,1,10,1,0,0,1)""",
+            (f"SCALE{i:05d}", f"Scale Product {i}"),
+        )
+        pid = cur.lastrowid
+        product_ids.append(pid)
+        conn.execute(
+            """INSERT INTO stock_batches (product_id, batch_no, qty_received, qty_remaining,
+               received_date, expiry_date, cost_price) VALUES (?,?,?,?,?,?,50)""",
+            (pid, "B1", 100, 20, (today - timedelta(days=10)).isoformat(),
+             (today + timedelta(days=5)).isoformat()),
+        )
+    for i, pid in enumerate(product_ids[:600]):
+        conn.execute(
+            "INSERT INTO invoices (invoice_no, datetime, staff_id, subtotal, net_total, payment_type, voided) "
+            "VALUES (?,?,?,80,80,'cash',0)",
+            (f"SCALEINV{i:06d}", (today - timedelta(days=1)).isoformat() + "T10:00:00", 1),
+        )
+        inv_id = conn.execute("SELECT last_insert_rowid() id").fetchone()["id"]
+        conn.execute(
+            "INSERT INTO invoice_items (invoice_id, product_id, qty, unit_price, line_total) VALUES (?,?,1,80,80)",
+            (inv_id, pid),
+        )
+    conn.commit()
+
+    start = _time.time()
+    rows = promotions.compute_promotions(conn, as_of=today)
+    elapsed = _time.time() - start
+
+    assert len(rows) == 2000
+    assert elapsed < 2.0, f"compute_promotions took {elapsed:.2f}s for 2,000 products - looks like the N+1 regressed"
+
+
 def test_layout_assigns_every_active_product():
     conn = _fresh_db()
     n_products = conn.execute("SELECT COUNT(*) c FROM products WHERE active=1").fetchone()["c"]
