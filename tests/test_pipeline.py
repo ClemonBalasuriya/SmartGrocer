@@ -930,10 +930,40 @@ def test_rag_answer_question_classifies_and_answers_each_intent():
     promo = rag_insights.answer_question(conn, "what promotion beter togive")
     assert promo["intent"] == "promotion"
 
-    unknown = rag_insights.answer_question(conn, "how is the weather today")
+    # "asdfghjkl qwerty" matches nothing (no known intent, no item name) -
+    # the fallback should say plainly it didn't understand rather than
+    # guessing, and still remind the owner what it CAN answer.
+    unknown = rag_insights.answer_question(conn, "asdfghjkl qwerty")
     assert unknown["intent"] is None
-    assert "not sure exactly what you're asking" in unknown["text"]
+    assert "don't understand" in unknown["text"]
     assert "what do I need to buy?" in unknown["text"]
+
+    sales = rag_insights.answer_question(conn, "how is business today")
+    assert sales["intent"] == "sales_today"
+
+    hello = rag_insights.answer_question(conn, "hi")
+    assert hello["intent"] == "greeting"
+
+    thanks = rag_insights.answer_question(conn, "thanks")
+    assert thanks["intent"] == "thanks"
+
+
+def test_rag_answer_question_looks_up_a_named_item_when_no_intent_matches():
+    # A question that doesn't match any fixed intent but does name an item
+    # ("how much rice do I have?", naming only PART of a longer product
+    # name like "milk powder" for "Full Cream Milk Powder 400g") should
+    # answer with that item's stock directly rather than falling all the
+    # way through to the generic "I don't understand" fallback.
+    conn = _fresh_db()
+    rice = rag_insights.answer_question(conn, "how much rice do I have")
+    assert rice["intent"] == "item_lookup"
+    assert "rice" in rice["text"].lower()
+    assert "on hand" in rice["text"].lower()
+
+    # A generic word alone ("how much stock do I have today") must NOT
+    # explode into matching every product in the catalog.
+    generic = rag_insights.answer_question(conn, "how much stock do I have today")
+    assert generic["intent"] is None
 
 
 def test_rag_answer_question_plain_language_has_no_jargon():

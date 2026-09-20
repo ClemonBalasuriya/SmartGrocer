@@ -1081,7 +1081,8 @@ class DashboardScreen(BaseScreen):
                      text_color=theme.TEXT_MUTED).pack(anchor="w", padx=16, pady=(12, 0))
         ctk.CTkLabel(
             ask_frame, text='Try: "What do I need to buy?"  ·  "What is fast moving?"  ·  '
-                            '"What promotion should I give?"',
+                            '"What promotion should I give?"  ·  "How much did I sell today?"  ·  '
+                            'or just an item name, like "How much rice do I have?"',
             font=ctk.CTkFont(size=11), text_color=theme.TEXT_MUTED, wraplength=900, justify="left",
         ).pack(anchor="w", padx=16, pady=(2, 8))
         ask_row = ctk.CTkFrame(ask_frame, fg_color="transparent")

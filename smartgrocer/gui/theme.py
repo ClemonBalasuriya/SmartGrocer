@@ -58,6 +58,10 @@ INSIGHT_STYLES = {
     "promotion":    ("🏷️", DANGER_RED),
     "unmatched":    ("💡", TEXT_MUTED),       # question didn't match a known intent
     "error":        ("⚠️", DANGER_RED),
+    "sales_today":  ("💰", SUCCESS_GREEN),
+    "item_lookup":  ("🔎", ACCENT_BLUE),
+    "greeting":     ("👋", ACCENT_BLUE),
+    "thanks":       ("👍", SUCCESS_GREEN),
 }
 
 
