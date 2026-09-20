@@ -40,6 +40,33 @@ ALERT_COLORS = {
     "needs_price": "#FBE7A2",  # price_verified=0 - a bulk-imported placeholder price, not yet checked
 }
 
+# Dashboard "Insights" cards and the "Ask a question" answer (rag_insights.py)
+# are read by the shop owner, not a developer, so each kind of insight gets
+# its own icon and accent color instead of one flat bulleted list - lets
+# someone glance down the panel and tell "this is an expiry warning" from
+# "this is just a heads-up" without reading every word. Keyed by the
+# "kind" field rag_insights.generate() already returns, plus the three
+# `answer_question()` intents and a fallback for the unmatched case.
+INSIGHT_STYLES = {
+    "festival":     ("🎉", ACCENT_BLUE),      # upcoming festival demand
+    "weather":      ("🌦️", ACCENT_BLUE),  # weather-driven demand
+    "expiry":       ("⏰", DANGER_RED),           # near-expiry stock
+    "stock":        ("📦", "#B7791F"),        # below reorder level (amber, distinct from red)
+    "ok":           ("✅", SUCCESS_GREEN),        # nothing needs attention
+    "purchase":     ("📦", "#B7791F"),
+    "fast_moving":  ("🔥", ACCENT_BLUE),
+    "promotion":    ("🏷️", DANGER_RED),
+    "unmatched":    ("💡", TEXT_MUTED),       # question didn't match a known intent
+    "error":        ("⚠️", DANGER_RED),
+}
+
+
+def insight_style(kind: str | None) -> tuple[str, str]:
+    """(icon, accent_color) for an insight/answer "kind" - falls back to a
+    plain neutral bullet for anything not in the table above so a future
+    new kind never renders as a crash, just a slightly less decorated card."""
+    return INSIGHT_STYLES.get(kind or "unmatched", ("•", TEXT_MUTED))
+
 
 def apply_global_style() -> None:
     """Configure ttk.Style once at app startup. ttk widgets (Treeview,

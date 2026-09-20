@@ -1091,11 +1091,27 @@ class DashboardScreen(BaseScreen):
         self.ask_entry.bind("<Return>", lambda _event: self.ask_question())
         self.ask_btn = styled_button(ask_row, "Ask", self.ask_question, kind="primary")
         self.ask_btn.pack(side="left")
+
+        # The answer renders as its own accent-colored card (same visual
+        # language as the Insights cards below) instead of a bare paragraph
+        # of text, and stays hidden until there is an actual answer to show -
+        # an empty card under the question box read as "did this do
+        # anything?" during testing.
+        self.ask_answer_card = ctk.CTkFrame(ask_frame, corner_radius=8, fg_color=theme.BG_LIGHT)
+        self.ask_answer_accent = ctk.CTkFrame(self.ask_answer_card, width=4, fg_color=theme.ACCENT_BLUE,
+                                               corner_radius=0)
+        self.ask_answer_accent.pack(side="left", fill="y")
+        ask_answer_inner = ctk.CTkFrame(self.ask_answer_card, fg_color="transparent")
+        ask_answer_inner.pack(side="left", fill="both", expand=True, padx=(12, 14), pady=12)
+        self.ask_answer_icon = ctk.CTkLabel(ask_answer_inner, text="", font=ctk.CTkFont(size=16),
+                                             text_color=theme.TEXT_DARK)
+        self.ask_answer_icon.pack(side="left", anchor="n", padx=(0, 10))
         self.ask_answer_label = ctk.CTkLabel(
-            ask_frame, text="", font=ctk.CTkFont(size=12), text_color=theme.TEXT_DARK,
-            wraplength=900, justify="left", anchor="w",
+            ask_answer_inner, text="", font=ctk.CTkFont(size=12), text_color=theme.TEXT_DARK,
+            wraplength=820, justify="left", anchor="w",
         )
-        self.ask_answer_label.pack(fill="x", padx=16, pady=(10, 14))
+        self.ask_answer_label.pack(side="left", fill="both", expand=True)
+        # Not packed here on purpose - shown for the first time in ask_question()/done().
 
         btn_row = ctk.CTkFrame(body, fg_color="transparent")
         btn_row.pack(fill="x", padx=24, pady=10)
@@ -1119,27 +1135,52 @@ class DashboardScreen(BaseScreen):
         for w in self.insights_container.winfo_children():
             w.destroy()
         for card in rag_insights.dashboard_insights(self.conn):
-            ctk.CTkLabel(self.insights_container, text="\u2022 " + card["text"], font=ctk.CTkFont(size=12),
-                         text_color=theme.TEXT_DARK, wraplength=900, justify="left", anchor="w").pack(
-                fill="x", pady=3)
+            icon, accent = theme.insight_style(card["kind"])
+            row = ctk.CTkFrame(self.insights_container, corner_radius=8, fg_color=theme.BG_LIGHT)
+            row.pack(fill="x", pady=4)
+            ctk.CTkFrame(row, width=4, fg_color=accent, corner_radius=0).pack(side="left", fill="y")
+            inner = ctk.CTkFrame(row, fg_color="transparent")
+            inner.pack(side="left", fill="both", expand=True, padx=(12, 14), pady=10)
+            ctk.CTkLabel(inner, text=icon, font=ctk.CTkFont(size=15), text_color=theme.TEXT_DARK).pack(
+                side="left", anchor="n", padx=(0, 10))
+            ctk.CTkLabel(inner, text=card["text"], font=ctk.CTkFont(size=12), text_color=theme.TEXT_DARK,
+                         wraplength=820, justify="left", anchor="w").pack(side="left", fill="both", expand=True)
 
     def ask_question(self):
         question = self.ask_entry.get().strip()
         if not question:
             return
         self.ask_btn.configure(state="disabled", text="Thinking...")
-        self.ask_answer_label.configure(text="")
 
         def work():
-            return rag_insights.answer_question(self.conn, question)
+            # This runs on a background thread (see run_in_background's
+            # docstring) - sqlite3 connections can't cross threads, so this
+            # opens its own rather than reusing self.conn. Reusing self.conn
+            # here previously raised "SQLite objects created in a thread can
+            # only be used in that same thread" on every single question,
+            # which is what made the Ask-a-question box look completely
+            # broken - it wasn't the RAG logic, it was this thread handoff.
+            conn = db_module.get_conn(self.app.db_path)
+            try:
+                return rag_insights.answer_question(conn, question)
+            finally:
+                conn.close()
+
+        def show_answer(text: str, kind: str):
+            icon, accent = theme.insight_style(kind)
+            self.ask_answer_icon.configure(text=icon)
+            self.ask_answer_accent.configure(fg_color=accent)
+            self.ask_answer_label.configure(text=text)
+            if not self.ask_answer_card.winfo_ismapped():
+                self.ask_answer_card.pack(fill="x", padx=16, pady=(10, 14))
 
         def done(result: dict):
             self.ask_btn.configure(state="normal", text="Ask")
-            self.ask_answer_label.configure(text=result["text"])
+            show_answer(result["text"], result["intent"] or "unmatched")
 
         def on_error(exc: Exception):
             self.ask_btn.configure(state="normal", text="Ask")
-            self.ask_answer_label.configure(text=f"Sorry, something went wrong answering that: {exc}")
+            show_answer(f"Sorry, something went wrong answering that: {exc}", "error")
 
         run_in_background(self, work, done, on_error)
 
@@ -2964,7 +3005,16 @@ class InventoryScreen(BaseScreen):
             return
 
         def work():
-            return import_products.import_from_csv(self.conn, path)
+            # run_in_background() runs this on a background thread - sqlite3
+            # connections can't be shared across threads, so this opens its
+            # own connection (see run_in_background's docstring) instead of
+            # reusing self.conn, which would raise "SQLite objects created
+            # in a thread can only be used in that same thread" every time.
+            conn = db_module.get_conn(self.app.db_path)
+            try:
+                return import_products.import_from_csv(conn, path)
+            finally:
+                conn.close()
 
         def done(summary: dict):
             self.refresh()
