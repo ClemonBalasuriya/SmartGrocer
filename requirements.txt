@@ -1,10 +1,17 @@
-pandas>=2.0
-numpy>=1.24
-scipy>=1.10
-matplotlib>=3.7
-statsmodels>=0.14
-customtkinter>=5.2
-pillow>=10.0
-opencv-contrib-python>=4.8   # fallback barcode/QR decoding for the phone-scanner companion (mobile_scan.py)
-pyzbar>=0.1.9                # PRIMARY barcode/QR decoder for the phone scanner - far more reliable than OpenCV's own detector; self-contained on Windows, nothing extra to install
-cryptography>=41.0           # self-signed HTTPS certificate so the phone-scanner's live camera works (mobile_scan.py)
+# Pinned to the exact versions this shop's own venv is already running
+# (checked directly against venv/Lib/site-packages) - a loose ">=" range
+# meant a fresh install on a new machine (a new till, a reinstall after a
+# crash) could silently pull a newer major version of pandas/numpy/etc.
+# than this app has ever actually been tested against. Pinning to what's
+# proven to work here removes that risk; bump a version deliberately (and
+# re-test) rather than letting pip pick one on its own.
+pandas==3.0.5
+numpy==2.5.3
+scipy==1.18.1
+matplotlib==3.11.1
+statsmodels==0.15.0
+customtkinter==6.0.0
+pillow==12.3.0
+opencv-contrib-python==5.0.0.93   # fallback barcode/QR decoding for the phone-scanner companion (mobile_scan.py)
+pyzbar==0.1.9                     # PRIMARY barcode/QR decoder for the phone scanner - far more reliable than OpenCV's own detector; self-contained on Windows, nothing extra to install
+cryptography==50.0.1              # self-signed HTTPS certificate so the phone-scanner's live camera works (mobile_scan.py)
