@@ -448,7 +448,11 @@ class SmartGrocerApp(ctk.CTk):
             row = self.conn.execute(
                 "SELECT * FROM staff WHERE name=? AND active=1", (staff_var.get(),)
             ).fetchone()
-            if row is None or row["pin"] != pin_var.get().strip():
+            # staff_module.verify_pin (not a direct pin-column compare) so a
+            # legacy plaintext PIN still logs in and gets transparently
+            # rehashed the moment it's confirmed correct - see staff.py's
+            # module docstring.
+            if row is None or not staff_module.verify_pin(self.conn, row["id"], pin_var.get().strip()):
                 messagebox.showerror("Login failed", "Incorrect PIN.")
                 return
             if not already_open:
@@ -622,7 +626,10 @@ class SmartGrocerApp(ctk.CTk):
         ctk.CTkEntry(body, textvariable=confirm_var, width=280, show="*").pack(padx=16)
 
         def save():
-            if current_var.get().strip() != row["pin"]:
+            # See open_login_dialog's matching comment above - verify_pin,
+            # not a direct pin-column compare, so a legacy plaintext PIN
+            # still works here too and gets migrated on this same check.
+            if not staff_module.verify_pin(self.conn, staff_id, current_var.get().strip()):
                 messagebox.showerror("Incorrect PIN", "Your current PIN doesn't match.")
                 return
             if new_var.get().strip() != confirm_var.get().strip():
