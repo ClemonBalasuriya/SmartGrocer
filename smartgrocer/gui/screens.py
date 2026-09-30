@@ -2856,6 +2856,17 @@ class POSScreen(BaseScreen):
 # Inventory
 # --------------------------------------------------------------------------- #
 
+class _AddProductCtx:
+    """Bag of widgets/state shared by InventoryScreen.open_add_product_dialog
+    and its _addproduct_* helper methods below - not a domain object, just
+    named-attribute storage so those helpers don't each have to share a
+    dozen+ separate bare local variables via closures. open_add_product_dialog
+    builds one of these (assigning straight into it as each widget/var is
+    created) instead of one 700+ line method holding all the dialog's
+    behavior as nested functions - the widgets are still built once, in
+    order, the same as before; only where the behavior *lives* has moved."""
+
+
 class InventoryScreen(BaseScreen):
     """Product catalog + stock levels. Everyone can view it; adding a new
     item, receiving stock, and editing an item's details all need Admin or
@@ -3230,15 +3241,23 @@ class InventoryScreen(BaseScreen):
         so you can stop partway through and click the right one instead
         of finishing the whole code. Picking a suggestion, or pressing
         Enter after the code (typed or scanned) is complete, both land on
-        the same result - see _use_product_code."""
+        the same result - see _addproduct_use_code.
+
+        This method's job is just to BUILD the dialog's widgets, in order,
+        into a shared `ctx` (_AddProductCtx) - the actual behavior (what
+        happens on a scan, a save, a reset, etc.) lives in the
+        `_addproduct_*` methods right after this one, each taking `ctx` so
+        they can all reach the same widgets/state without needing a
+        dozen+ separate parameters."""
         if not self._is_admin():
             messagebox.showwarning("Admin required", "Log in as Admin or Owner (sidebar) to add an item.")
             return
-        dialog = ctk.CTkToplevel(self)
-        dialog.title("Add / Scan Item")
-        fit_dialog(dialog, 440, 820)  # a bit taller - Payment now always shows, not just for a restock
-        dialog.configure(fg_color=theme.BG_LIGHT)
-        dialog.grab_set()
+        ctx = _AddProductCtx()
+        ctx.dialog = ctk.CTkToplevel(self)
+        ctx.dialog.title("Add / Scan Item")
+        fit_dialog(ctx.dialog, 440, 820)  # a bit taller - Payment now always shows, not just for a restock
+        ctx.dialog.configure(fg_color=theme.BG_LIGHT)
+        ctx.dialog.grab_set()
 
         # Holds the function _open_phone_capture_dialog hands back once the
         # phone is linked in continuous mode (see the "Scan with Phone"
@@ -3248,33 +3267,18 @@ class InventoryScreen(BaseScreen):
         # just that popup's own Done button) so that closing THIS whole
         # dialog while the phone is still linked can't leave a scan
         # arriving later trying to act on fields that no longer exist.
-        phone_scan_restore = {"fn": None}
+        ctx.phone_scan_restore = {"fn": None}
 
-        def close_dialog():
-            if phone_scan_restore["fn"] is not None:
-                phone_scan_restore["fn"]()
-            dialog.destroy()
+        ctx.dialog.protocol("WM_DELETE_WINDOW", lambda: self._addproduct_close_dialog(ctx))
 
-        dialog.protocol("WM_DELETE_WINDOW", close_dialog)
+        ctx.body = ctk.CTkScrollableFrame(ctx.dialog, fg_color="transparent")
+        ctx.body.pack(fill="both", expand=True)
 
-        body = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
-        body.pack(fill="both", expand=True)
-
-        session_count = {"n": 0}
-        session_label = ctk.CTkLabel(
-            body, text="", text_color=theme.SUCCESS_GREEN, font=ctk.CTkFont(size=12, weight="bold"),
+        ctx.session_count = {"n": 0}
+        ctx.session_label = ctk.CTkLabel(
+            ctx.body, text="", text_color=theme.SUCCESS_GREEN, font=ctk.CTkFont(size=12, weight="bold"),
         )
-        session_label.pack(anchor="w", padx=16, pady=(10, 0))
-
-        def _update_session_label():
-            if session_count["n"] == 0:
-                session_label.configure(text="")
-            elif session_count["n"] == 1:
-                session_label.configure(text="1 item added so far - keep scanning/typing to add more.")
-            else:
-                session_label.configure(
-                    text=f"{session_count['n']} items added so far - keep scanning/typing to add more."
-                )
+        ctx.session_label.pack(anchor="w", padx=16, pady=(10, 0))
 
         def field(parent, label, initial=""):
             ctk.CTkLabel(parent, text=label).pack(anchor="w", padx=16, pady=(10, 0))
@@ -3283,44 +3287,12 @@ class InventoryScreen(BaseScreen):
             entry.pack(fill="x", padx=16)
             return var, entry
 
-        ctk.CTkLabel(body, text="Barcode / Code:").pack(anchor="w", padx=16, pady=(12, 0))
-        code_row = ctk.CTkFrame(body, fg_color="transparent")
+        ctk.CTkLabel(ctx.body, text="Barcode / Code:").pack(anchor="w", padx=16, pady=(12, 0))
+        code_row = ctk.CTkFrame(ctx.body, fg_color="transparent")
         code_row.pack(fill="x", padx=16)
-        code_var = tk.StringVar()
-        code_entry = ctk.CTkEntry(code_row, textvariable=code_var)
-        code_entry.pack(side="left", fill="x", expand=True)
-
-        def _use_product_code(code: str) -> None:
-            """Common landing point for every way this dialog can learn a
-            product's code other than typing the whole thing by hand -
-            a phone scan, a live suggestion picked while typing/scanning,
-            or "Pick from list". Just sets the code and re-checks it, same
-            as pressing Enter after typing would - except guarded the same
-            way a scan already was: a code for a NEW (not-yet-in-the-
-            catalog) product shows a full details form the cashier is
-            meant to fill in and Save, and swapping code_var out from
-            under that mid-fill would hide new_frame and make the
-            in-progress item look like it just vanished - no error, no
-            chance to fix a mistake. An "existing product" match has
-            nothing typed to lose (just a quantity that resets on save
-            anyway) so those keep going straight through."""
-            if state["mode"] == "new":
-                status_label.configure(
-                    text="Still filling in the previous (new) item - click Save or Clear before "
-                         "using another code.",
-                    text_color=theme.DANGER_RED,
-                )
-                return
-            # This is an external, non-typing change to code_var (the user
-            # already finished choosing, they didn't just type this) -
-            # without suppressing it, setting it back to the real code
-            # would look exactly like a fresh keystroke to the suggestion
-            # box below and pop it open again a moment later, showing the
-            # same single match right after it was already picked. See
-            # SuggestionBox.suppress_next_change's own docstring.
-            code_suggestions.suppress_next_change()
-            code_var.set(code)
-            check_code()
+        ctx.code_var = tk.StringVar()
+        ctx.code_entry = ctk.CTkEntry(code_row, textvariable=ctx.code_var)
+        ctx.code_entry.pack(side="left", fill="x", expand=True)
 
         # Live suggestions as this box is typed/scanned into - matches by
         # CODE PREFIX only (not name; see search_products_by_code's own
@@ -3331,111 +3303,29 @@ class InventoryScreen(BaseScreen):
         # (SuggestionBox handles that) - either way, pressing Enter after
         # a full code (typed or scanned) is untouched by this and still
         # proceeds immediately via check_code below, exactly as before.
-        code_suggestions = SuggestionBox(
-            code_entry, code_var,
+        ctx.code_suggestions = SuggestionBox(
+            ctx.code_entry, ctx.code_var,
             fetch_fn=lambda q: [(f"{p['code']} — {p['name_en']}", p) for p in pos.search_products_by_code(self.conn, q)],
-            on_select=lambda product: _use_product_code(product["code"]),
+            on_select=lambda product: self._addproduct_use_code(ctx, product["code"]),
         )
 
-        def start_phone_scan():
-            def on_scanned(scanned):
-                _use_product_code(scanned)
-
-            # continuous=True: this keeps the phone linked and this
-            # dialog's own barcode field being filled in for every scan
-            # that follows, not just the first - that's what lets one
-            # phone-scanner session add a whole delivery's worth of items
-            # in a row (each one checked, filled in, and saved via the
-            # normal Save button, same as typing the code by hand would)
-            # instead of needing "Scan with Phone" tapped again per item.
-            #
-            # THIS dialog holds a modal grab (see dialog.grab_set() near
-            # the top of open_add_product_dialog), and Tk's grab is
-            # application-wide, not per-window - so with it still held,
-            # the little phone-link popup we're about to open would be
-            # completely unclickable behind it. Release it here so BOTH
-            # windows are usable while the phone is linked (click the
-            # popup to see the QR again, click back here to fill in a
-            # quantity/details and hit Save) - exactly what "one link,
-            # add every item" needs. on_closed grabs it back the moment
-            # the popup goes away (its own Done button, its X, or this
-            # dialog's own close_dialog calling phone_scan_restore["fn"]
-            # first) so this dialog goes back to blocking the rest of the
-            # app once the phone step is done, same as before.
-            dialog.grab_release()
-
-            def _regrab():
-                if dialog.winfo_exists():
-                    try:
-                        dialog.grab_set()
-                    except Exception:
-                        pass
-
-            phone_scan_restore["fn"] = self._open_phone_capture_dialog(
-                on_scanned, continuous=True,
-                title="Scan Items to Add",
-                instruction="Scan each item's barcode, one after another",
-                on_closed=_regrab,
-            )
-
         styled_button(
-            code_row, "Scan with Phone", start_phone_scan,
+            code_row, "Scan with Phone", lambda: self._addproduct_start_phone_scan(ctx),
             kind="secondary", width=130,
         ).pack(side="left", padx=(8, 0))
 
-        def pick_from_list():
-            """For restocking without a barcode in hand at all - e.g.
-            working off a supplier's paper invoice by product name rather
-            than scanning each item. Picking one here just fills in its
-            code and runs it through check_code(), landing on exactly the
-            same existing-product path as if that code had been scanned -
-            this is what the standalone "Receive Stock (GRN)" dialog used
-            to be the only way to do."""
-            if state["mode"] == "new":
-                status_label.configure(
-                    text="Still filling in the previous (new) item - click Save or Clear before "
-                         "picking another one.",
-                    text_color=theme.DANGER_RED,
-                )
-                return
-            catalog = self.conn.execute(
-                "SELECT id, code, name_en FROM products WHERE active=1 ORDER BY name_en"
-            ).fetchall()
-            if not catalog:
-                messagebox.showinfo("No products yet", "The catalog is empty - nothing to pick from yet.")
-                return
-            labels = [f"{p['code']} - {p['name_en']}" for p in catalog]
-
-            popup = ctk.CTkToplevel(dialog)
-            popup.title("Pick a Product")
-            fit_dialog(popup, 380, 220)
-            popup.configure(fg_color=theme.BG_LIGHT)
-            popup.grab_set()
-
-            ctk.CTkLabel(popup, text="Product:").pack(anchor="w", padx=16, pady=(16, 0))
-            pick_var = tk.StringVar(value=labels[0])
-            SearchableDropdown(popup, values=labels, variable=pick_var, width=340, label="Product").pack(padx=16)
-
-            def choose():
-                idx = labels.index(pick_var.get())
-                chosen_code = catalog[idx]["code"]
-                popup.destroy()
-                _use_product_code(chosen_code)
-
-            popup.bind("<Return>", lambda e: choose())
-            styled_button(popup, "Use This Product", choose, kind="primary", width=160).pack(pady=18)
-
         styled_button(
-            body, "Don't have the barcode? Pick from list", pick_from_list, kind="secondary",
+            ctx.body, "Don't have the barcode? Pick from list",
+            lambda: self._addproduct_pick_from_list(ctx), kind="secondary",
         ).pack(anchor="w", padx=16, pady=(4, 0))
 
-        status_label = ctk.CTkLabel(
-            body, text="Type, scan with a USB/Bluetooth scanner, tap \"Scan with Phone\", or pick "
-                       "from the list above - a suggestion list appears as you go, but nothing "
-                       "happens until you press Enter or click a suggestion.",
+        ctx.status_label = ctk.CTkLabel(
+            ctx.body, text="Type, scan with a USB/Bluetooth scanner, tap \"Scan with Phone\", or pick "
+                           "from the list above - a suggestion list appears as you go, but nothing "
+                           "happens until you press Enter or click a suggestion.",
             text_color=theme.TEXT_MUTED, font=ctk.CTkFont(size=11), wraplength=380, justify="left",
         )
-        status_label.pack(anchor="w", padx=16, pady=(6, 6))
+        ctx.status_label.pack(anchor="w", padx=16, pady=(6, 6))
 
         # Supplier - shared by both paths below, since either one creates a
         # stock batch (an opening batch for a brand-new product, a restock
@@ -3443,26 +3333,20 @@ class InventoryScreen(BaseScreen):
         # from - what the standalone "Receive Stock (GRN)" dialog used to
         # be a separate button for. Optional either way - "(none)" if
         # you'd rather skip it.
-        suppliers_list = suppliers_module.list_suppliers(self.conn)
-        supplier_names = ["(none)"] + [s["name"] for s in suppliers_list]
-        ctk.CTkLabel(body, text="Supplier (optional):").pack(anchor="w", padx=16, pady=(0, 0))
-        supplier_row = ctk.CTkFrame(body, fg_color="transparent")
+        ctx.suppliers_list = suppliers_module.list_suppliers(self.conn)
+        ctx.supplier_names = ["(none)"] + [s["name"] for s in ctx.suppliers_list]
+        ctk.CTkLabel(ctx.body, text="Supplier (optional):").pack(anchor="w", padx=16, pady=(0, 0))
+        supplier_row = ctk.CTkFrame(ctx.body, fg_color="transparent")
         supplier_row.pack(fill="x", padx=16, pady=(0, 6))
-        supplier_var = tk.StringVar(value=supplier_names[0])
+        ctx.supplier_var = tk.StringVar(value=ctx.supplier_names[0])
         supplier_dropdown = SearchableDropdown(
-            supplier_row, values=supplier_names, variable=supplier_var, width=290, label="Supplier")
+            supplier_row, values=ctx.supplier_names, variable=ctx.supplier_var, width=290, label="Supplier")
         supplier_dropdown.pack(side="left")
         styled_button(
             supplier_row, "+ New", lambda: self._add_supplier_on_the_fly(
-                dialog, suppliers_list, supplier_names, supplier_dropdown, supplier_var),
+                ctx.dialog, ctx.suppliers_list, ctx.supplier_names, supplier_dropdown, ctx.supplier_var),
             kind="secondary", width=80,
         ).pack(side="left", padx=(8, 0))
-
-        def _resolve_supplier_id() -> int | None:
-            if supplier_var.get() == "(none)":
-                return None
-            match = next((s for s in suppliers_list if s["name"] == supplier_var.get()), None)
-            return match["id"] if match else None
 
         # Payment - shared by both paths below, same as Supplier just
         # above, and for the same reason: a whole delivery/session of
@@ -3478,423 +3362,79 @@ class InventoryScreen(BaseScreen):
         # (GRN)" dialog's own Payment section used to cover, and now also
         # applies to a brand-new product's opening stock, which used to
         # have no way to record any of this at all.
-        ctk.CTkLabel(body, text="Payment:").pack(anchor="w", padx=16, pady=(6, 0))
-        payment_var = tk.StringVar(value="Cash")
-        cheque_fields = ctk.CTkFrame(body, fg_color="transparent")
-        cheque_number_var = tk.StringVar()
-        cheque_date_var = tk.StringVar()
-
-        def _on_payment_changed(*_a):
-            if payment_var.get() == "Cheque":
-                cheque_fields.pack(fill="x", padx=16, pady=(4, 6))
-            else:
-                cheque_fields.pack_forget()
-            # Same stale-scroll-canvas glitch check_code() guards against
-            # below (see _refresh_scroll_region) - showing/hiding the
-            # cheque fields changes body's content height too.
-            _refresh_scroll_region()
+        ctk.CTkLabel(ctx.body, text="Payment:").pack(anchor="w", padx=16, pady=(6, 0))
+        ctx.payment_var = tk.StringVar(value="Cash")
+        ctx.cheque_fields = ctk.CTkFrame(ctx.body, fg_color="transparent")
+        ctx.cheque_number_var = tk.StringVar()
+        ctx.cheque_date_var = tk.StringVar()
 
         ctk.CTkOptionMenu(
-            body, values=["Cash", "Cheque", "Not paid yet (credit)"],
-            variable=payment_var, command=_on_payment_changed,
+            ctx.body, values=["Cash", "Cheque", "Not paid yet (credit)"],
+            variable=ctx.payment_var, command=lambda *_a: self._addproduct_on_payment_changed(ctx),
         ).pack(fill="x", padx=16)
-        ctk.CTkLabel(cheque_fields, text="Cheque number:").pack(anchor="w", pady=(6, 0))
-        ctk.CTkEntry(cheque_fields, textvariable=cheque_number_var).pack(fill="x")
-        ctk.CTkLabel(cheque_fields, text="Cheque date (YYYY-MM-DD):").pack(anchor="w", pady=(6, 0))
-        ctk.CTkEntry(cheque_fields, textvariable=cheque_date_var).pack(fill="x")
+        ctk.CTkLabel(ctx.cheque_fields, text="Cheque number:").pack(anchor="w", pady=(6, 0))
+        ctk.CTkEntry(ctx.cheque_fields, textvariable=ctx.cheque_number_var).pack(fill="x")
+        ctk.CTkLabel(ctx.cheque_fields, text="Cheque date (YYYY-MM-DD):").pack(anchor="w", pady=(6, 0))
+        ctk.CTkEntry(ctx.cheque_fields, textvariable=ctx.cheque_date_var).pack(fill="x")
 
         # --- Existing-product path: just ask how much stock came in. ---
-        existing_frame = ctk.CTkFrame(body, fg_color="transparent")
-        existing_info = ctk.CTkLabel(existing_frame, text="", text_color=theme.NAVY_DARK,
-                                      font=ctk.CTkFont(size=13, weight="bold"), wraplength=380, justify="left")
-        existing_info.pack(anchor="w", padx=16, pady=(4, 8))
-        qty_received_var, _ = field(existing_frame, "Quantity received:", "10")
-        existing_cost_var, _ = field(existing_frame, "Cost price (per unit, blank = use last cost):")
-        existing_expiry_var, _ = field(existing_frame, "Expiry date (YYYY-MM-DD, blank if none):")
+        ctx.existing_frame = ctk.CTkFrame(ctx.body, fg_color="transparent")
+        ctx.existing_info = ctk.CTkLabel(ctx.existing_frame, text="", text_color=theme.NAVY_DARK,
+                                          font=ctk.CTkFont(size=13, weight="bold"), wraplength=380, justify="left")
+        ctx.existing_info.pack(anchor="w", padx=16, pady=(4, 8))
+        ctx.qty_received_var, _ = field(ctx.existing_frame, "Quantity received:", "10")
+        ctx.existing_cost_var, _ = field(ctx.existing_frame, "Cost price (per unit, blank = use last cost):")
+        ctx.existing_expiry_var, _ = field(ctx.existing_frame, "Expiry date (YYYY-MM-DD, blank if none):")
 
         # --- New-product path: the full catalog-entry form. ---
-        new_frame = ctk.CTkFrame(body, fg_color="transparent")
-        name_en_var, _ = field(new_frame, "Product name (English):")
-        name_si_var, _ = field(new_frame, "Product name (Sinhala, optional):")
-        category_var, _ = field(new_frame, "Category:")
-        unit_var, _ = field(new_frame, "Unit (e.g. pcs, kg, g, L):", "pcs")
-        cost_var, _ = field(new_frame, "Cost price (what you pay):")
-        cash_var, _ = field(new_frame, "Cash selling price:")
-        credit_var, _ = field(new_frame, "Credit selling price (blank = same as cash):")
-        wholesale_var, _ = field(new_frame, "Wholesale price (blank = same as cost):")
-        pack_size_var, _ = field(new_frame, "Pack size (units per pack):", "1")
-        reorder_var, _ = field(new_frame, "Reorder level (low-stock alert threshold):", "10")
-        initial_qty_var, _ = field(new_frame, "Opening stock quantity (optional):", "0")
-        expiry_var, _ = field(new_frame, "Expiry date (YYYY-MM-DD, optional):")
-        flags_row = ctk.CTkFrame(new_frame, fg_color="transparent")
+        ctx.new_frame = ctk.CTkFrame(ctx.body, fg_color="transparent")
+        ctx.name_en_var, _ = field(ctx.new_frame, "Product name (English):")
+        ctx.name_si_var, _ = field(ctx.new_frame, "Product name (Sinhala, optional):")
+        ctx.category_var, _ = field(ctx.new_frame, "Category:")
+        ctx.unit_var, _ = field(ctx.new_frame, "Unit (e.g. pcs, kg, g, L):", "pcs")
+        ctx.cost_var, _ = field(ctx.new_frame, "Cost price (what you pay):")
+        ctx.cash_var, _ = field(ctx.new_frame, "Cash selling price:")
+        ctx.credit_var, _ = field(ctx.new_frame, "Credit selling price (blank = same as cash):")
+        ctx.wholesale_var, _ = field(ctx.new_frame, "Wholesale price (blank = same as cost):")
+        ctx.pack_size_var, _ = field(ctx.new_frame, "Pack size (units per pack):", "1")
+        ctx.reorder_var, _ = field(ctx.new_frame, "Reorder level (low-stock alert threshold):", "10")
+        ctx.initial_qty_var, _ = field(ctx.new_frame, "Opening stock quantity (optional):", "0")
+        ctx.expiry_var, _ = field(ctx.new_frame, "Expiry date (YYYY-MM-DD, optional):")
+        flags_row = ctk.CTkFrame(ctx.new_frame, fg_color="transparent")
         flags_row.pack(fill="x", padx=16, pady=(14, 0))
-        perishable_var = tk.BooleanVar(value=False)
-        staple_var = tk.BooleanVar(value=False)
-        child_var = tk.BooleanVar(value=False)
-        ctk.CTkCheckBox(flags_row, text="Perishable", variable=perishable_var).pack(side="left")
-        ctk.CTkCheckBox(flags_row, text="Staple item", variable=staple_var).pack(side="left", padx=12)
-        ctk.CTkCheckBox(flags_row, text="Child-target item", variable=child_var).pack(side="left")
+        ctx.perishable_var = tk.BooleanVar(value=False)
+        ctx.staple_var = tk.BooleanVar(value=False)
+        ctx.child_var = tk.BooleanVar(value=False)
+        ctk.CTkCheckBox(flags_row, text="Perishable", variable=ctx.perishable_var).pack(side="left")
+        ctk.CTkCheckBox(flags_row, text="Staple item", variable=ctx.staple_var).pack(side="left", padx=12)
+        ctk.CTkCheckBox(flags_row, text="Child-target item", variable=ctx.child_var).pack(side="left")
 
-        button_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        button_row = ctk.CTkFrame(ctx.dialog, fg_color="transparent")
         button_row.pack(pady=16)
-        save_btn = styled_button(button_row, "Save", lambda: None, kind="primary", width=160)
-        save_btn.pack(side="left")
+        ctx.save_btn = styled_button(button_row, "Save", lambda: None, kind="primary", width=160)
+        ctx.save_btn.pack(side="left")
         styled_button(
-            button_row, "Clear", lambda: reset_form(
-                keep_supplier=False,
+            button_row, "Clear", lambda: self._addproduct_reset_form(
+                ctx, keep_supplier=False,
                 message="Cleared. Type, scan with a USB/Bluetooth scanner, tap \"Scan with Phone\", or "
                         "pick from the list above - a suggestion list appears as you go, but nothing "
                         "happens until you press Enter or click a suggestion.",
             ), kind="secondary", width=90,
         ).pack(side="left", padx=(8, 0))
-        styled_button(button_row, "Done", close_dialog, kind="secondary", width=100).pack(
+        styled_button(button_row, "Done", lambda: self._addproduct_close_dialog(ctx), kind="secondary", width=100).pack(
             side="left", padx=(8, 0))
 
-        state = {"mode": None, "product": None}
+        ctx.state = {"mode": None, "product": None}
 
-        def _new_product_ready() -> bool:
-            """Whether the new-product form currently has everything
-            pos.add_product actually requires - a name, a category, and a
-            cash price above zero. Backs the "Save New Product" button's
-            enabled state below, so a blank/incomplete form can't be
-            clicked at all - it used to be clickable the whole time, only
-            failing afterwards with an error message from pos.add_product
-            once Save was actually pressed."""
-            if not name_en_var.get().strip():
-                return False
-            if not category_var.get().strip():
-                return False
-            try:
-                return float(cash_var.get() or 0) > 0
-            except ValueError:
-                return False
-
-        def _update_save_button_state(*_a):
-            """Re-checked live as the required new-product fields are
-            typed into, so Save unlocks the moment the form is actually
-            complete rather than needing another action to notice."""
-            if state["mode"] == "new":
-                save_btn.configure(state="normal" if _new_product_ready() else "disabled")
-
-        for _required_var in (name_en_var, category_var, cash_var):
-            _required_var.trace_add("write", _update_save_button_state)
-
-        def reset_form(keep_supplier: bool = True, message: str | None = None):
-            """Blank every field back to its default, ready for the next
-            item, without closing the dialog. keep_supplier=True (used
-            right after a successful save) leaves the Supplier dropdown -
-            and now Payment (method, cheque number/date) too - exactly as
-            they were: bulk-adding is usually one delivery, one supplier,
-            paid one way, whether that next item is a restock of
-            something already in the catalog or a brand-new product, so
-            the user shouldn't have to re-pick "Cash" (or re-enter the
-            same cheque details) for every single line of the same
-            delivery. The explicit Clear button passes keep_supplier=False
-            for a genuine start-over instead, which does reset both.
-            `message`, when given, replaces the status line (used by
-            Clear); left out, the status line is untouched (used right
-            after a save, so the green "added!" confirmation isn't
-            immediately overwritten by this same reset)."""
-            if not keep_supplier:
-                supplier_var.set(supplier_names[0])
-                payment_var.set("Cash")
-                cheque_number_var.set("")
-                cheque_date_var.set("")
-                cheque_fields.pack_forget()
-            code_var.set("")
-            qty_received_var.set("10")
-            existing_cost_var.set("")
-            existing_expiry_var.set("")
-            name_en_var.set("")
-            name_si_var.set("")
-            category_var.set("")
-            unit_var.set("pcs")
-            cost_var.set("")
-            cash_var.set("")
-            credit_var.set("")
-            wholesale_var.set("")
-            pack_size_var.set("1")
-            reorder_var.set("10")
-            initial_qty_var.set("0")
-            expiry_var.set("")
-            perishable_var.set(False)
-            staple_var.set(False)
-            child_var.set(False)
-            if message is not None:
-                status_label.configure(text=message, text_color=theme.TEXT_MUTED)
-            check_code(keep_status=True)
-            code_entry.focus_set()
-
-        def save_existing():
-            code = code_var.get().strip()
-            product = pos.get_product_by_code(self.conn, code)
-            if product is None:
-                status_label.configure(
-                    text="That barcode no longer matches a product - re-check it.",
-                    text_color=theme.DANGER_RED,
-                )
-                check_code()
-                return
-            payment_choice = payment_var.get()
-            method = {"Cash": "cash", "Cheque": "cheque", "Not paid yet (credit)": "credit"}[payment_choice]
-            supplier_id = _resolve_supplier_id()
-            if method != "cash" and supplier_id is None:
-                status_label.configure(
-                    text="A cheque or credit purchase needs a supplier selected above - who is it owed to?",
-                    text_color=theme.DANGER_RED,
-                )
-                return
-            try:
-                pos.receive_stock(
-                    self.conn, product_id=product["id"],
-                    qty=float(qty_received_var.get() or 0),
-                    cost_price=float(existing_cost_var.get()) if existing_cost_var.get().strip() else None,
-                    expiry_date=existing_expiry_var.get().strip() or None,
-                    supplier_id=supplier_id, payment_method=method,
-                    cheque_number=cheque_number_var.get(), cheque_date=cheque_date_var.get().strip() or None,
-                )
-            except ValueError as e:
-                # A plain in-dialog message rather than messagebox.showerror
-                # here - on this specific dialog, a popped-up messagebox was
-                # reported to leave the "Add / Scan Item" window looking
-                # like it had closed/gone back to the main page once the
-                # messagebox was dismissed (very likely a Windows focus/
-                # z-order quirk between a native modal dialog and this
-                # CTkToplevel, not an actual close - but confusing either
-                # way). Everything already typed stays exactly as it was;
-                # only the status line changes color/text to show the error.
-                status_label.configure(text=str(e), text_color=theme.DANGER_RED)
-                return
-            except Exception as e:  # noqa: BLE001 - anything unexpected still leaves everything you typed in place
-                status_label.configure(
-                    text=f"Something went wrong and this wasn't saved: {e} - nothing you entered "
-                         "was lost, fix the problem (or click Clear to start over) and try again.",
-                    text_color=theme.DANGER_RED,
-                )
-                return
-            self.refresh()
-            session_count["n"] += 1
-            _update_session_label()
-            status_label.configure(
-                text=f"Added {qty_received_var.get()} {product['unit']} to '{product['name_en']}'. "
-                     f"Ready for the next item - scan/type its code, or click Done to finish.",
-                text_color=theme.SUCCESS_GREEN,
-            )
-            reset_form()
-
-        def save_new():
-            new_name = name_en_var.get().strip()
-            payment_choice = payment_var.get()
-            method = {"Cash": "cash", "Cheque": "cheque", "Not paid yet (credit)": "credit"}[payment_choice]
-            supplier_id = _resolve_supplier_id()
-            initial_qty = float(initial_qty_var.get() or 0)
-            if method != "cash" and initial_qty > 0 and supplier_id is None:
-                status_label.configure(
-                    text="A cheque or credit purchase needs a supplier selected above - who is it owed to?",
-                    text_color=theme.DANGER_RED,
-                )
-                return
-            try:
-                pos.add_product(
-                    self.conn,
-                    code=code_var.get(),
-                    name_en=name_en_var.get(),
-                    name_si=name_si_var.get(),
-                    category=category_var.get(),
-                    unit=unit_var.get() or "pcs",
-                    cost_price=float(cost_var.get() or 0),
-                    cash_price=float(cash_var.get() or 0),
-                    credit_price=float(credit_var.get()) if credit_var.get().strip() else None,
-                    wholesale_price=float(wholesale_var.get()) if wholesale_var.get().strip() else None,
-                    pack_size=int(pack_size_var.get() or 1),
-                    reorder_level=int(reorder_var.get() or 0),
-                    is_perishable=perishable_var.get(),
-                    is_staple=staple_var.get(),
-                    child_target=child_var.get(),
-                    initial_qty=initial_qty,
-                    expiry_date=expiry_var.get().strip() or None,
-                    supplier_id=supplier_id, payment_method=method,
-                    cheque_number=cheque_number_var.get(), cheque_date=cheque_date_var.get().strip() or None,
-                )
-            except ValueError as e:
-                # See the matching comment in save_existing() above - a
-                # native messagebox popup on THIS dialog was reported to
-                # leave the window looking like it had closed/gone back to
-                # the main page after being dismissed, so this stays an
-                # in-dialog message instead; nothing typed is lost either way.
-                status_label.configure(text=str(e), text_color=theme.DANGER_RED)
-                return
-            except Exception as e:  # noqa: BLE001 - anything unexpected still leaves everything you typed in place
-                status_label.configure(
-                    text=f"Something went wrong and this wasn't saved: {e} - nothing you entered "
-                         "was lost, fix the problem (or click Clear to start over) and try again.",
-                    text_color=theme.DANGER_RED,
-                )
-                return
-            self.refresh()
-            session_count["n"] += 1
-            _update_session_label()
-            status_label.configure(
-                text=f"'{new_name}' was added to the catalog. "
-                     f"Ready for the next item - scan/type its code, or click Done to finish.",
-                text_color=theme.SUCCESS_GREEN,
-            )
-            reset_form()
-
-        def _refresh_scroll_region():
-            """body (the whole form above the buttons) is a
-            CTkScrollableFrame, and on Windows in particular its inner
-            canvas can fail to notice that the content changed height the
-            instant a child frame (existing_frame/new_frame/cheque_fields)
-            gets pack_forget()'d or pack()'d back mid-dialog - the widgets
-            are all really there and correctly configured (the Save
-            button's own text/state proves the code above ran fine), but
-            the canvas's scroll region goes stale and the visible area can
-            render as a totally blank page until something else forces a
-            redraw (resizing the window, scrolling, etc). That's the
-            reported "Add / Scan Item goes blank" - a rendering glitch in
-            the scroll container, not a crash and not lost data. Forcing
-            an idle-task flush plus a fresh scrollregion recompute after
-            every visibility change fixes that. Best-effort and silent:
-            _parent_canvas is a private CustomTkinter attribute that has
-            been stable across the 5.x line but isn't guaranteed forever,
-            so if a future version renames it this just quietly does
-            nothing rather than breaking the dialog over a cosmetic fix."""
-            try:
-                dialog.update_idletasks()
-                canvas = body._parent_canvas
-                canvas.configure(scrollregion=canvas.bbox("all"))
-            except Exception:  # noqa: BLE001
-                pass
-
-        def check_code(event=None, keep_status=False):
-            """keep_status=True is used right after a successful save (via
-            reset_form): the code field is now blank again, but we don't want
-            to stomp on the green "added!" confirmation status_label just
-            showed - it should stay up until the user starts on the next
-            item."""
-            try:
-                # The live suggestion list (code_suggestions) never closes
-                # itself on <Return> by design - only on a click/Escape/
-                # focus-out, or picking one - so a code committed by
-                # pressing Enter (typed or scanned) would otherwise leave
-                # that popup sitting there looking like it's still
-                # offering choices after this already acted on one.
-                # Always close it the moment this dialog is about to act
-                # on whatever's in the box.
-                code_suggestions.close()
-                code = code_var.get().strip()
-                if not code:
-                    existing_frame.pack_forget()
-                    new_frame.pack_forget()
-                    save_btn.configure(state="disabled")
-                    if not keep_status:
-                        status_label.configure(
-                            text="Type, scan with a USB/Bluetooth scanner, tap \"Scan with Phone\", "
-                                 "or pick from the list above - a suggestion list appears as you go, "
-                                 "but nothing happens until you press Enter or click a suggestion.",
-                            text_color=theme.TEXT_MUTED,
-                        )
-                    state["mode"] = None
-                    state["product"] = None
-                    return
-                # Everything below this point does real work (a DB lookup,
-                # then hiding one frame and showing another) with no
-                # safety net of its own - unlike every button click in
-                # this dialog (Save, Add Stock, etc), which is wrapped in
-                # its own try/except and reports a problem via
-                # status_label. Before this try/except existed, an
-                # unexpected error partway through (e.g. right after
-                # new_frame.pack_forget() but before existing_frame.pack()
-                # ran) left BOTH frames hidden - the whole dialog looking
-                # like it had simply gone blank, with no error shown
-                # anywhere to explain why. Wrapping the whole thing means
-                # that instead always ends in a real error message, never
-                # silent blankness.
-                try:
-                    product = pos.get_product_by_code(self.conn, code)
-                except Exception as e:  # noqa: BLE001
-                    existing_frame.pack_forget()
-                    new_frame.pack_forget()
-                    save_btn.configure(state="disabled")
-                    status_label.configure(
-                        text=f"Couldn't look up that code: {e} - try again, or click Clear to start over.",
-                        text_color=theme.DANGER_RED,
-                    )
-                    state["mode"] = None
-                    state["product"] = None
-                    return
-                try:
-                    _apply_code_lookup_result(code, product)
-                except Exception as e:  # noqa: BLE001
-                    existing_frame.pack_forget()
-                    new_frame.pack_forget()
-                    save_btn.configure(state="disabled")
-                    status_label.configure(
-                        text=f"Something went wrong showing that item: {e} - try again, or click Clear "
-                             "to start over. Nothing was saved.",
-                        text_color=theme.DANGER_RED,
-                    )
-                    state["mode"] = None
-                    state["product"] = None
-            finally:
-                # Runs on every path through the above (blank code, a
-                # found product, a new one, or either error branch) so a
-                # stale-canvas blank page can never survive to be the last
-                # thing check_code leaves on screen.
-                _refresh_scroll_region()
-
-        def _apply_code_lookup_result(code: str, product) -> None:
-            if product is not None:
-                save_btn.configure(state="normal")
-                state["mode"] = "existing"
-                new_frame.pack_forget()
-                # A NEW product deserves fresh per-item fields, not
-                # whatever was typed for the LAST existing product checked
-                # here - otherwise a quantity/cost/expiry typed for one
-                # item could silently carry over and get applied to a
-                # completely different one if the phone scans the next
-                # item before this one's Save is clicked (continuous
-                # scanning means that next scan can arrive at any moment,
-                # not just after the cashier is done with this one).
-                # Guarded on the product actually changing so check_code
-                # re-firing for the SAME still-unsaved code (e.g. a
-                # redundant FocusOut) doesn't wipe out mid-typed values.
-                # Payment is deliberately NOT reset here (see reset_form) -
-                # it's a whole-delivery choice, not a per-item one, so
-                # switching to a different not-yet-saved item mid-session
-                # should keep whatever was already picked.
-                if state["product"] != product["id"]:
-                    qty_received_var.set("10")
-                    existing_cost_var.set("")
-                    existing_expiry_var.set("")
-                state["product"] = product["id"]
-                on_hand = pos.get_stock_on_hand(self.conn, product["id"])
-                existing_info.configure(
-                    text=f"Already in the catalog: {product['name_en']} ({product['category']}) - "
-                         f"{on_hand:.0f} {product['unit']} in stock now. Just enter how many more came in."
-                )
-                existing_frame.pack(fill="x")
-                status_label.configure(text=f"Found an existing product for code '{code}'.", text_color=theme.TEXT_MUTED)
-                save_btn.configure(text="Add Stock", command=save_existing)
-            else:
-                state["mode"] = "new"
-                state["product"] = None
-                existing_frame.pack_forget()
-                new_frame.pack(fill="x")
-                status_label.configure(text=f"Code '{code}' isn't in the catalog yet - fill in the new "
-                                             f"product's details below. Save New Product unlocks once "
-                                             f"the name, category, and cash price are filled in.",
-                                        text_color=theme.TEXT_MUTED)
-                save_btn.configure(text="Save New Product", command=save_new)
-                _update_save_button_state()
+        for _required_var in (ctx.name_en_var, ctx.category_var, ctx.cash_var):
+            _required_var.trace_add("write", lambda *_a: self._addproduct_update_save_button_state(ctx))
 
         # Deliberately ONLY <Return> - typing/scanning into this box (with
         # the live suggestion dropdown previewing matches as it goes) never
         # proceeds to the existing/new-product view on its own; nothing
         # happens until you explicitly commit, either by pressing Enter
         # after a typed/scanned code or by clicking a suggestion (that
-        # calls check_code itself, via _use_product_code, since picking
+        # calls check_code itself, via _addproduct_use_code, since picking
         # one off the list is just as deliberate a choice as pressing
         # Enter). This used to also run on <FocusOut> (clicking/tabbing
         # away from the box), which meant just glancing at another field
@@ -3902,10 +3442,491 @@ class InventoryScreen(BaseScreen):
         # - could flip the whole dialog over to "new product" for a
         # still-incomplete code. Removed for exactly that reason - nothing
         # here reacts until you say it's ready.
-        code_entry.bind("<Return>", check_code)
-        save_btn.configure(state="disabled")
-        dialog.after(150, code_entry.focus_set)
-        dialog.after(150, _refresh_scroll_region)
+        ctx.code_entry.bind("<Return>", lambda event: self._addproduct_check_code(ctx))
+        ctx.save_btn.configure(state="disabled")
+        ctx.dialog.after(150, ctx.code_entry.focus_set)
+        ctx.dialog.after(150, lambda: self._addproduct_refresh_scroll_region(ctx))
+
+    def _addproduct_close_dialog(self, ctx) -> None:
+        if ctx.phone_scan_restore["fn"] is not None:
+            ctx.phone_scan_restore["fn"]()
+        ctx.dialog.destroy()
+
+    def _addproduct_update_session_label(self, ctx) -> None:
+        if ctx.session_count["n"] == 0:
+            ctx.session_label.configure(text="")
+        elif ctx.session_count["n"] == 1:
+            ctx.session_label.configure(text="1 item added so far - keep scanning/typing to add more.")
+        else:
+            ctx.session_label.configure(
+                text=f"{ctx.session_count['n']} items added so far - keep scanning/typing to add more."
+            )
+
+    def _addproduct_use_code(self, ctx, code: str) -> None:
+        """Common landing point for every way this dialog can learn a
+        product's code other than typing the whole thing by hand -
+        a phone scan, a live suggestion picked while typing/scanning,
+        or "Pick from list". Just sets the code and re-checks it, same
+        as pressing Enter after typing would - except guarded the same
+        way a scan already was: a code for a NEW (not-yet-in-the-
+        catalog) product shows a full details form the cashier is
+        meant to fill in and Save, and swapping code_var out from
+        under that mid-fill would hide new_frame and make the
+        in-progress item look like it just vanished - no error, no
+        chance to fix a mistake. An "existing product" match has
+        nothing typed to lose (just a quantity that resets on save
+        anyway) so those keep going straight through."""
+        if ctx.state["mode"] == "new":
+            ctx.status_label.configure(
+                text="Still filling in the previous (new) item - click Save or Clear before "
+                     "using another code.",
+                text_color=theme.DANGER_RED,
+            )
+            return
+        # This is an external, non-typing change to code_var (the user
+        # already finished choosing, they didn't just type this) -
+        # without suppressing it, setting it back to the real code
+        # would look exactly like a fresh keystroke to the suggestion
+        # box below and pop it open again a moment later, showing the
+        # same single match right after it was already picked. See
+        # SuggestionBox.suppress_next_change's own docstring.
+        ctx.code_suggestions.suppress_next_change()
+        ctx.code_var.set(code)
+        self._addproduct_check_code(ctx)
+
+    def _addproduct_start_phone_scan(self, ctx) -> None:
+        def on_scanned(scanned):
+            self._addproduct_use_code(ctx, scanned)
+
+        # continuous=True: this keeps the phone linked and this
+        # dialog's own barcode field being filled in for every scan
+        # that follows, not just the first - that's what lets one
+        # phone-scanner session add a whole delivery's worth of items
+        # in a row (each one checked, filled in, and saved via the
+        # normal Save button, same as typing the code by hand would)
+        # instead of needing "Scan with Phone" tapped again per item.
+        #
+        # THIS dialog holds a modal grab (see ctx.dialog.grab_set() in
+        # open_add_product_dialog), and Tk's grab is application-wide,
+        # not per-window - so with it still held, the little phone-link
+        # popup we're about to open would be completely unclickable
+        # behind it. Release it here so BOTH windows are usable while
+        # the phone is linked (click the popup to see the QR again,
+        # click back here to fill in a quantity/details and hit Save) -
+        # exactly what "one link, add every item" needs. on_closed grabs
+        # it back the moment the popup goes away (its own Done button,
+        # its X, or this dialog's own _addproduct_close_dialog calling
+        # phone_scan_restore["fn"] first) so this dialog goes back to
+        # blocking the rest of the app once the phone step is done, same
+        # as before.
+        ctx.dialog.grab_release()
+
+        def _regrab():
+            if ctx.dialog.winfo_exists():
+                try:
+                    ctx.dialog.grab_set()
+                except Exception:
+                    pass
+
+        ctx.phone_scan_restore["fn"] = self._open_phone_capture_dialog(
+            on_scanned, continuous=True,
+            title="Scan Items to Add",
+            instruction="Scan each item's barcode, one after another",
+            on_closed=_regrab,
+        )
+
+    def _addproduct_pick_from_list(self, ctx) -> None:
+        """For restocking without a barcode in hand at all - e.g.
+        working off a supplier's paper invoice by product name rather
+        than scanning each item. Picking one here just fills in its
+        code and runs it through check_code(), landing on exactly the
+        same existing-product path as if that code had been scanned -
+        this is what the standalone "Receive Stock (GRN)" dialog used
+        to be the only way to do."""
+        if ctx.state["mode"] == "new":
+            ctx.status_label.configure(
+                text="Still filling in the previous (new) item - click Save or Clear before "
+                     "picking another one.",
+                text_color=theme.DANGER_RED,
+            )
+            return
+        catalog = self.conn.execute(
+            "SELECT id, code, name_en FROM products WHERE active=1 ORDER BY name_en"
+        ).fetchall()
+        if not catalog:
+            messagebox.showinfo("No products yet", "The catalog is empty - nothing to pick from yet.")
+            return
+        labels = [f"{p['code']} - {p['name_en']}" for p in catalog]
+
+        popup = ctk.CTkToplevel(ctx.dialog)
+        popup.title("Pick a Product")
+        fit_dialog(popup, 380, 220)
+        popup.configure(fg_color=theme.BG_LIGHT)
+        popup.grab_set()
+
+        ctk.CTkLabel(popup, text="Product:").pack(anchor="w", padx=16, pady=(16, 0))
+        pick_var = tk.StringVar(value=labels[0])
+        SearchableDropdown(popup, values=labels, variable=pick_var, width=340, label="Product").pack(padx=16)
+
+        def choose():
+            idx = labels.index(pick_var.get())
+            chosen_code = catalog[idx]["code"]
+            popup.destroy()
+            self._addproduct_use_code(ctx, chosen_code)
+
+        popup.bind("<Return>", lambda e: choose())
+        styled_button(popup, "Use This Product", choose, kind="primary", width=160).pack(pady=18)
+
+    def _addproduct_resolve_supplier_id(self, ctx) -> int | None:
+        if ctx.supplier_var.get() == "(none)":
+            return None
+        match = next((s for s in ctx.suppliers_list if s["name"] == ctx.supplier_var.get()), None)
+        return match["id"] if match else None
+
+    def _addproduct_on_payment_changed(self, ctx) -> None:
+        if ctx.payment_var.get() == "Cheque":
+            ctx.cheque_fields.pack(fill="x", padx=16, pady=(4, 6))
+        else:
+            ctx.cheque_fields.pack_forget()
+        # Same stale-scroll-canvas glitch check_code() guards against
+        # below (see _addproduct_refresh_scroll_region) - showing/hiding
+        # the cheque fields changes ctx.body's content height too.
+        self._addproduct_refresh_scroll_region(ctx)
+
+    def _addproduct_new_ready(self, ctx) -> bool:
+        """Whether the new-product form currently has everything
+        pos.add_product actually requires - a name, a category, and a
+        cash price above zero. Backs the "Save New Product" button's
+        enabled state below, so a blank/incomplete form can't be
+        clicked at all - it used to be clickable the whole time, only
+        failing afterwards with an error message from pos.add_product
+        once Save was actually pressed."""
+        if not ctx.name_en_var.get().strip():
+            return False
+        if not ctx.category_var.get().strip():
+            return False
+        try:
+            return float(ctx.cash_var.get() or 0) > 0
+        except ValueError:
+            return False
+
+    def _addproduct_update_save_button_state(self, ctx) -> None:
+        """Re-checked live as the required new-product fields are
+        typed into, so Save unlocks the moment the form is actually
+        complete rather than needing another action to notice."""
+        if ctx.state["mode"] == "new":
+            ctx.save_btn.configure(state="normal" if self._addproduct_new_ready(ctx) else "disabled")
+
+    def _addproduct_reset_form(self, ctx, keep_supplier: bool = True, message: str | None = None) -> None:
+        """Blank every field back to its default, ready for the next
+        item, without closing the dialog. keep_supplier=True (used
+        right after a successful save) leaves the Supplier dropdown -
+        and now Payment (method, cheque number/date) too - exactly as
+        they were: bulk-adding is usually one delivery, one supplier,
+        paid one way, whether that next item is a restock of
+        something already in the catalog or a brand-new product, so
+        the user shouldn't have to re-pick "Cash" (or re-enter the
+        same cheque details) for every single line of the same
+        delivery. The explicit Clear button passes keep_supplier=False
+        for a genuine start-over instead, which does reset both.
+        `message`, when given, replaces the status line (used by
+        Clear); left out, the status line is untouched (used right
+        after a save, so the green "added!" confirmation isn't
+        immediately overwritten by this same reset)."""
+        if not keep_supplier:
+            ctx.supplier_var.set(ctx.supplier_names[0])
+            ctx.payment_var.set("Cash")
+            ctx.cheque_number_var.set("")
+            ctx.cheque_date_var.set("")
+            ctx.cheque_fields.pack_forget()
+        ctx.code_var.set("")
+        ctx.qty_received_var.set("10")
+        ctx.existing_cost_var.set("")
+        ctx.existing_expiry_var.set("")
+        ctx.name_en_var.set("")
+        ctx.name_si_var.set("")
+        ctx.category_var.set("")
+        ctx.unit_var.set("pcs")
+        ctx.cost_var.set("")
+        ctx.cash_var.set("")
+        ctx.credit_var.set("")
+        ctx.wholesale_var.set("")
+        ctx.pack_size_var.set("1")
+        ctx.reorder_var.set("10")
+        ctx.initial_qty_var.set("0")
+        ctx.expiry_var.set("")
+        ctx.perishable_var.set(False)
+        ctx.staple_var.set(False)
+        ctx.child_var.set(False)
+        if message is not None:
+            ctx.status_label.configure(text=message, text_color=theme.TEXT_MUTED)
+        self._addproduct_check_code(ctx, keep_status=True)
+        ctx.code_entry.focus_set()
+
+    def _addproduct_save_existing(self, ctx) -> None:
+        code = ctx.code_var.get().strip()
+        product = pos.get_product_by_code(self.conn, code)
+        if product is None:
+            ctx.status_label.configure(
+                text="That barcode no longer matches a product - re-check it.",
+                text_color=theme.DANGER_RED,
+            )
+            self._addproduct_check_code(ctx)
+            return
+        payment_choice = ctx.payment_var.get()
+        method = {"Cash": "cash", "Cheque": "cheque", "Not paid yet (credit)": "credit"}[payment_choice]
+        supplier_id = self._addproduct_resolve_supplier_id(ctx)
+        if method != "cash" and supplier_id is None:
+            ctx.status_label.configure(
+                text="A cheque or credit purchase needs a supplier selected above - who is it owed to?",
+                text_color=theme.DANGER_RED,
+            )
+            return
+        try:
+            pos.receive_stock(
+                self.conn, product_id=product["id"],
+                qty=float(ctx.qty_received_var.get() or 0),
+                cost_price=float(ctx.existing_cost_var.get()) if ctx.existing_cost_var.get().strip() else None,
+                expiry_date=ctx.existing_expiry_var.get().strip() or None,
+                supplier_id=supplier_id, payment_method=method,
+                cheque_number=ctx.cheque_number_var.get(), cheque_date=ctx.cheque_date_var.get().strip() or None,
+            )
+        except ValueError as e:
+            # A plain in-dialog message rather than messagebox.showerror
+            # here - on this specific dialog, a popped-up messagebox was
+            # reported to leave the "Add / Scan Item" window looking
+            # like it had closed/gone back to the main page once the
+            # messagebox was dismissed (very likely a Windows focus/
+            # z-order quirk between a native modal dialog and this
+            # CTkToplevel, not an actual close - but confusing either
+            # way). Everything already typed stays exactly as it was;
+            # only the status line changes color/text to show the error.
+            ctx.status_label.configure(text=str(e), text_color=theme.DANGER_RED)
+            return
+        except Exception as e:  # noqa: BLE001 - anything unexpected still leaves everything you typed in place
+            ctx.status_label.configure(
+                text=f"Something went wrong and this wasn't saved: {e} - nothing you entered "
+                     "was lost, fix the problem (or click Clear to start over) and try again.",
+                text_color=theme.DANGER_RED,
+            )
+            return
+        self.refresh()
+        ctx.session_count["n"] += 1
+        self._addproduct_update_session_label(ctx)
+        ctx.status_label.configure(
+            text=f"Added {ctx.qty_received_var.get()} {product['unit']} to '{product['name_en']}'. "
+                 f"Ready for the next item - scan/type its code, or click Done to finish.",
+            text_color=theme.SUCCESS_GREEN,
+        )
+        self._addproduct_reset_form(ctx)
+
+    def _addproduct_save_new(self, ctx) -> None:
+        new_name = ctx.name_en_var.get().strip()
+        payment_choice = ctx.payment_var.get()
+        method = {"Cash": "cash", "Cheque": "cheque", "Not paid yet (credit)": "credit"}[payment_choice]
+        supplier_id = self._addproduct_resolve_supplier_id(ctx)
+        initial_qty = float(ctx.initial_qty_var.get() or 0)
+        if method != "cash" and initial_qty > 0 and supplier_id is None:
+            ctx.status_label.configure(
+                text="A cheque or credit purchase needs a supplier selected above - who is it owed to?",
+                text_color=theme.DANGER_RED,
+            )
+            return
+        try:
+            pos.add_product(
+                self.conn,
+                code=ctx.code_var.get(),
+                name_en=ctx.name_en_var.get(),
+                name_si=ctx.name_si_var.get(),
+                category=ctx.category_var.get(),
+                unit=ctx.unit_var.get() or "pcs",
+                cost_price=float(ctx.cost_var.get() or 0),
+                cash_price=float(ctx.cash_var.get() or 0),
+                credit_price=float(ctx.credit_var.get()) if ctx.credit_var.get().strip() else None,
+                wholesale_price=float(ctx.wholesale_var.get()) if ctx.wholesale_var.get().strip() else None,
+                pack_size=int(ctx.pack_size_var.get() or 1),
+                reorder_level=int(ctx.reorder_var.get() or 0),
+                is_perishable=ctx.perishable_var.get(),
+                is_staple=ctx.staple_var.get(),
+                child_target=ctx.child_var.get(),
+                initial_qty=initial_qty,
+                expiry_date=ctx.expiry_var.get().strip() or None,
+                supplier_id=supplier_id, payment_method=method,
+                cheque_number=ctx.cheque_number_var.get(), cheque_date=ctx.cheque_date_var.get().strip() or None,
+            )
+        except ValueError as e:
+            # See the matching comment in _addproduct_save_existing() above -
+            # a native messagebox popup on THIS dialog was reported to
+            # leave the window looking like it had closed/gone back to
+            # the main page after being dismissed, so this stays an
+            # in-dialog message instead; nothing typed is lost either way.
+            ctx.status_label.configure(text=str(e), text_color=theme.DANGER_RED)
+            return
+        except Exception as e:  # noqa: BLE001 - anything unexpected still leaves everything you typed in place
+            ctx.status_label.configure(
+                text=f"Something went wrong and this wasn't saved: {e} - nothing you entered "
+                     "was lost, fix the problem (or click Clear to start over) and try again.",
+                text_color=theme.DANGER_RED,
+            )
+            return
+        self.refresh()
+        ctx.session_count["n"] += 1
+        self._addproduct_update_session_label(ctx)
+        ctx.status_label.configure(
+            text=f"'{new_name}' was added to the catalog. "
+                 f"Ready for the next item - scan/type its code, or click Done to finish.",
+            text_color=theme.SUCCESS_GREEN,
+        )
+        self._addproduct_reset_form(ctx)
+
+    def _addproduct_refresh_scroll_region(self, ctx) -> None:
+        """ctx.body (the whole form above the buttons) is a
+        CTkScrollableFrame, and on Windows in particular its inner
+        canvas can fail to notice that the content changed height the
+        instant a child frame (existing_frame/new_frame/cheque_fields)
+        gets pack_forget()'d or pack()'d back mid-dialog - the widgets
+        are all really there and correctly configured (the Save
+        button's own text/state proves the code above ran fine), but
+        the canvas's scroll region goes stale and the visible area can
+        render as a totally blank page until something else forces a
+        redraw (resizing the window, scrolling, etc). That's the
+        reported "Add / Scan Item goes blank" - a rendering glitch in
+        the scroll container, not a crash and not lost data. Forcing
+        an idle-task flush plus a fresh scrollregion recompute after
+        every visibility change fixes that. Best-effort and silent:
+        _parent_canvas is a private CustomTkinter attribute that has
+        been stable across the 5.x line but isn't guaranteed forever,
+        so if a future version renames it this just quietly does
+        nothing rather than breaking the dialog over a cosmetic fix."""
+        try:
+            ctx.dialog.update_idletasks()
+            canvas = ctx.body._parent_canvas
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _addproduct_check_code(self, ctx, keep_status: bool = False) -> None:
+        """keep_status=True is used right after a successful save (via
+        _addproduct_reset_form): the code field is now blank again, but we
+        don't want to stomp on the green "added!" confirmation
+        ctx.status_label just showed - it should stay up until the user
+        starts on the next item."""
+        try:
+            # The live suggestion list (code_suggestions) never closes
+            # itself on <Return> by design - only on a click/Escape/
+            # focus-out, or picking one - so a code committed by
+            # pressing Enter (typed or scanned) would otherwise leave
+            # that popup sitting there looking like it's still
+            # offering choices after this already acted on one.
+            # Always close it the moment this dialog is about to act
+            # on whatever's in the box.
+            ctx.code_suggestions.close()
+            code = ctx.code_var.get().strip()
+            if not code:
+                ctx.existing_frame.pack_forget()
+                ctx.new_frame.pack_forget()
+                ctx.save_btn.configure(state="disabled")
+                if not keep_status:
+                    ctx.status_label.configure(
+                        text="Type, scan with a USB/Bluetooth scanner, tap \"Scan with Phone\", "
+                             "or pick from the list above - a suggestion list appears as you go, "
+                             "but nothing happens until you press Enter or click a suggestion.",
+                        text_color=theme.TEXT_MUTED,
+                    )
+                ctx.state["mode"] = None
+                ctx.state["product"] = None
+                return
+            # Everything below this point does real work (a DB lookup,
+            # then hiding one frame and showing another) with no
+            # safety net of its own - unlike every button click in
+            # this dialog (Save, Add Stock, etc), which is wrapped in
+            # its own try/except and reports a problem via
+            # status_label. Before this try/except existed, an
+            # unexpected error partway through (e.g. right after
+            # new_frame.pack_forget() but before existing_frame.pack()
+            # ran) left BOTH frames hidden - the whole dialog looking
+            # like it had simply gone blank, with no error shown
+            # anywhere to explain why. Wrapping the whole thing means
+            # that instead always ends in a real error message, never
+            # silent blankness.
+            try:
+                product = pos.get_product_by_code(self.conn, code)
+            except Exception as e:  # noqa: BLE001
+                ctx.existing_frame.pack_forget()
+                ctx.new_frame.pack_forget()
+                ctx.save_btn.configure(state="disabled")
+                ctx.status_label.configure(
+                    text=f"Couldn't look up that code: {e} - try again, or click Clear to start over.",
+                    text_color=theme.DANGER_RED,
+                )
+                ctx.state["mode"] = None
+                ctx.state["product"] = None
+                return
+            try:
+                self._addproduct_apply_code_lookup_result(ctx, code, product)
+            except Exception as e:  # noqa: BLE001
+                ctx.existing_frame.pack_forget()
+                ctx.new_frame.pack_forget()
+                ctx.save_btn.configure(state="disabled")
+                ctx.status_label.configure(
+                    text=f"Something went wrong showing that item: {e} - try again, or click Clear "
+                         "to start over. Nothing was saved.",
+                    text_color=theme.DANGER_RED,
+                )
+                ctx.state["mode"] = None
+                ctx.state["product"] = None
+        finally:
+            # Runs on every path through the above (blank code, a
+            # found product, a new one, or either error branch) so a
+            # stale-canvas blank page can never survive to be the last
+            # thing check_code leaves on screen.
+            self._addproduct_refresh_scroll_region(ctx)
+
+    def _addproduct_apply_code_lookup_result(self, ctx, code: str, product) -> None:
+        if product is not None:
+            ctx.save_btn.configure(state="normal")
+            ctx.state["mode"] = "existing"
+            ctx.new_frame.pack_forget()
+            # A NEW product deserves fresh per-item fields, not
+            # whatever was typed for the LAST existing product checked
+            # here - otherwise a quantity/cost/expiry typed for one
+            # item could silently carry over and get applied to a
+            # completely different one if the phone scans the next
+            # item before this one's Save is clicked (continuous
+            # scanning means that next scan can arrive at any moment,
+            # not just after the cashier is done with this one).
+            # Guarded on the product actually changing so check_code
+            # re-firing for the SAME still-unsaved code (e.g. a
+            # redundant FocusOut) doesn't wipe out mid-typed values.
+            # Payment is deliberately NOT reset here (see
+            # _addproduct_reset_form) - it's a whole-delivery choice,
+            # not a per-item one, so switching to a different
+            # not-yet-saved item mid-session should keep whatever was
+            # already picked.
+            if ctx.state["product"] != product["id"]:
+                ctx.qty_received_var.set("10")
+                ctx.existing_cost_var.set("")
+                ctx.existing_expiry_var.set("")
+            ctx.state["product"] = product["id"]
+            on_hand = pos.get_stock_on_hand(self.conn, product["id"])
+            ctx.existing_info.configure(
+                text=f"Already in the catalog: {product['name_en']} ({product['category']}) - "
+                     f"{on_hand:.0f} {product['unit']} in stock now. Just enter how many more came in."
+            )
+            ctx.existing_frame.pack(fill="x")
+            ctx.status_label.configure(text=f"Found an existing product for code '{code}'.", text_color=theme.TEXT_MUTED)
+            ctx.save_btn.configure(text="Add Stock", command=lambda: self._addproduct_save_existing(ctx))
+        else:
+            ctx.state["mode"] = "new"
+            ctx.state["product"] = None
+            ctx.existing_frame.pack_forget()
+            ctx.new_frame.pack(fill="x")
+            ctx.status_label.configure(text=f"Code '{code}' isn't in the catalog yet - fill in the new "
+                                             f"product's details below. Save New Product unlocks once "
+                                             f"the name, category, and cash price are filled in.",
+                                        text_color=theme.TEXT_MUTED)
+            ctx.save_btn.configure(text="Save New Product", command=lambda: self._addproduct_save_new(ctx))
+            self._addproduct_update_save_button_state(ctx)
 
     # _open_phone_capture_dialog moved to BaseScreen - POSScreen's search box
     # uses it too now, not just this dialog's barcode field.
