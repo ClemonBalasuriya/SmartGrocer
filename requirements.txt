@@ -15,3 +15,4 @@ pillow==12.3.0
 opencv-contrib-python==5.0.0.93   # fallback barcode/QR decoding for the phone-scanner companion (mobile_scan.py)
 pyzbar==0.1.9                     # PRIMARY barcode/QR decoder for the phone scanner - far more reliable than OpenCV's own detector; self-contained on Windows, nothing extra to install
 cryptography==50.0.1              # self-signed HTTPS certificate so the phone-scanner's live camera works (mobile_scan.py)
+pytest==9.1.1                    # test runner for test_pipeline.py

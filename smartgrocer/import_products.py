@@ -3,8 +3,8 @@ Import a real item-list export into the products table.
 
 Why this exists (separate from smartgrocer/catalog.py + data_generator.py):
 catalog.py's CATALOG is a small, hand-picked 66-item demo catalogue whose
-job is to give the synthetic data generator, the forecasting/association/
-layout demos, and the test suite a compact, fully-priced, fully-categorised
+job is to give the synthetic data generator, the forecasting/association
+demos, and the test suite a compact, fully-priced, fully-categorised
 product list to work with - swapping a real ~9,000-row shop export in
 there would make every demo and test slower and harder to reason about,
 for no benefit, since none of that code needs real product data to prove

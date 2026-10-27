@@ -12,16 +12,16 @@ from tkinter import filedialog, messagebox, ttk
 
 import customtkinter as ctk
 
-from .. import association, forecasting, layout, offers as offers_module, pos, promotions, reports
+from .. import association, forecasting, offers as offers_module, pos, promotions, reports
 from .. import cash_drawer as cash_drawer_module
 from .. import customers as customers_module
 from .. import receipts as receipts_module
 from .. import suppliers as suppliers_module
 from .. import staff as staff_module
+from .. import stock_take as stock_take_module
 from .. import mobile_scan
 from .. import netclient
 from .. import netserver
-from .. import weather_sl
 from .. import offline_sync
 from .. import rag_insights
 from .. import audit
@@ -45,26 +45,69 @@ def make_treeview(parent, columns: list[str], widths: dict[str, int] | None = No
     vsb.grid(row=0, column=1, sticky="ns")
     frame.grid_rowconfigure(0, weight=1)
     frame.grid_columnconfigure(0, weight=1)
-    tree.master_frame = frame  # convenience handle so callers can .pack()/.grid() `frame`
     theme.configure_stripes(tree)
     tree._row_counter = 0
+    tree.master_frame = frame  # convenience handle so callers can .pack()/.grid() `frame`
+
+    def _tree_mousewheel(event):
+        if hasattr(event, "delta") and event.delta:
+            accum = getattr(tree, "_tree_wheel_accum", 0.0) + event.delta
+            rows_to_scroll = int(accum / 40.0)
+            if rows_to_scroll != 0:
+                tree._tree_wheel_accum = accum - (rows_to_scroll * 40.0)
+                tree.yview_scroll(-rows_to_scroll, "units")
+            else:
+                tree._tree_wheel_accum = accum
+        elif getattr(event, "num", None) == 4:
+            tree.yview_scroll(-2, "units")
+        elif getattr(event, "num", None) == 5:
+            tree.yview_scroll(2, "units")
+        return "break"
+
+    tree.bind("<MouseWheel>", _tree_mousewheel)
+    tree.bind("<Button-4>", _tree_mousewheel)
+    tree.bind("<Button-5>", _tree_mousewheel)
+    vsb.bind("<MouseWheel>", _tree_mousewheel)
+    vsb.bind("<Button-4>", _tree_mousewheel)
+    vsb.bind("<Button-5>", _tree_mousewheel)
     return tree
 
 
-PRIMARY_BTN = dict(fg_color=theme.ACCENT_BLUE, hover_color=theme.ACCENT_BLUE_HOVER,
-                    text_color="#FFFFFF", corner_radius=8)
-SUCCESS_BTN = dict(fg_color=theme.SUCCESS_GREEN, hover_color=theme.SUCCESS_GREEN_HOVER,
-                    text_color="#FFFFFF", corner_radius=8)
-DANGER_BTN = dict(fg_color=theme.DANGER_RED, hover_color=theme.DANGER_RED_HOVER,
-                   text_color="#FFFFFF", corner_radius=8)
-SECONDARY_BTN = dict(fg_color=theme.CARD_BG, hover_color=theme.CARD_BG_ALT, text_color=theme.NAVY_DARK,
-                      border_width=1, border_color=theme.BORDER, corner_radius=8)
+PRIMARY_BTN = dict(
+    fg_color=theme.TEAL, hover_color=theme.TEAL_HOVER,
+    text_color=theme.TEXT_ON_TEAL, corner_radius=8,
+)
+SUCCESS_BTN = dict(
+    fg_color=theme.SUCCESS_GREEN, hover_color=theme.SUCCESS_GREEN_HOVER,
+    text_color="#FFFFFF", corner_radius=8,
+)
+DANGER_BTN = dict(
+    fg_color=theme.DANGER_RED, hover_color=theme.DANGER_RED_HOVER,
+    text_color="#FFFFFF", corner_radius=8,
+)
+SECONDARY_BTN = dict(
+    fg_color=theme.CARD_BG, hover_color=theme.CARD_BG_ALT,
+    text_color=theme.TEXT_DARK, border_width=1, border_color=theme.BORDER,
+    corner_radius=8,
+)
+WARNING_BTN = dict(
+    fg_color=theme.ACCENT_AMBER, hover_color=theme.ACCENT_AMBER_HOVER,
+    text_color="#FFFFFF", corner_radius=8,
+)
 
 
 def styled_button(parent, text, command, kind="primary", **kwargs):
-    style = {"primary": PRIMARY_BTN, "success": SUCCESS_BTN, "danger": DANGER_BTN,
-             "secondary": SECONDARY_BTN}[kind]
-    return ctk.CTkButton(parent, text=text, command=command, **{**style, **kwargs})
+    """Create a consistently-styled button. Kinds: primary, success, danger, secondary, warning."""
+    style = {
+        "primary": PRIMARY_BTN,
+        "success": SUCCESS_BTN,
+        "danger": DANGER_BTN,
+        "secondary": SECONDARY_BTN,
+        "warning": WARNING_BTN,
+    }.get(kind, PRIMARY_BTN)
+    merged = {**style, **kwargs}
+    return ctk.CTkButton(parent, text=text, command=command, **merged)
+
 
 
 def fit_dialog(dialog, width: int, height: int) -> None:
@@ -298,19 +341,17 @@ class SearchableDropdown(ctk.CTkButton):
         # firing right after and scrolling a second time.
         def _fast_scroll(event):
             if getattr(event, "num", None) == 4:
-                units = -3
+                tree.yview_scroll(-2, "units")
             elif getattr(event, "num", None) == 5:
-                units = 3
-            else:
-                # A standard wheel notch on Windows is delta=+/-120; a
-                # fast flick of a physical wheel can send a larger
-                # multiple of that in one event, which this scales up
-                # for proportionally. The "or" fallback covers a smaller,
-                # non-multiple-of-120 delta (some trackpad drivers do
-                # this) so it never rounds down to a no-op 0.
-                notches = int(event.delta / 120) or (1 if event.delta > 0 else -1)
-                units = -3 * notches
-            tree.yview_scroll(units, "units")
+                tree.yview_scroll(2, "units")
+            elif hasattr(event, "delta") and event.delta:
+                accum = getattr(tree, "_fast_wheel_accum", 0.0) + event.delta
+                rows = int(accum / 40.0)
+                if rows != 0:
+                    tree._fast_wheel_accum = accum - (rows * 40.0)
+                    tree.yview_scroll(-rows, "units")
+                else:
+                    tree._fast_wheel_accum = accum
             return "break"
 
         tree.bind("<MouseWheel>", _fast_scroll)
@@ -630,13 +671,17 @@ class SuggestionBox:
         # and "break" so it stops right here instead of reaching bind_all.
         def _popup_scroll(event):
             if getattr(event, "num", None) == 4:
-                units = -3
+                tree.yview_scroll(-2, "units")
             elif getattr(event, "num", None) == 5:
-                units = 3
-            else:
-                notches = int(event.delta / 120) or (1 if event.delta > 0 else -1)
-                units = -3 * notches
-            tree.yview_scroll(units, "units")
+                tree.yview_scroll(2, "units")
+            elif hasattr(event, "delta") and event.delta:
+                accum = getattr(tree, "_popup_wheel_accum", 0.0) + event.delta
+                rows = int(accum / 40.0)
+                if rows != 0:
+                    tree._popup_wheel_accum = accum - (rows * 40.0)
+                    tree.yview_scroll(-rows, "units")
+                else:
+                    tree._popup_wheel_accum = accum
             return "break"
 
         tree.bind("<MouseWheel>", _popup_scroll)
@@ -798,7 +843,7 @@ class SuggestionBox:
 
 def run_in_background(widget: ctk.CTkBaseClass, work_fn, on_done, on_error=None):
     """Run a slow, DB-heavy computation (forecasting, association-rule
-    mining, layout optimisation - anything that can take seconds over a
+    mining - anything that can take seconds over a
     real transaction history) off the Tkinter main thread, so the window
     stays responsive instead of freezing mid-click.
 
@@ -821,7 +866,7 @@ def run_in_background(widget: ctk.CTkBaseClass, work_fn, on_done, on_error=None)
 
 class BaseScreen(ctk.CTkFrame):
     def __init__(self, parent, app):
-        super().__init__(parent, fg_color=theme.BG_LIGHT)
+        super().__init__(parent, fg_color=theme.BG_MAIN)
         self.app = app
 
     @property
@@ -831,10 +876,34 @@ class BaseScreen(ctk.CTkFrame):
     def on_show(self):
         pass
 
-    def header(self, text: str):
-        lbl = ctk.CTkLabel(self, text=text, font=ctk.CTkFont(size=22, weight="bold"),
-                            text_color=theme.NAVY_DARK)
-        lbl.pack(anchor="w", padx=24, pady=(20, 12))
+    def header(self, text: str, subtitle: str = ""):
+        """Professional page header with teal left accent bar.
+
+        Used by every screen once (first call in __init__) to give a
+        consistent, branded title bar across all pages.
+        """
+        hdr = ctk.CTkFrame(self, fg_color=theme.CARD_BG,
+                            corner_radius=0, border_width=0)
+        hdr.pack(fill="x")
+
+        # Teal accent bar on the left
+        ctk.CTkFrame(hdr, width=4, fg_color=theme.TEAL, corner_radius=0).pack(
+            side="left", fill="y")
+
+        text_col = ctk.CTkFrame(hdr, fg_color="transparent")
+        text_col.pack(side="left", padx=(14, 0), pady=14)
+
+        ctk.CTkLabel(text_col, text=text,
+                     font=ctk.CTkFont(family="Segoe UI", size=20, weight="bold"),
+                     text_color=theme.CHARCOAL_DARK).pack(anchor="w")
+        if subtitle:
+            ctk.CTkLabel(text_col, text=subtitle,
+                         font=ctk.CTkFont(size=11), text_color=theme.TEXT_MUTED).pack(anchor="w")
+
+        # Thin bottom divider
+        ctk.CTkFrame(self, height=1, fg_color=theme.BORDER, corner_radius=0).pack(fill="x")
+
+
 
     def _open_phone_capture_dialog(self, on_captured, *, title="Scan Barcode with Phone",
                                     instruction="Scan the product's barcode", continuous=False,
@@ -1013,99 +1082,125 @@ class BaseScreen(ctk.CTkFrame):
 class DashboardScreen(BaseScreen):
     def __init__(self, parent, app):
         super().__init__(parent, app)
-        self.header("Dashboard")  # stays fixed at the top, outside the scrollable area below
+        self.header("📊 Executive Dashboard", subtitle="Real-time overview of today's trading activity and KPI metrics")
 
-        # Everything below goes in a scrollable frame, not straight into
-        # `self` - on a smaller screen, a laptop with the taskbar/title bar
-        # eating into the usable height, or Windows display scaling above
-        # 100%, the 6 KPI cards + top-seller card + button row don't all
-        # fit, and without a scrollbar there was literally no way to reach
-        # whatever got cut off (unlike the POS screen, which already had
-        # this same fix - see its own __init__ for the fuller explanation).
+        # Everything below goes in a scrollable frame so smaller screens
+        # can still reach every section without cutting anything off.
         body = ctk.CTkScrollableFrame(self, fg_color="transparent")
-        body.pack(fill="both", expand=True)
+        body.pack(fill="both", expand=True, padx=0, pady=0)
+
+        # ---- Section: KPI Cards -------------------------------------------
+        section_label = ctk.CTkLabel(body, text="KEY PERFORMANCE INDICATORS",
+                                      font=ctk.CTkFont(size=10, weight="bold"),
+                                      text_color=theme.TEXT_MUTED)
+        section_label.pack(anchor="w", padx=16, pady=(14, 6))
 
         self.cards_frame = ctk.CTkFrame(body, fg_color="transparent")
-        self.cards_frame.pack(fill="x", padx=24, pady=10)
+        self.cards_frame.pack(fill="x", padx=12, pady=(0, 6))
         self.card_labels: dict[str, ctk.CTkLabel] = {}
+
+        # (key, label, icon, accent_color)
         specs = [
-            ("today_sales_total", "Today's Sales (LKR)"),
-            ("today_invoice_count", "Invoices Today"),
-            ("today_gross_margin_pct", "Gross Margin % (Today)"),
-            ("low_stock_count", "Products Below Reorder Level"),
-            ("expiring_within_7_days", "Batches Expiring in 7 Days"),
-            ("historical_waste_value_lkr", "Historical Waste (LKR)"),
+            ("today_sales_total",       "Today's Sales",          "💰", theme.TEAL),
+            ("today_invoice_count",      "Invoices Today",         "🧾", theme.INFO_BLUE),
+            ("today_gross_margin_pct",   "Gross Margin %",         "📊", theme.SUCCESS_GREEN),
+            ("low_stock_count",          "Low Stock Alerts",       "📦", theme.ACCENT_AMBER),
+            ("expiring_within_7_days",   "Expiring in 7 Days",     "⏰", theme.DANGER_RED),
+            ("historical_waste_value_lkr","Total Waste (LKR)",     "♻️",  theme.TEXT_MUTED),
         ]
-        for i, (key, label) in enumerate(specs):
-            card = ctk.CTkFrame(self.cards_frame, corner_radius=10, fg_color=theme.CARD_BG,
-                                 border_width=1, border_color=theme.BORDER)
-            card.grid(row=i // 3, column=i % 3, padx=10, pady=10, sticky="nsew")
+        for i, (key, label, icon, accent) in enumerate(specs):
+            card = ctk.CTkFrame(self.cards_frame, corner_radius=12, fg_color=theme.CARD_BG,
+                                border_width=1, border_color=theme.BORDER)
+            card.grid(row=i // 3, column=i % 3, padx=8, pady=8, sticky="nsew")
             self.cards_frame.grid_columnconfigure(i % 3, weight=1)
-            ctk.CTkLabel(card, text=label, font=ctk.CTkFont(size=12), text_color=theme.TEXT_MUTED).pack(
-                anchor="w", padx=16, pady=(14, 0))
-            value_lbl = ctk.CTkLabel(card, text="-", font=ctk.CTkFont(size=26, weight="bold"),
-                                      text_color=theme.NAVY_DARK)
-            value_lbl.pack(anchor="w", padx=16, pady=(0, 14))
+
+            # Coloured top accent strip
+            ctk.CTkFrame(card, height=4, fg_color=accent, corner_radius=0).pack(fill="x")
+
+            inner = ctk.CTkFrame(card, fg_color="transparent")
+            inner.pack(fill="both", padx=16, pady=(10, 14))
+
+            icon_row = ctk.CTkFrame(inner, fg_color="transparent")
+            icon_row.pack(fill="x")
+            ctk.CTkLabel(icon_row, text=icon, font=ctk.CTkFont(size=20)).pack(side="left")
+            ctk.CTkLabel(icon_row, text=label, font=ctk.CTkFont(size=11),
+                         text_color=theme.TEXT_MUTED).pack(side="left", padx=(8, 0))
+
+            value_lbl = ctk.CTkLabel(inner, text="—",
+                                      font=ctk.CTkFont(family="Segoe UI", size=28, weight="bold"),
+                                      text_color=accent)
+            value_lbl.pack(anchor="w", pady=(6, 0))
             self.card_labels[key] = value_lbl
 
-        top_seller_frame = ctk.CTkFrame(body, corner_radius=10, fg_color=theme.CARD_BG,
-                                         border_width=1, border_color=theme.BORDER)
-        top_seller_frame.pack(fill="x", padx=24, pady=(0, 10))
-        self.top_seller_label = ctk.CTkLabel(top_seller_frame, text="Top seller (30d): -",
-                                              font=ctk.CTkFont(size=14), text_color=theme.TEXT_DARK)
-        self.top_seller_label.pack(anchor="w", padx=16, pady=12)
+        # ---- Section: Top Seller ------------------------------------------
+        top_row = ctk.CTkFrame(body, fg_color="transparent")
+        top_row.pack(fill="x", padx=12, pady=(4, 8))
+        ts_card = ctk.CTkFrame(top_row, corner_radius=12, fg_color=theme.CARD_BG,
+                                border_width=1, border_color=theme.BORDER)
+        ts_card.pack(fill="x")
+        ts_inner = ctk.CTkFrame(ts_card, fg_color="transparent")
+        ts_inner.pack(fill="x", padx=16, pady=12)
+        ctk.CTkLabel(ts_inner, text="🏆  TOP SELLER (30 days)",
+                     font=ctk.CTkFont(size=10, weight="bold"), text_color=theme.TEXT_MUTED).pack(side="left")
+        self.top_seller_label = ctk.CTkLabel(ts_inner, text="—",
+                                              font=ctk.CTkFont(size=14, weight="bold"),
+                                              text_color=theme.CHARCOAL_DARK)
+        self.top_seller_label.pack(side="left", padx=(16, 0))
 
-        # Objective 6 - lightweight RAG insight cards (see rag_insights.py):
-        # plain-language, template-generated explanations grounded in the
-        # festival calendar, weather, and this shop's own current low-stock/
-        # expiry state - not a chat box, just "here's what's worth knowing
-        # today and why".
-        insights_frame = ctk.CTkFrame(body, corner_radius=10, fg_color=theme.CARD_BG,
+        # ---- Section: Insights -------------------------------------------
+        ctk.CTkLabel(body, text="SMART INSIGHTS",
+                     font=ctk.CTkFont(size=10, weight="bold"),
+                     text_color=theme.TEXT_MUTED).pack(anchor="w", padx=16, pady=(8, 6))
+
+        insights_frame = ctk.CTkFrame(body, corner_radius=12, fg_color=theme.CARD_BG,
                                        border_width=1, border_color=theme.BORDER)
-        insights_frame.pack(fill="x", padx=24, pady=(0, 10))
-        ctk.CTkLabel(insights_frame, text="Insights", font=ctk.CTkFont(size=13, weight="bold"),
-                     text_color=theme.TEXT_MUTED).pack(anchor="w", padx=16, pady=(12, 4))
+        insights_frame.pack(fill="x", padx=12, pady=(0, 10))
         self.insights_container = ctk.CTkFrame(insights_frame, fg_color="transparent")
-        self.insights_container.pack(fill="x", padx=16, pady=(0, 14))
+        self.insights_container.pack(fill="x", padx=12, pady=12)
 
-        # Ask-a-question box (rag_insights.answer_question) - added because
-        # the shop owner this app is for isn't comfortable hunting through
-        # menus (Best Sellers, Promotions & Expiry, etc.) for an answer;
-        # typing a plain question here and reading a plain-language answer
-        # back is a much shorter path for someone who just wants to know
-        # what to buy today.
-        ask_frame = ctk.CTkFrame(body, corner_radius=10, fg_color=theme.CARD_BG,
+        # ---- Section: Ask AI ---------------------------------------------
+        ctk.CTkLabel(body, text="ASK AI ASSISTANT",
+                     font=ctk.CTkFont(size=10, weight="bold"),
+                     text_color=theme.TEXT_MUTED).pack(anchor="w", padx=16, pady=(8, 6))
+
+        ask_frame = ctk.CTkFrame(body, corner_radius=12, fg_color=theme.CARD_BG,
                                   border_width=1, border_color=theme.BORDER)
-        ask_frame.pack(fill="x", padx=24, pady=(0, 10))
-        ctk.CTkLabel(ask_frame, text="Ask a question", font=ctk.CTkFont(size=13, weight="bold"),
-                     text_color=theme.TEXT_MUTED).pack(anchor="w", padx=16, pady=(12, 0))
+        ask_frame.pack(fill="x", padx=12, pady=(0, 10))
+
+        ask_hdr = ctk.CTkFrame(ask_frame, fg_color=theme.CHARCOAL_DARK, corner_radius=0)
+        ask_hdr.pack(fill="x")
+        ctk.CTkLabel(ask_hdr,
+                     text="💬  Ask a question about your shop's data",
+                     font=ctk.CTkFont(size=12, weight="bold"),
+                     text_color=theme.TEXT_ON_DARK).pack(anchor="w", padx=14, pady=10)
+
+        ask_body = ctk.CTkFrame(ask_frame, fg_color="transparent")
+        ask_body.pack(fill="x", padx=14, pady=10)
         ctk.CTkLabel(
-            ask_frame, text='Try: "What do I need to buy?"  ·  "What is fast moving?"  ·  '
-                            '"What promotion should I give?"  ·  "How much did I sell today?"  ·  '
-                            'or just an item name, like "How much rice do I have?"',
+            ask_body,
+            text='Try: "What do I need to buy?"  ·  "What is fast moving?"  ·  '
+                 '"What promotion should I give?"  ·  "How much did I sell today?"',
             font=ctk.CTkFont(size=11), text_color=theme.TEXT_MUTED, wraplength=900, justify="left",
-        ).pack(anchor="w", padx=16, pady=(2, 8))
-        ask_row = ctk.CTkFrame(ask_frame, fg_color="transparent")
-        ask_row.pack(fill="x", padx=16)
-        self.ask_entry = ctk.CTkEntry(ask_row, placeholder_text="Type your question here...")
-        self.ask_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        ).pack(anchor="w", pady=(0, 8))
+        ask_row = ctk.CTkFrame(ask_body, fg_color="transparent")
+        ask_row.pack(fill="x")
+        self.ask_entry = ctk.CTkEntry(ask_row, placeholder_text="Type your question here...",
+                                       height=38, corner_radius=8, border_color=theme.BORDER)
+        self.ask_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
         self.ask_entry.bind("<Return>", lambda _event: self.ask_question())
-        self.ask_btn = styled_button(ask_row, "Ask", self.ask_question, kind="primary")
+        self.ask_btn = styled_button(ask_row, "  Ask  ", self.ask_question, kind="primary",
+                                      height=38, width=90)
         self.ask_btn.pack(side="left")
 
-        # The answer renders as its own accent-colored card (same visual
-        # language as the Insights cards below) instead of a bare paragraph
-        # of text, and stays hidden until there is an actual answer to show -
-        # an empty card under the question box read as "did this do
-        # anything?" during testing.
-        self.ask_answer_card = ctk.CTkFrame(ask_frame, corner_radius=8, fg_color=theme.BG_LIGHT)
-        self.ask_answer_accent = ctk.CTkFrame(self.ask_answer_card, width=4, fg_color=theme.ACCENT_BLUE,
+        # Answer card - hidden until a question is answered
+        self.ask_answer_card = ctk.CTkFrame(ask_body, corner_radius=8, fg_color=theme.BG_MAIN)
+        self.ask_answer_accent = ctk.CTkFrame(self.ask_answer_card, width=4, fg_color=theme.TEAL,
                                                corner_radius=0)
         self.ask_answer_accent.pack(side="left", fill="y")
         ask_answer_inner = ctk.CTkFrame(self.ask_answer_card, fg_color="transparent")
         ask_answer_inner.pack(side="left", fill="both", expand=True, padx=(12, 14), pady=12)
-        self.ask_answer_icon = ctk.CTkLabel(ask_answer_inner, text="", font=ctk.CTkFont(size=16),
-                                             text_color=theme.TEXT_DARK)
+        self.ask_answer_icon = ctk.CTkLabel(ask_answer_inner, text="",
+                                             font=ctk.CTkFont(size=16), text_color=theme.TEXT_DARK)
         self.ask_answer_icon.pack(side="left", anchor="n", padx=(0, 10))
         self.ask_answer_label = ctk.CTkLabel(
             ask_answer_inner, text="", font=ctk.CTkFont(size=12), text_color=theme.TEXT_DARK,
@@ -1114,11 +1209,15 @@ class DashboardScreen(BaseScreen):
         self.ask_answer_label.pack(side="left", fill="both", expand=True)
         # Not packed here on purpose - shown for the first time in ask_question()/done().
 
+        # ---- Bottom action row -------------------------------------------
         btn_row = ctk.CTkFrame(body, fg_color="transparent")
-        btn_row.pack(fill="x", padx=24, pady=10)
-        styled_button(btn_row, "Refresh", self.refresh, kind="secondary").pack(side="left", padx=(0, 10))
-        styled_button(btn_row, "Rebuild synthetic demo data", self.rebuild_demo_data,
-                      kind="danger").pack(side="left")
+        btn_row.pack(fill="x", padx=12, pady=(0, 16))
+        styled_button(btn_row, "↺  Refresh", self.refresh, kind="secondary",
+                      height=36).pack(side="left", padx=(0, 8))
+        styled_button(btn_row, "⚠  Rebuild Demo Data", self.rebuild_demo_data,
+                      kind="danger", height=36).pack(side="left")
+
+
 
     def on_show(self):
         self.refresh()
@@ -1228,7 +1327,7 @@ def prompt_split_payment(parent, total: float) -> list[tuple[str, float]] | None
     method_vars: dict[str, tk.StringVar] = {}
     for method in ["cash", "card", "cheque", "credit"]:
         row = ctk.CTkFrame(body, fg_color="transparent")
-        row.pack(fill="x", padx=24, pady=4)
+        row.pack(fill="x", padx=12, pady=4)
         ctk.CTkLabel(row, text=method.capitalize() + ":", width=70, anchor="w",
                      text_color=theme.TEXT_DARK).pack(side="left")
         v = tk.StringVar(value="0")
@@ -1264,20 +1363,42 @@ def prompt_split_payment(parent, total: float) -> list[tuple[str, float]] | None
 class POSScreen(BaseScreen):
     def __init__(self, parent, app):
         super().__init__(parent, app)
-        # A custom header row instead of the plain self.header(...) other
-        # screens use.
-        header_row = ctk.CTkFrame(self, fg_color="transparent")
-        header_row.pack(fill="x", padx=24, pady=(20, 12))
-        ctk.CTkLabel(header_row, text="POS / Checkout", font=ctk.CTkFont(size=22, weight="bold"),
-                     text_color=theme.NAVY_DARK).pack(side="left")
-        # Objective 6 - a cashier ringing up sales needs to see offline
-        # mode from THIS screen, not just the Network screen they'd have
-        # no reason to visit mid-sale. Blank whenever this till isn't an
-        # offline-capable Cashier Till or is online with nothing queued.
-        self.offline_badge = ctk.CTkLabel(header_row, text="", font=ctk.CTkFont(size=13, weight="bold"),
+
+        # ---- Professional POS Header (full-width dark bar) ----------------
+        # This replaces the plain header() other screens use - Checkout needs
+        # live status items (cashier name, offline badge, customer) visible
+        # at all times, not just a static title.
+        pos_hdr = ctk.CTkFrame(self, fg_color=theme.CHARCOAL_DARK, corner_radius=0)
+        pos_hdr.pack(fill="x")
+
+        # Left: title + offline badge
+        hdr_left = ctk.CTkFrame(pos_hdr, fg_color="transparent")
+        hdr_left.pack(side="left", padx=16, pady=10)
+        ctk.CTkLabel(hdr_left, text="🛒  CHECKOUT",
+                     font=ctk.CTkFont(family="Segoe UI", size=16, weight="bold"),
+                     text_color=theme.TEXT_ON_DARK).pack(side="left")
+        self.offline_badge = ctk.CTkLabel(hdr_left, text="",
+                                           font=ctk.CTkFont(size=11, weight="bold"),
                                            text_color=theme.DANGER_RED)
-        self.offline_badge.pack(side="left", padx=(16, 0))
+        self.offline_badge.pack(side="left", padx=(14, 0))
+
+        # Right: cashier chip
+        hdr_right = ctk.CTkFrame(pos_hdr, fg_color="transparent")
+        hdr_right.pack(side="right", padx=16, pady=8)
+        ctk.CTkLabel(hdr_right, text="CASHIER", font=ctk.CTkFont(size=9, weight="bold"),
+                     text_color="#4A5568").pack(anchor="e")
+        self.cashier_label = ctk.CTkLabel(hdr_right, text="Not logged in",
+                                           font=ctk.CTkFont(size=12, weight="bold"),
+                                           text_color="#94A3B8")
+        self.cashier_label.pack(anchor="e")
+
+        # Thin teal underline
+        ctk.CTkFrame(self, height=3, fg_color=theme.TEAL, corner_radius=0).pack(fill="x")
+        ctk.CTkFrame(self, height=1, fg_color=theme.BORDER, corner_radius=0).pack(fill="x")
+
         self.cart: list[dict] = []
+
+
 
         # Everything below goes in a scrollable frame, not straight into
         # `self` - this screen has a lot stacked vertically (search/filter
@@ -1292,19 +1413,31 @@ class POSScreen(BaseScreen):
         body = ctk.CTkScrollableFrame(self, fg_color="transparent")
         body.pack(fill="both", expand=True)
 
-        # Search/find-an-item lives right at the top of the screen now -
-        # the first thing a cashier reaches the moment this screen opens,
-        # before touching tier/payment/customer at all, so a scan or a
-        # typed search can start immediately. (The barcode/name boxes
-        # further down, right above the checkout list, are a second,
-        # quicker entry point once a sale is already under way.)
-        search_row = ctk.CTkFrame(body, fg_color="transparent")
-        search_row.pack(fill="x", padx=24, pady=(0, 6))
+        # ---- Search card -------------------------------------------------
+        # Search/find-an-item lives right at the top of the screen - the first
+        # thing a cashier reaches the moment this screen opens, so a scan or
+        # typed search can start immediately. The barcode/name boxes further down
+        # (right above the checkout list) are a second, quicker entry point
+        # once a sale is already under way.
+        search_card = ctk.CTkFrame(body, fg_color=theme.CARD_BG, corner_radius=10,
+                                    border_width=1, border_color=theme.BORDER)
+        search_card.pack(fill="x", padx=12, pady=(10, 0))
 
-        ctk.CTkLabel(search_row, text="Scan barcode or search item:", text_color=theme.TEXT_DARK).grid(
-            row=0, column=0, columnspan=2, sticky="w")
+        search_hdr = ctk.CTkFrame(search_card, fg_color=theme.CHARCOAL_DARK, corner_radius=0)
+        search_hdr.pack(fill="x")
+        ctk.CTkLabel(search_hdr, text="🔍  PRODUCT SEARCH",
+                     font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color=theme.TEXT_ON_DARK).pack(side="left", padx=14, pady=8)
+
+        search_row = ctk.CTkFrame(search_card, fg_color="transparent")
+        search_row.pack(fill="x", padx=12, pady=10)
+
+        ctk.CTkLabel(search_row, text="Scan / Search:", text_color=theme.TEXT_MUTED,
+                     font=ctk.CTkFont(size=11)).grid(row=0, column=0, sticky="w")
         self.search_var = tk.StringVar()
-        self.search_entry = ctk.CTkEntry(search_row, textvariable=self.search_var, width=280)
+        self.search_entry = ctk.CTkEntry(search_row, textvariable=self.search_var, width=280,
+                                          height=34, corner_radius=6,
+                                          placeholder_text="Barcode or product name…")
         self.search_entry.grid(row=1, column=0, sticky="w")
         self.search_entry.bind("<Return>", lambda e: self.do_search())
         # Live-as-you-type: fires on every keystroke (not just Enter/Search),
@@ -1319,9 +1452,8 @@ class POSScreen(BaseScreen):
         # Remembers that this box had the cursor last, out of every input
         # on this screen a scan could plausibly land in - see
         # _route_scanned_code, which the one "Link Phone Scanner" button
-        # (down with Hold/Resume/Return) now routes every scan through
-        # instead of each box needing its own separate "Scan with Phone"
-        # button.
+        # (in the sidebar) now routes every scan through instead of each
+        # box needing its own separate "Scan with Phone" button.
         self.search_entry.bind("<FocusIn>", lambda e: self._mark_focus("search"))
         # <FocusIn> alone turned out not to be trustworthy enough to base
         # scanner routing on - cashiers reported a scan still landing in
@@ -1340,38 +1472,41 @@ class POSScreen(BaseScreen):
         # Enter still runs do_search directly for a scanner's Enter/wedge
         # keystroke, so the button was a redundant extra click/target.
 
-        ctk.CTkLabel(search_row, text="Category:", text_color=theme.TEXT_DARK).grid(
-            row=0, column=3, padx=(16, 0), sticky="w")
+        ctk.CTkLabel(search_row, text="Category:", text_color=theme.TEXT_MUTED,
+                     font=ctk.CTkFont(size=11)).grid(row=0, column=1, padx=(16, 0), sticky="w")
         self.category_var = tk.StringVar(value="All categories")
         self.category_menu = SearchableDropdown(
             search_row, values=["All categories"], variable=self.category_var, width=160, label="Category")
-        self.category_menu.grid(row=1, column=3, padx=(16, 0))
+        self.category_menu.grid(row=1, column=1, padx=(16, 0))
         # Picking a category re-runs the live search immediately (same as
         # typing a letter) so it narrows/filters what's already been typed,
         # rather than waiting for another keystroke.
         self.category_var.trace_add("write", lambda *a: self._on_search_changed())
 
-        # A quiet, inline "not found" line rather than a popup - a popup
-        # is a modal dialog that steals the keyboard/mouse until it's
-        # dismissed, which is fine for one deliberate lookup but brings a
-        # continuous scanning session (a USB/BT gun, or the linked phone
-        # scanner - either one can send several codes a minute with
-        # nobody touching the keyboard between them) to a dead stop the
-        # moment ONE scanned code doesn't match anything: every scan after
-        # that just piles up behind the dialog instead of registering,
-        # which is exactly what "can't scan continuously" looks like from
-        # the till. This label says the same thing without blocking
-        # anything - the next scan a moment later just works.
+        # Qty + Add button in the same row, on the right
+        ctk.CTkLabel(search_row, text="Qty:", text_color=theme.TEXT_MUTED,
+                     font=ctk.CTkFont(size=11)).grid(row=0, column=2, padx=(16, 0), sticky="w")
+        self.qty_var = tk.StringVar(value="1")
+        ctk.CTkEntry(search_row, textvariable=self.qty_var, width=60, height=34,
+                     corner_radius=6).grid(row=1, column=2, padx=(16, 0), sticky="w")
+        styled_button(search_row, "＋ Add to Cart", self.add_selected_to_cart,
+                      kind="primary", height=34, width=130).grid(row=1, column=3, padx=(10, 0), sticky="w")
+
+        # A quiet inline "not found" label (not a modal popup) - a popup is a
+        # modal dialog that steals the keyboard/mouse and brings a continuous
+        # scanning session to a dead stop the moment ONE scanned code doesn't
+        # match anything. This label says the same thing without blocking.
         self.search_status_label = ctk.CTkLabel(
-            body, text="", text_color=theme.DANGER_RED, font=ctk.CTkFont(size=11),
+            search_card, text="", text_color=theme.DANGER_RED, font=ctk.CTkFont(size=11),
             wraplength=560, justify="left",
         )
-        self.search_status_label.pack(fill="x", padx=24, pady=(2, 0), anchor="w")
+        self.search_status_label.pack(fill="x", padx=14, pady=(0, 4), anchor="w")
 
-        results_frame = ctk.CTkFrame(body, fg_color="transparent")
-        results_frame.pack(fill="x", padx=24, pady=(6, 0))
+        # Search results compact table
+        results_card_inner = ctk.CTkFrame(search_card, fg_color=theme.BG_MAIN, corner_radius=6)
+        results_card_inner.pack(fill="x", padx=12, pady=(0, 12))
         self.results_tree = make_treeview(
-            results_frame, ["Code", "Name", "Cash Price", "Stock"],
+            results_card_inner, ["Code", "Name", "Cash Price", "Stock"],
             {"Code": 90, "Name": 300, "Cash Price": 100, "Stock": 80},
             rows=5,
         )
@@ -1389,31 +1524,43 @@ class POSScreen(BaseScreen):
         self.results_tree.master_frame.pack(fill="x")
         self.results_tree.bind("<Double-1>", lambda e: self.add_selected_to_cart())
 
-        qty_row = ctk.CTkFrame(body, fg_color="transparent")
-        qty_row.pack(fill="x", padx=24, pady=(6, 12))
-        ctk.CTkLabel(qty_row, text="Qty:", text_color=theme.TEXT_DARK).pack(side="left")
-        self.qty_var = tk.StringVar(value="1")
-        ctk.CTkEntry(qty_row, textvariable=self.qty_var, width=70).pack(side="left", padx=8)
-        styled_button(qty_row, "Add to Cart", self.add_selected_to_cart).pack(side="left")
-
         self._search_results: list = []
 
-        # Per-sale settings (tier/payment - things you set once and rarely
-        # touch again mid-sale) sit below the search box. Customer is no
-        # longer here - it moved up into search_row, alongside item search
-        # and Category (see the comment there).
-        top = ctk.CTkFrame(body, fg_color="transparent")
-        top.pack(fill="x", padx=24)
 
-        ctk.CTkLabel(top, text="Price tier:", text_color=theme.TEXT_DARK).grid(row=0, column=0, sticky="w")
+
+        # ---- Sale Settings card (Tier / Payment / Customer) ---------------
+        # Per-sale settings (tier/payment/customer) - things you set once and
+        # rarely touch again mid-sale. Customer lookup moved here from the old
+        # search row - who's serving and who's being served sit together.
+        sale_card = ctk.CTkFrame(body, fg_color=theme.CARD_BG, corner_radius=10,
+                                  border_width=1, border_color=theme.BORDER)
+        sale_card.pack(fill="x", padx=12, pady=(10, 0))
+
+        sale_hdr = ctk.CTkFrame(sale_card, fg_color=theme.CHARCOAL_DARK, corner_radius=0)
+        sale_hdr.pack(fill="x")
+        ctk.CTkLabel(sale_hdr, text="⚙  SALE SETTINGS",
+                     font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color=theme.TEXT_ON_DARK).pack(side="left", padx=14, pady=8)
+
+        top = ctk.CTkFrame(sale_card, fg_color="transparent")
+        top.pack(fill="x", padx=12, pady=10)
+
+        ctk.CTkLabel(top, text="Price Tier:", text_color=theme.TEXT_MUTED,
+                     font=ctk.CTkFont(size=11)).grid(row=0, column=0, sticky="w")
         self.tier_var = tk.StringVar(value="cash")
-        ctk.CTkOptionMenu(top, values=["cash", "credit", "wholesale"], variable=self.tier_var).grid(
-            row=1, column=0)
+        ctk.CTkOptionMenu(top, values=["cash", "credit", "wholesale"], variable=self.tier_var,
+                          height=32, fg_color=theme.BG_MAIN, text_color=theme.TEXT_DARK,
+                          button_color=theme.TEAL, button_hover_color=theme.TEAL_HOVER,
+                          corner_radius=6).grid(row=1, column=0)
 
-        ctk.CTkLabel(top, text="Payment:", text_color=theme.TEXT_DARK).grid(row=0, column=1, padx=(16, 0), sticky="w")
+        ctk.CTkLabel(top, text="Payment:", text_color=theme.TEXT_MUTED,
+                     font=ctk.CTkFont(size=11)).grid(row=0, column=1, padx=(16, 0), sticky="w")
         self.payment_var = tk.StringVar(value="cash")
         ctk.CTkOptionMenu(top, values=["cash", "card", "cheque", "credit", "split"],
-                           variable=self.payment_var).grid(row=1, column=1, padx=(16, 0))
+                          variable=self.payment_var, height=32,
+                          fg_color=theme.BG_MAIN, text_color=theme.TEXT_DARK,
+                          button_color=theme.TEAL, button_hover_color=theme.TEAL_HOVER,
+                          corner_radius=6).grid(row=1, column=1, padx=(16, 0))
 
         # One box does the whole job of attaching a customer to this sale -
         # a phone number IS their loyalty ID (see customers.py). Type a
@@ -1422,18 +1569,15 @@ class POSScreen(BaseScreen):
         # their name then appears right next to the box, inline, in
         # customer_found_label. Leave it blank for an anonymous Walk-in
         # sale, which is the default.
-        #
-        # Lives in the `top` row now, right beside the Cashier/login
-        # display (column 3 below) rather than up with item search/
-        # Category - who's serving and who's being served sit together at
-        # a glance, instead of the customer box being all the way up next
-        # to item search.
-        ctk.CTkLabel(top, text="Customer - phone number:", text_color=theme.TEXT_DARK).grid(
-            row=0, column=2, padx=(16, 0), sticky="w")
+        ctk.CTkLabel(top, text="Customer (phone):", text_color=theme.TEXT_MUTED,
+                     font=ctk.CTkFont(size=11)).grid(row=0, column=2, padx=(16, 0), sticky="w")
         customer_lookup_row = ctk.CTkFrame(top, fg_color="transparent")
         customer_lookup_row.grid(row=1, column=2, padx=(16, 0), sticky="w")
         self.customer_lookup_var = tk.StringVar()
-        self.customer_lookup_entry = ctk.CTkEntry(customer_lookup_row, textvariable=self.customer_lookup_var, width=160)
+        self.customer_lookup_entry = ctk.CTkEntry(customer_lookup_row,
+                                                   textvariable=self.customer_lookup_var,
+                                                   width=160, height=32, corner_radius=6,
+                                                   placeholder_text="Phone number…")
         self.customer_lookup_entry.pack(side="left")
         self.customer_lookup_entry.bind("<Return>", lambda e: self.identify_customer(self.customer_lookup_var.get()))
         self.customer_lookup_entry.bind("<FocusIn>", lambda e: self._mark_focus("customer"))
@@ -1450,7 +1594,8 @@ class POSScreen(BaseScreen):
         # counts as a loyalty sale is still tracked internally via
         # _current_is_loyalty() for offer pricing - it just isn't its own
         # label on screen any more).
-        self.customer_found_label = ctk.CTkLabel(customer_lookup_row, text="Walk-in", font=ctk.CTkFont(size=12, weight="bold"),
+        self.customer_found_label = ctk.CTkLabel(customer_lookup_row, text="Walk-in",
+                                                  font=ctk.CTkFont(size=12, weight="bold"),
                                                   text_color=theme.TEXT_MUTED)
         self.customer_found_label.pack(side="left", padx=(10, 0))
         # Live suggestions as digits (or a name) go in - matching customers
@@ -1489,36 +1634,50 @@ class POSScreen(BaseScreen):
         self.customer_var = tk.StringVar(value="Walk-in")
         self.customer_var.trace_add("write", lambda *a: self._on_customer_changed())
 
-        ctk.CTkLabel(top, text="Cashier:", text_color=theme.TEXT_DARK).grid(row=0, column=3, padx=(16, 0), sticky="w")
-        self.cashier_label = ctk.CTkLabel(top, text="Not logged in", font=ctk.CTkFont(weight="bold"),
-                                           text_color=theme.DANGER_RED)
-        self.cashier_label.grid(row=1, column=3, padx=(16, 0), sticky="w")
+        # Cashier label is now in the POS header bar (pos_hdr / hdr_right),
+        # no longer duplicated in the `top` sale-settings row.
 
-        # No heading text above this row of buttons any more - just the
-        # tap-to-add buttons themselves (_refresh_quick_items below).
-        self.quick_items_frame = ctk.CTkFrame(body, fg_color="transparent")
-        self.quick_items_frame.pack(fill="x", padx=24, pady=(6, 6))
+        # ---- Quick Items panel (top sellers / customer favourites) ---------
+        quick_card = ctk.CTkFrame(body, fg_color=theme.CARD_BG, corner_radius=10,
+                                   border_width=1, border_color=theme.BORDER)
+        quick_card.pack(fill="x", padx=12, pady=(10, 0))
+        qi_hdr = ctk.CTkFrame(quick_card, fg_color=theme.CHARCOAL_DARK, corner_radius=0)
+        qi_hdr.pack(fill="x")
+        ctk.CTkLabel(qi_hdr, text="⚡  QUICK ADD",
+                     font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color=theme.TEXT_ON_DARK).pack(side="left", padx=14, pady=8)
+        self.quick_items_frame = ctk.CTkFrame(quick_card, fg_color="transparent")
+        self.quick_items_frame.pack(fill="x", padx=12, pady=10)
         self.tier_var.trace_add("write", lambda *a: self._refresh_quick_items())
 
+
+
+        # ---- Add Item card (barcode / name direct entry) ------------------
         # A second way to add an item, right above the checkout list itself
-        # rather than up at the search box at the top of the screen - two
+        # rather than at the search box at the top of the screen - two
         # separate, dedicated boxes (barcode, and item name) rather than
         # one box guessing which of the two you meant, each with its own
         # live suggestion dropdown (SuggestionBox) so a cashier can either
         # finish typing/scanning an exact value or just pick a match off
         # the list. One shared Qty and "Add" apply to whichever of the two
-        # currently has something typed in it. There's no separate "Scan
-        # with Phone" button here any more - see the single "Link Phone
-        # Scanner" button further down (with Hold/Resume/Return): once
-        # linked, a scan lands in whichever of this screen's boxes last
-        # had the cursor, this pair included.
-        add_item_row = ctk.CTkFrame(body, fg_color="transparent")
-        add_item_row.pack(fill="x", padx=24, pady=(2, 6))
+        # currently has something typed in it.
+        add_card = ctk.CTkFrame(body, fg_color=theme.CARD_BG, corner_radius=10,
+                                 border_width=1, border_color=theme.BORDER)
+        add_card.pack(fill="x", padx=12, pady=(10, 0))
+        add_hdr = ctk.CTkFrame(add_card, fg_color=theme.CHARCOAL_DARK, corner_radius=0)
+        add_hdr.pack(fill="x")
+        ctk.CTkLabel(add_hdr, text="📥  ADD ITEM DIRECTLY",
+                     font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color=theme.TEXT_ON_DARK).pack(side="left", padx=14, pady=8)
 
-        ctk.CTkLabel(add_item_row, text="Add item - barcode:", text_color=theme.TEXT_DARK).grid(
-            row=0, column=0, sticky="w")
+        add_item_row = ctk.CTkFrame(add_card, fg_color="transparent")
+        add_item_row.pack(fill="x", padx=12, pady=10)
+
+        ctk.CTkLabel(add_item_row, text="Barcode:", text_color=theme.TEXT_MUTED,
+                     font=ctk.CTkFont(size=11)).grid(row=0, column=0, sticky="w")
         self.cart_add_barcode_var = tk.StringVar()
-        self.cart_add_barcode_entry = ctk.CTkEntry(add_item_row, textvariable=self.cart_add_barcode_var, width=160)
+        self.cart_add_barcode_entry = ctk.CTkEntry(add_item_row, textvariable=self.cart_add_barcode_var,
+                                                    width=160, height=32, corner_radius=6)
         self.cart_add_barcode_entry.grid(row=1, column=0, sticky="w")
         self.cart_add_barcode_entry.bind("<Return>", lambda e: self.add_item_by_barcode())
         self.cart_add_barcode_entry.bind("<FocusIn>", lambda e: self._mark_focus("barcode"))
@@ -1533,10 +1692,11 @@ class POSScreen(BaseScreen):
             on_select=self._add_product_from_suggestion(self.cart_add_barcode_entry),
         )
 
-        ctk.CTkLabel(add_item_row, text="or item name:", text_color=theme.TEXT_DARK).grid(
-            row=0, column=1, padx=(16, 0), sticky="w")
+        ctk.CTkLabel(add_item_row, text="Item Name:", text_color=theme.TEXT_MUTED,
+                     font=ctk.CTkFont(size=11)).grid(row=0, column=1, padx=(16, 0), sticky="w")
         self.cart_add_name_var = tk.StringVar()
-        self.cart_add_name_entry = ctk.CTkEntry(add_item_row, textvariable=self.cart_add_name_var, width=200)
+        self.cart_add_name_entry = ctk.CTkEntry(add_item_row, textvariable=self.cart_add_name_var,
+                                                 width=200, height=32, corner_radius=6)
         self.cart_add_name_entry.grid(row=1, column=1, padx=(16, 0), sticky="w")
         self.cart_add_name_entry.bind("<Return>", lambda e: self.add_item_by_name())
         self.cart_add_name_entry.bind("<FocusIn>", lambda e: self._mark_focus("name"))
@@ -1551,13 +1711,13 @@ class POSScreen(BaseScreen):
             on_select=self._add_product_from_suggestion(self.cart_add_name_entry),
         )
 
-        ctk.CTkLabel(add_item_row, text="Qty:", text_color=theme.TEXT_DARK).grid(
-            row=0, column=2, padx=(16, 0), sticky="w")
+        ctk.CTkLabel(add_item_row, text="Qty:", text_color=theme.TEXT_MUTED,
+                     font=ctk.CTkFont(size=11)).grid(row=0, column=2, padx=(16, 0), sticky="w")
         self.cart_add_qty_var = tk.StringVar(value="1")
-        ctk.CTkEntry(add_item_row, textvariable=self.cart_add_qty_var, width=60).grid(
-            row=1, column=2, padx=(16, 0), sticky="w")
-        styled_button(add_item_row, "Add", self._add_item_from_whichever_box_has_text, kind="primary").grid(
-            row=1, column=3, padx=(8, 0), sticky="w")
+        ctk.CTkEntry(add_item_row, textvariable=self.cart_add_qty_var, width=60,
+                     height=32, corner_radius=6).grid(row=1, column=2, padx=(16, 0), sticky="w")
+        styled_button(add_item_row, "＋ Add", self._add_item_from_whichever_box_has_text,
+                      kind="primary", height=32, width=90).grid(row=1, column=3, padx=(10, 0), sticky="w")
 
         # Same reasoning as search_status_label above - a "not found" here
         # is exactly as likely to come from a continuous scanning session
@@ -1576,6 +1736,7 @@ class POSScreen(BaseScreen):
         # clearing the box by hand after a "Not found" line appeared, or
         # just backspacing it out) left a stale message sitting there with
         # nothing left in the box to explain it, reported directly. These
+
         # traces clear it on every change to either box - typed, deleted,
         # or a suggestion picked - same as search_var's own trace already
         # does for search_status_label above; no debounce needed since
@@ -1583,18 +1744,24 @@ class POSScreen(BaseScreen):
         self.cart_add_barcode_var.trace_add("write", self._on_cart_add_changed)
         self.cart_add_name_var.trace_add("write", self._on_cart_add_changed)
 
-        # fill="both" WITHOUT expand=True: inside a CTkScrollableFrame,
-        # "expand" fights with the scrollbar's own idea of how tall the
-        # content is (the inner frame tries to stretch to match the
-        # visible viewport instead of its natural content size), which
-        # silently breaks scrolling to anything below it - the results-box
-        # sizing bug's sibling. Giving the cart a fixed, generous row
-        # count (with its own internal scrollbar for a long basket) keeps
-        # its height predictable instead.
-        cart_frame = ctk.CTkFrame(body, fg_color="transparent")
-        cart_frame.pack(fill="both", padx=24, pady=(6, 0))
+        # ---- Cart card (bordered) ----------------------------------------
+        # fill="both" WITHOUT expand=True: inside a CTkScrollableFrame, "expand"
+        # fights the scrollbar's own content sizing. Fixed row count + internal
+        # scrollbar keeps height predictable.
+        cart_card = ctk.CTkFrame(body, fg_color=theme.CARD_BG, corner_radius=10,
+                                  border_width=1, border_color=theme.BORDER)
+        cart_card.pack(fill="both", padx=12, pady=(8, 0))
+
+        cart_hdr = ctk.CTkFrame(cart_card, fg_color=theme.CHARCOAL_DARK, corner_radius=0)
+        cart_hdr.pack(fill="x")
+        ctk.CTkLabel(cart_hdr, text="🛒  CART ITEMS",
+                     font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color=theme.TEXT_ON_DARK).pack(side="left", padx=14, pady=8)
+
+        cart_body = ctk.CTkFrame(cart_card, fg_color="transparent")
+        cart_body.pack(fill="both", padx=4, pady=4)
         self.cart_tree = make_treeview(
-            cart_frame, ["Item", "Qty", "Unit Price", "Discount", "Line Total"],
+            cart_body, ["Item", "Qty", "Unit Price", "Discount", "Line Total"],
             {"Item": 280, "Qty": 70, "Unit Price": 90, "Discount": 90, "Line Total": 100},
             rows=10,
         )
@@ -1604,89 +1771,93 @@ class POSScreen(BaseScreen):
         # go check what it currently says.
         self.cart_tree.bind("<<TreeviewSelect>>", lambda e: self._on_cart_line_selected())
 
-        # An input right on the cart list itself, not just down at the
-        # search box - select a line already in the checkout list above
-        # and change its quantity here, instead of having to remove it and
-        # re-add it at a different quantity through the search/Qty section
-        # further down.
-        edit_qty_row = ctk.CTkFrame(body, fg_color="transparent")
-        edit_qty_row.pack(fill="x", padx=24, pady=(6, 0))
-        ctk.CTkLabel(edit_qty_row, text="Selected line - new qty:", text_color=theme.TEXT_DARK).pack(side="left")
+        # ---- Edit-qty row (inside the cart card) -------------------------
+        eq_row = ctk.CTkFrame(cart_card, fg_color="transparent")
+        eq_row.pack(fill="x", padx=12, pady=(4, 8))
+        ctk.CTkLabel(eq_row, text="Selected line qty:", text_color=theme.TEXT_MUTED,
+                     font=ctk.CTkFont(size=11)).pack(side="left")
         self.cart_edit_qty_var = tk.StringVar()
-        ctk.CTkEntry(edit_qty_row, textvariable=self.cart_edit_qty_var, width=70).pack(side="left", padx=8)
-        styled_button(edit_qty_row, "Update Qty", self.update_selected_line_qty, kind="secondary").pack(side="left")
+        ctk.CTkEntry(eq_row, textvariable=self.cart_edit_qty_var, width=70, height=32,
+                     corner_radius=6).pack(side="left", padx=6)
+        styled_button(eq_row, "Update Qty", self.update_selected_line_qty,
+                      kind="secondary", height=32).pack(side="left")
+        styled_button(eq_row, "✕ Remove Line", self.remove_selected_line,
+                      kind="danger", height=32).pack(side="left", padx=6)
+        styled_button(eq_row, "Clear All", self.clear_cart,
+                      kind="secondary", height=32).pack(side="left")
 
-        bottom = ctk.CTkFrame(body, fg_color="transparent")
-        bottom.pack(fill="x", padx=24, pady=(4, 0))
-        styled_button(bottom, "Remove Selected Line", self.remove_selected_line, kind="secondary").pack(side="left")
-        styled_button(bottom, "Clear Cart", self.clear_cart, kind="secondary").pack(side="left", padx=8)
-        self.total_label = ctk.CTkLabel(bottom, text="Net Total: LKR 0.00", font=ctk.CTkFont(size=16, weight="bold"),
-                                         text_color=theme.NAVY_DARK)
-        self.total_label.pack(side="left", padx=(30, 0))
-        # A one-off, cashier-typed discount for this sale only (a manager
-        # saying "knock off 200 for this customer today", or "10% off this
-        # one") - separate from the automatic Offers/Promotions discounts,
-        # which stay untouched. Either a flat LKR amount or a % of the
-        # sale - the mode dropdown sits right above the amount box it
-        # applies to. Whichever mode is picked, it's spread across the
-        # cart lines proportionally at checkout (see checkout()) so it
-        # still shows up per-line on the receipt/invoice record rather
-        # than as an unexplained gap between subtotal and total.
-        #
-        # Admin/Owner only: a plain cashier login leaves both the mode
-        # dropdown and the amount box disabled (see on_show(), which is
-        # what re-checks this every time login/logout happens) so an
-        # ordinary cashier can't knock money off a sale on their own.
-        discount_col = ctk.CTkFrame(bottom, fg_color="transparent")
-        discount_col.pack(side="left", padx=(20, 0))
-        ctk.CTkLabel(discount_col, text="Discount:", text_color=theme.TEXT_DARK).pack(side="left")
+        # ---- Totals + Checkout summary bar --------------------------------
+        summary_bar = ctk.CTkFrame(body, fg_color=theme.CHARCOAL_MED,
+                                    corner_radius=10, border_width=1, border_color=theme.BORDER_DARK)
+        summary_bar.pack(fill="x", padx=12, pady=(10, 0))
+
+        # Left: Net total + discount controls
+        sb_left = ctk.CTkFrame(summary_bar, fg_color="transparent")
+        sb_left.pack(side="left", padx=16, pady=10)
+
+        self.total_label = ctk.CTkLabel(sb_left, text="Net Total: LKR 0.00",
+                                         font=ctk.CTkFont(size=15, weight="bold"),
+                                         text_color=theme.TEXT_ON_DARK)
+        self.total_label.pack(anchor="w")
+
+        # A one-off cashier-typed discount for this sale only (Admin/Owner only).
+        # Separate from automatic Offers/Promotions discounts. Spread proportionally
+        # across cart lines at checkout (see checkout()) for per-line receipt records.
+        disc_row = ctk.CTkFrame(sb_left, fg_color="transparent")
+        disc_row.pack(anchor="w", pady=(6, 0))
+        ctk.CTkLabel(disc_row, text="Discount:", text_color="#94A3B8",
+                     font=ctk.CTkFont(size=11)).pack(side="left")
         self.discount_mode_var = tk.StringVar(value="LKR")
         self.discount_mode_var.trace_add("write", lambda *a: self._update_payable_label())
         self.discount_mode_menu = ctk.CTkOptionMenu(
-            discount_col, values=["LKR", "%"], variable=self.discount_mode_var, width=70, state="disabled")
-        self.discount_mode_menu.pack(side="left", padx=(6, 0))
+            disc_row, values=["LKR", "%"], variable=self.discount_mode_var,
+            width=70, height=28, fg_color=theme.CHARCOAL_HOVER,
+            button_color=theme.CHARCOAL_HOVER, text_color=theme.TEXT_ON_DARK,
+            state="disabled")
+        self.discount_mode_menu.pack(side="left", padx=(8, 0))
         self.manual_discount_var = tk.StringVar(value="0")
         self.manual_discount_var.trace_add("write", lambda *a: self._update_payable_label())
         self.manual_discount_entry = ctk.CTkEntry(
-            discount_col, textvariable=self.manual_discount_var, width=90, state="disabled")
+            disc_row, textvariable=self.manual_discount_var, width=90, height=28,
+            corner_radius=6, fg_color=theme.CHARCOAL_HOVER, text_color=theme.TEXT_ON_DARK,
+            state="disabled")
         self.manual_discount_entry.pack(side="left", padx=(6, 0))
 
-        # Payable sits directly above the Checkout button, not beside it in
-        # the row - it's the last figure a cashier's eye should land on
-        # before pressing Checkout, right where the click is about to
-        # happen, rather than off to the side where it's easy to miss.
-        checkout_col = ctk.CTkFrame(bottom, fg_color="transparent")
-        checkout_col.pack(side="right")
-        self.payable_label = ctk.CTkLabel(checkout_col, text="Payable: LKR 0.00", font=ctk.CTkFont(size=16, weight="bold"),
-                                           text_color=theme.SUCCESS_GREEN)
-        self.payable_label.pack(side="top")
-        styled_button(checkout_col, "Checkout", self.checkout, kind="success", width=140,
-                      height=40).pack(side="top", pady=(4, 0))
+        # Right: Payable amount + big Checkout button
+        # Payable sits directly above the Checkout button - it's the last figure
+        # a cashier's eye lands on before pressing Checkout.
+        sb_right = ctk.CTkFrame(summary_bar, fg_color="transparent")
+        sb_right.pack(side="right", padx=16, pady=10)
 
+        self.payable_label = ctk.CTkLabel(
+            sb_right, text="Payable: LKR 0.00",
+            font=ctk.CTkFont(family="Segoe UI", size=20, weight="bold"),
+            text_color=theme.SUCCESS_GREEN)
+        self.payable_label.pack(anchor="e")
+
+        styled_button(sb_right, "✓  CHECKOUT", self.checkout, kind="success",
+                      width=180, height=46,
+                      font=ctk.CTkFont(size=14, weight="bold")).pack(anchor="e", pady=(8, 0))
+
+        # ---- Action buttons row (Hold / Resume / Return / Reprint / Void) --
         # grid (not pack/side="left") so these shrink to fit a narrower window
         # or a smaller/scaled-up-DPI screen instead of running off the edge.
-        # "Link Phone Scanner" used to live here as a 4th button, but it got
-        # lost among the invoice-management buttons - a cashier who'd never
-        # used it before genuinely couldn't find it ("scanner button can't
-        # see"). It now lives in the app's own left sidebar (see app.py,
-        # SmartGrocerApp.__init__) instead, where it's visible no matter
-        # which screen is open, not just when already on POS/Checkout -
-        # exactly where you'd look for something you do once before you
-        # start ringing anything up.
         bottom2 = ctk.CTkFrame(body, fg_color="transparent")
-        bottom2.pack(fill="x", padx=24, pady=(8, 12))
+        bottom2.pack(fill="x", padx=12, pady=(8, 16))
         for col in range(5):
             bottom2.grid_columnconfigure(col, weight=1, uniform="bottom2")
-        styled_button(bottom2, "Hold Invoice", self.hold_invoice, kind="secondary").grid(
-            row=0, column=0, sticky="ew", padx=(0, 4))
-        styled_button(bottom2, "Resume Held", self.resume_invoice, kind="secondary").grid(
-            row=0, column=1, sticky="ew", padx=4)
-        styled_button(bottom2, "Return / Refund", self.open_return_dialog, kind="danger").grid(
-            row=0, column=2, sticky="ew", padx=4)
-        styled_button(bottom2, "Reprint Receipt", self.open_reprint_dialog, kind="secondary").grid(
-            row=0, column=3, sticky="ew", padx=4)
-        styled_button(bottom2, "Void Sale", self.open_void_dialog, kind="danger").grid(
-            row=0, column=4, sticky="ew", padx=(4, 0))
+        styled_button(bottom2, "⏸  Hold Invoice", self.hold_invoice, kind="secondary",
+                      height=36).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        styled_button(bottom2, "▶  Resume Held", self.resume_invoice, kind="secondary",
+                      height=36).grid(row=0, column=1, sticky="ew", padx=4)
+        styled_button(bottom2, "↩  Return / Refund", self.open_return_dialog, kind="danger",
+                      height=36).grid(row=0, column=2, sticky="ew", padx=4)
+        styled_button(bottom2, "🖨  Reprint Receipt", self.open_reprint_dialog, kind="secondary",
+                      height=36).grid(row=0, column=3, sticky="ew", padx=4)
+        styled_button(bottom2, "⊗  Void Sale", self.open_void_dialog, kind="danger",
+                      height=36).grid(row=0, column=4, sticky="ew", padx=(4, 0))
+
+
 
         # Which of this screen's own text boxes last had the keyboard
         # cursor - "search" by default, since on_show() below focuses the
@@ -1726,9 +1897,12 @@ class POSScreen(BaseScreen):
 
         if self.app.logged_in:
             staff = self.conn.execute("SELECT name FROM staff WHERE id=?", (self.app.current_staff_id,)).fetchone()
-            self.cashier_label.configure(text=staff["name"] if staff else "Unknown", text_color=theme.SUCCESS_GREEN)
+            self.cashier_label.configure(text=staff["name"] if staff else "Unknown",
+                                          text_color=theme.TEAL)
         else:
-            self.cashier_label.configure(text="Not logged in", text_color=theme.DANGER_RED)
+            self.cashier_label.configure(text="Not logged in",
+                                          text_color="#94A3B8")
+
 
         # The checkout discount (LKR or %) is Admin/Owner only - re-checked
         # every time this screen shows, since login/logout happens from the
@@ -2880,15 +3054,15 @@ class InventoryScreen(BaseScreen):
 
     def __init__(self, parent, app):
         super().__init__(parent, app)
-        self.header("Inventory")
+        self.header("📦 Inventory & Stock Control", subtitle="Monitor stock levels, manage batches, and configure pricing tiers")
 
         self.hint = ctk.CTkLabel(
             self, text="", font=ctk.CTkFont(size=12), text_color=theme.TEXT_MUTED, wraplength=760, justify="left",
         )
-        self.hint.pack(anchor="w", padx=24, pady=(0, 8))
+        self.hint.pack(anchor="w", padx=12, pady=(0, 8))
 
         btn_row = ctk.CTkFrame(self, fg_color="transparent")
-        btn_row.pack(fill="x", padx=24)
+        btn_row.pack(fill="x", padx=12)
         styled_button(btn_row, "Refresh", self.refresh, kind="secondary").pack(side="left")
         styled_button(btn_row, "Export CSV", self.export, kind="secondary").pack(side="left", padx=8)
         self.import_btn = styled_button(
@@ -2909,9 +3083,13 @@ class InventoryScreen(BaseScreen):
         self.edit_btn.pack(side="left", padx=8)
         self.remove_btn = styled_button(btn_row, "Remove / Restore Item", self.toggle_product_active, kind="danger")
         self.remove_btn.pack(side="left", padx=8)
+        self.stock_take_btn = styled_button(
+            btn_row, "Stock Take", self.open_stock_take_dialog, kind="secondary",
+        )
+        self.stock_take_btn.pack(side="left", padx=8)
 
         tree_frame = ctk.CTkFrame(self, fg_color="transparent")
-        tree_frame.pack(fill="both", expand=True, padx=24, pady=10)
+        tree_frame.pack(fill="both", expand=True, padx=12, pady=10)
         self.tree = make_treeview(
             tree_frame, ["Code", "Name", "Category", "On Hand", "Reorder Level", "Status"],
             {"Code": 90, "Name": 260, "Category": 150, "On Hand": 90, "Reorder Level": 100, "Status": 100},
@@ -2956,6 +3134,7 @@ class InventoryScreen(BaseScreen):
         self.edit_btn.configure(state="normal" if is_admin else "disabled")
         self.remove_btn.configure(state="normal" if is_owner else "disabled")
         self.import_btn.configure(state="normal" if is_admin else "disabled")
+        self.stock_take_btn.configure(state="normal" if is_admin else "disabled")
 
         raw = self.conn.execute(
             """SELECT p.id, p.code, p.name_en, p.category, p.reorder_level, p.active,
@@ -3931,6 +4110,121 @@ class InventoryScreen(BaseScreen):
     # _open_phone_capture_dialog moved to BaseScreen - POSScreen's search box
     # uses it too now, not just this dialog's barcode field.
 
+    def open_stock_take_dialog(self):
+        """Physical stock count, one category at a time - see stock_take.py.
+        Admin/Owner only, same bar as every other stock-affecting action on
+        this screen."""
+        if not self._is_admin():
+            messagebox.showwarning("Admin/Owner only", "Log in as Admin or Owner to run a stock take.")
+            return
+
+        categories = pos.list_categories(self.conn)
+        if not categories:
+            messagebox.showinfo("No products", "There are no active products to count yet.")
+            return
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Stock Take")
+        fit_dialog(dialog, 640, 640)
+        dialog.configure(fg_color=theme.BG_LIGHT)
+        dialog.grab_set()
+
+        top = ctk.CTkFrame(dialog, fg_color="transparent")
+        top.pack(fill="x", padx=16, pady=(16, 8))
+        ctk.CTkLabel(top, text="Category:", text_color=theme.TEXT_DARK).pack(side="left")
+        category_var = tk.StringVar(value=categories[0])
+
+        ctk.CTkLabel(
+            dialog,
+            text="Counted quantity is pre-filled with what the system currently expects - overtype "
+                 "any row that's actually different on the shelf. A row you leave unchanged is "
+                 "recorded as matching the system exactly, so count every row you can see.",
+            text_color=theme.TEXT_MUTED, font=ctk.CTkFont(size=11), wraplength=600, justify="left",
+        ).pack(anchor="w", padx=16, pady=(0, 8))
+
+        body = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+
+        state = {"rows": []}  # [(product_id, system_qty, unit_cost, counted_var), ...]
+
+        def load_category():
+            for w in body.winfo_children():
+                w.destroy()
+            state["rows"] = []
+            products = stock_take_module.products_for_count(self.conn, category_var.get())
+            header = ctk.CTkFrame(body, fg_color="transparent")
+            header.pack(fill="x", pady=(0, 4))
+            ctk.CTkLabel(header, text="Product", width=260, anchor="w",
+                         font=ctk.CTkFont(weight="bold")).pack(side="left")
+            ctk.CTkLabel(header, text="System Qty", width=90, anchor="w",
+                         font=ctk.CTkFont(weight="bold")).pack(side="left")
+            ctk.CTkLabel(header, text="Counted Qty", width=90, anchor="w",
+                         font=ctk.CTkFont(weight="bold")).pack(side="left")
+            for p in products:
+                row = ctk.CTkFrame(body, fg_color="transparent")
+                row.pack(fill="x", pady=2)
+                ctk.CTkLabel(row, text=p["name_en"], width=260, anchor="w").pack(side="left")
+                ctk.CTkLabel(row, text=f"{p['system_qty']:g}", width=90, anchor="w").pack(side="left")
+                counted_var = tk.StringVar(value=f"{p['system_qty']:g}")
+                ctk.CTkEntry(row, textvariable=counted_var, width=80).pack(side="left")
+                state["rows"].append((p["product_id"], p["system_qty"], p["cost_price"], counted_var))
+            if not products:
+                ctk.CTkLabel(body, text="No active products in this category.",
+                             text_color=theme.TEXT_MUTED).pack(pady=10)
+
+        ctk.CTkOptionMenu(
+            top, values=categories, variable=category_var, command=lambda _c: load_category(),
+        ).pack(side="left", padx=8)
+        load_category()
+
+        apply_var = tk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            dialog, text="Apply these counts to stock now (otherwise just record the variance report)",
+            variable=apply_var,
+        ).pack(anchor="w", padx=16, pady=(0, 4))
+
+        def save_and_finish():
+            counts = []
+            for product_id, system_qty, unit_cost, counted_var in state["rows"]:
+                try:
+                    counted = float(counted_var.get().strip())
+                except ValueError:
+                    messagebox.showerror("Invalid number", "Every counted quantity must be a number.")
+                    return
+                if counted < 0:
+                    messagebox.showerror("Invalid number", "Counted quantity can't be negative.")
+                    return
+                counts.append((product_id, system_qty, counted, unit_cost))
+            if not counts:
+                messagebox.showwarning("Nothing to count", "No products in this category.")
+                return
+
+            staff_row = self.conn.execute(
+                "SELECT name FROM staff WHERE id=?", (self.app.current_staff_id,)
+            ).fetchone()
+            stock_take_id = stock_take_module.start_session(
+                self.conn, self.app.current_staff_id, category_var.get(),
+            )
+            stock_take_module.save_counts(self.conn, stock_take_id, counts)
+            summary = stock_take_module.finish_session(
+                self.conn, stock_take_id, apply_adjustments=apply_var.get(),
+                actor_staff_id=self.app.current_staff_id,
+                actor_name=staff_row["name"] if staff_row else "Someone",
+            )
+            messagebox.showinfo(
+                "Stock take saved",
+                f"{summary['lines_counted']} item(s) counted, {summary['lines_with_variance']} with a "
+                f"variance.\nNet variance LKR {summary['total_variance_value']:,.2f} "
+                f"(shortfall LKR {summary['shortfall_value']:,.2f}).\n\n"
+                + ("Stock has been adjusted to match the count." if apply_var.get()
+                   else "Stock was NOT changed - this was recorded as a report only.")
+                + "\n\nSee Reports > Stock Take History for the full record."
+            )
+            dialog.destroy()
+            self.refresh()
+
+        styled_button(dialog, "Save Stock Take", save_and_finish, kind="success").pack(pady=14)
+
 
 # --------------------------------------------------------------------------- #
 # Promotions & Expiry
@@ -3939,10 +4233,10 @@ class InventoryScreen(BaseScreen):
 class PromotionsScreen(BaseScreen):
     def __init__(self, parent, app):
         super().__init__(parent, app)
-        self.header("Promotions & Expiry (Urgency Ranking)")
+        self.header("🏷️ Promotions & Expiry Urgency", subtitle="Rank expiring stock batches and launch promotional markdowns to prevent waste")
 
         top = ctk.CTkFrame(self, fg_color="transparent")
-        top.pack(fill="x", padx=24)
+        top.pack(fill="x", padx=12)
         styled_button(top, "Refresh", self.refresh, kind="secondary").pack(side="left")
         legend = ctk.CTkFrame(top, fg_color="transparent")
         legend.pack(side="left", padx=20)
@@ -3955,7 +4249,7 @@ class PromotionsScreen(BaseScreen):
             ctk.CTkLabel(legend, text=label, font=ctk.CTkFont(size=11), text_color=theme.TEXT_MUTED).pack(side="left")
 
         tree_frame = ctk.CTkFrame(self, fg_color="transparent")
-        tree_frame.pack(fill="both", expand=True, padx=24, pady=10)
+        tree_frame.pack(fill="both", expand=True, padx=12, pady=10)
         columns = ["Product", "Qty", "Expiry", "Days Left", "Alert", "Urgency",
                    "Discount %", "Suggested Price", "Est. Clearance"]
         widths = {"Product": 220, "Qty": 60, "Expiry": 90, "Days Left": 80, "Alert": 100,
@@ -3984,10 +4278,10 @@ class PromotionsScreen(BaseScreen):
 class ForecastingScreen(BaseScreen):
     def __init__(self, parent, app):
         super().__init__(parent, app)
-        self.header("Demand Forecasting")
+        self.header("📈 Demand Forecasting & Planning", subtitle="AI-powered sales prediction, model selection, and automated purchase list generation")
 
         top = ctk.CTkFrame(self, fg_color="transparent")
-        top.pack(fill="x", padx=24)
+        top.pack(fill="x", padx=12)
         ctk.CTkLabel(top, text="Product:", text_color=theme.TEXT_DARK).pack(side="left")
         products = self.conn.execute("SELECT id, name_en FROM products WHERE active=1 ORDER BY name_en").fetchall()
         self._products = products
@@ -4001,34 +4295,14 @@ class ForecastingScreen(BaseScreen):
                                                 kind="secondary")
         self.purchase_list_btn.pack(side="left", padx=20)
 
-        # Objective 6 - lets the shop log today's ACTUAL weather category so
-        # the SARIMAX (festival+weather) variant above has real data to use
-        # instead of only the climatology fallback (see weather_sl.py).
-        weather_row = ctk.CTkFrame(self, fg_color="transparent")
-        weather_row.pack(fill="x", padx=24, pady=(10, 0))
-        ctk.CTkLabel(weather_row, text="Today's weather:", text_color=theme.TEXT_DARK).pack(side="left")
-        today_logged = weather_sl.logged_categories(self.conn).get(date.today().isoformat())
-        self.weather_var = tk.StringVar(
-            value=today_logged or weather_sl.climatology_category(date.today())
-        )
-        ctk.CTkOptionMenu(weather_row, values=list(weather_sl.CATEGORIES), variable=self.weather_var,
-                          width=100).pack(side="left", padx=8)
-        styled_button(weather_row, "Log Weather", self.log_weather, kind="secondary").pack(side="left")
-        self.weather_hint = ctk.CTkLabel(
-            weather_row,
-            text=("(logged)" if today_logged else "(climatology estimate - not yet logged today)"),
-            font=ctk.CTkFont(size=11), text_color=theme.TEXT_MUTED,
-        )
-        self.weather_hint.pack(side="left", padx=10)
-
         self.status_label = ctk.CTkLabel(self, text="", text_color=theme.TEXT_MUTED)
-        self.status_label.pack(anchor="w", padx=24, pady=(6, 0))
+        self.status_label.pack(anchor="w", padx=12, pady=(6, 0))
 
         self.chart_frame = ctk.CTkFrame(self, fg_color="transparent", height=280)
-        self.chart_frame.pack(fill="x", padx=24, pady=10)
+        self.chart_frame.pack(fill="x", padx=12, pady=10)
 
         tree_frame = ctk.CTkFrame(self, fg_color="transparent")
-        tree_frame.pack(fill="both", expand=True, padx=24)
+        tree_frame.pack(fill="both", expand=True, padx=12)
         self.tree = make_treeview(tree_frame, ["Model / Date", "Value"], {"Model / Date": 260, "Value": 140})
         self.tree.master_frame.pack(fill="both", expand=True)
 
@@ -4046,12 +4320,6 @@ class ForecastingScreen(BaseScreen):
                 conn.close()
 
         run_in_background(self, work, self._on_forecast_done, self._on_forecast_error)
-
-    def log_weather(self):
-        weather_sl.log_weather(self.conn, date.today(), self.weather_var.get())
-        self.weather_hint.configure(text="(logged)")
-        messagebox.showinfo("Weather logged", f"Logged today ({date.today().isoformat()}) as \"{self.weather_var.get()}\". "
-                             "The SARIMAX (festival+weather) forecast will use this from now on.")
 
     def _on_forecast_error(self, err):
         self.run_forecast_btn.configure(state="normal")
@@ -4138,10 +4406,10 @@ class ForecastingScreen(BaseScreen):
 class BundlesScreen(BaseScreen):
     def __init__(self, parent, app):
         super().__init__(parent, app)
-        self.header("Bundle Recommendations (Association Rule Mining)")
+        self.header("🛍️ Bundle Recommendations", subtitle="Discover frequent product pairings and cross-selling bundles using association rule mining")
 
         top = ctk.CTkFrame(self, fg_color="transparent")
-        top.pack(fill="x", padx=24)
+        top.pack(fill="x", padx=12)
         self.compute_btn = styled_button(top, "Compute Bundles", self.compute)
         self.compute_btn.pack(side="left")
         self.status_label = ctk.CTkLabel(top, text="min support 2%, min confidence 30%, min lift 1.1",
@@ -4149,7 +4417,7 @@ class BundlesScreen(BaseScreen):
         self.status_label.pack(side="left", padx=16)
 
         tree_frame = ctk.CTkFrame(self, fg_color="transparent")
-        tree_frame.pack(fill="both", expand=True, padx=24, pady=10)
+        tree_frame.pack(fill="both", expand=True, padx=12, pady=10)
         columns = ["Bundle", "Support", "Confidence", "Lift", "Sum Price", "Bundle Price", "Savings"]
         widths = {"Bundle": 320, "Support": 80, "Confidence": 90, "Lift": 70,
                   "Sum Price": 100, "Bundle Price": 100, "Savings": 90}
@@ -4185,89 +4453,40 @@ class BundlesScreen(BaseScreen):
 
 
 # --------------------------------------------------------------------------- #
-# Layout
-# --------------------------------------------------------------------------- #
-
-class LayoutScreen(BaseScreen):
-    def __init__(self, parent, app):
-        super().__init__(parent, app)
-        self.header("Store Layout Optimisation")
-
-        top = ctk.CTkFrame(self, fg_color="transparent")
-        top.pack(fill="x", padx=24)
-        self.compute_btn = styled_button(top, "Compute Layout", self.compute)
-        self.compute_btn.pack(side="left")
-        self.status_label = ctk.CTkLabel(top, text="", text_color=theme.TEXT_MUTED)
-        self.status_label.pack(side="left", padx=16)
-
-        self.image_frame = ctk.CTkFrame(self, fg_color=theme.CARD_BG, border_width=1, border_color=theme.BORDER)
-        self.image_frame.pack(padx=24, pady=10, fill="both", expand=True)
-        self.image_label = ctk.CTkLabel(self.image_frame, text="Click \"Compute Layout\" to generate a planogram.",
-                                         text_color=theme.TEXT_MUTED)
-        self.image_label.pack(padx=16, pady=16)
-
-    def compute(self):
-        self.compute_btn.configure(state="disabled")
-        self.status_label.configure(text="Computing layout assignments...")
-
-        def work():
-            conn = db_module.get_conn(self.app.db_path)
-            try:
-                assignments = layout.compute_layout(conn)
-                layout.persist_layout(conn, assignments)
-            finally:
-                conn.close()
-            out_path = str(db_module.ensure_output_dir() / "planogram.png")
-            layout.render_planogram(assignments, out_path)
-            return assignments, out_path
-
-        def on_done(result):
-            assignments, out_path = result
-            self.compute_btn.configure(state="normal")
-            self.status_label.configure(text=f"Layout computed for {len(assignments)} products. Saved to {out_path}")
-            try:
-                from PIL import Image
-                img = Image.open(out_path)
-                w, h = img.size
-                scale = min(1.0, 900 / w)
-                ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=(int(w * scale), int(h * scale)))
-                self.image_label.configure(image=ctk_img, text="")
-                self.image_label.image = ctk_img
-            except ImportError:
-                self.image_label.configure(text=f"Planogram saved to {out_path} (install Pillow to preview it here).")
-
-        def on_error(err):
-            self.compute_btn.configure(state="normal")
-            messagebox.showerror("Layout computation failed", str(err))
-
-        run_in_background(self, work, on_done, on_error)
-
-
-# --------------------------------------------------------------------------- #
 # Reports
 # --------------------------------------------------------------------------- #
 
-REPORT_OPTIONS = ["Best Sellers (30d)", "Stock Summary", "Low Stock Alert",
+REPORT_OPTIONS = ["Daily Sales Summary", "Best Sellers (30d)", "Stock Summary", "Low Stock Alert",
                    "Waste Summary", "Cashier Daily Statement", "Credit Outstanding",
-                   "Returns Summary (30d)", "Supplier Summary", "Cash Sessions (Day Open/Close)"]
+                   "Returns Summary (30d)", "Supplier Summary", "Cash Sessions (Day Open/Close)",
+                   "Stock Take History"]
+# A numbered picker, same idea as the sample POS system's own Report Name
+# list (01 .. NN) - still backed by the plain REPORT_OPTIONS names above
+# for every actual comparison below; _strip_report_number is the only
+# place that ever has to know about the "01  " prefix.
+NUMBERED_REPORT_OPTIONS = [f"{i + 1:02d}  {name}" for i, name in enumerate(REPORT_OPTIONS)]
+
+
+def _strip_report_number(choice: str) -> str:
+    return choice.split("  ", 1)[1] if "  " in choice else choice
 
 
 class ReportsScreen(BaseScreen):
     def __init__(self, parent, app):
         super().__init__(parent, app)
-        self.header("Reports")
+        self.header("📑 Business Reports & Analytics", subtitle="Financial statements, sales breakdowns, cashier reconciliations, and data exports")
 
         top = ctk.CTkFrame(self, fg_color="transparent")
-        top.pack(fill="x", padx=24)
-        self.report_var = tk.StringVar(value=REPORT_OPTIONS[0])
-        ctk.CTkOptionMenu(top, values=REPORT_OPTIONS, variable=self.report_var,
+        top.pack(fill="x", padx=12)
+        self.report_var = tk.StringVar(value=NUMBERED_REPORT_OPTIONS[0])
+        ctk.CTkOptionMenu(top, values=NUMBERED_REPORT_OPTIONS, variable=self.report_var, width=240,
                           command=self._on_report_change).pack(side="left")
         styled_button(top, "Run Report", self.run_report).pack(side="left", padx=8)
         styled_button(top, "Export CSV", self.export, kind="secondary").pack(side="left", padx=8)
         styled_button(top, "Backup Database", self.backup, kind="secondary").pack(side="left", padx=20)
 
         self.cashier_row = ctk.CTkFrame(self, fg_color="transparent")
-        ctk.CTkLabel(self.cashier_row, text="Staff:", text_color=theme.TEXT_DARK).pack(side="left", padx=(24, 4))
+        ctk.CTkLabel(self.cashier_row, text="Staff:", text_color=theme.TEXT_DARK).pack(side="left", padx=(12, 4))
         staff_names = [r["name"] for r in self.conn.execute("SELECT name FROM staff").fetchall()] or ["Admin"]
         self.cashier_staff_var = tk.StringVar(value=staff_names[0])
         SearchableDropdown(
@@ -4279,21 +4498,32 @@ class ReportsScreen(BaseScreen):
         ctk.CTkEntry(self.cashier_row, textvariable=self.cashier_date_var, width=120).pack(side="left")
         # hidden until "Cashier Daily Statement" is selected - see _on_report_change
 
+        self.date_row = ctk.CTkFrame(self, fg_color="transparent")
+        ctk.CTkLabel(self.date_row, text="Date (YYYY-MM-DD):", text_color=theme.TEXT_DARK).pack(
+            side="left", padx=(12, 4))
+        self.report_date_var = tk.StringVar(value=date.today().isoformat())
+        ctk.CTkEntry(self.date_row, textvariable=self.report_date_var, width=120).pack(side="left")
+        # hidden until "Daily Sales Summary" is selected - see _on_report_change
+
         self.summary_label = ctk.CTkLabel(self, text="", text_color=theme.NAVY_DARK,
                                            font=ctk.CTkFont(size=14, weight="bold"))
-        self.summary_label.pack(anchor="w", padx=24, pady=(8, 0))
+        self.summary_label.pack(anchor="w", padx=12, pady=(8, 0))
 
         tree_frame = ctk.CTkFrame(self, fg_color="transparent")
-        tree_frame.pack(fill="both", expand=True, padx=24, pady=10)
+        tree_frame.pack(fill="both", expand=True, padx=12, pady=10)
         self.tree = make_treeview(tree_frame, ["A", "B", "C", "D"], {})
         self.tree.master_frame.pack(fill="both", expand=True)
         self._rows: list[dict] = []
+        self._on_report_change(self.report_var.get())
 
     def _on_report_change(self, choice: str):
+        choice = _strip_report_number(choice)
+        self.cashier_row.pack_forget()
+        self.date_row.pack_forget()
         if choice == "Cashier Daily Statement":
             self.cashier_row.pack(fill="x", pady=(6, 0), before=self.summary_label)
-        else:
-            self.cashier_row.pack_forget()
+        elif choice == "Daily Sales Summary":
+            self.date_row.pack(fill="x", pady=(6, 0), before=self.summary_label)
 
     def _set_columns(self, columns: list[str]):
         self.tree.configure(columns=columns)
@@ -4302,11 +4532,23 @@ class ReportsScreen(BaseScreen):
             self.tree.column(c, width=140)
 
     def run_report(self):
-        choice = self.report_var.get()
+        choice = _strip_report_number(self.report_var.get())
         tree_clear(self.tree)
         self.summary_label.configure(text="")
 
-        if choice == "Best Sellers (30d)":
+        if choice == "Daily Sales Summary":
+            try:
+                day = date.fromisoformat(self.report_date_var.get().strip())
+            except ValueError:
+                messagebox.showerror("Invalid date", "Use YYYY-MM-DD format.")
+                return
+            rows = [dict(r) for r in reports.daily_sales_summary(self.conn, day)]
+            self._set_columns(["name_en", "qty", "revenue"])
+            total = sum(r["revenue"] for r in rows)
+            self.summary_label.configure(
+                text=f"{day.isoformat()}: {len(rows)} product(s) sold, LKR {total:,.2f} total revenue"
+            )
+        elif choice == "Best Sellers (30d)":
             rows = [dict(r) for r in reports.best_sellers(self.conn)]
             self._set_columns(["name_en", "category", "qty", "revenue"])
         elif choice == "Stock Summary":
@@ -4345,6 +4587,11 @@ class ReportsScreen(BaseScreen):
             rows = [dict(r) for r in cash_drawer_module.session_history(self.conn)]
             self._set_columns(["staff_name", "opened_at", "closed_at", "opening_float",
                                 "counted_cash", "expected_cash", "variance"])
+        elif choice == "Stock Take History":
+            rows = stock_take_module.session_history(self.conn)
+            self._set_columns(["category", "staff_name", "started_at", "status",
+                                "lines_counted", "lines_with_variance", "total_variance_value",
+                                "shortfall_value"])
         else:
             rows = reports.waste_summary(self.conn)
             self._set_columns(["name_en", "category", "events", "qty", "value_lost"])
@@ -4468,16 +4715,16 @@ def open_customer_registration_dialog(
 class CustomersScreen(BaseScreen):
     def __init__(self, parent, app):
         super().__init__(parent, app)
-        self.header("Customers & Credit Accounts")
+        self.header("👥 Customers & Credit Accounts", subtitle="Manage loyalty profiles, outstanding credit ledgers, and credit limits")
 
         self.hint = ctk.CTkLabel(
             self, text="", text_color=theme.TEXT_MUTED, font=ctk.CTkFont(size=11),
             wraplength=760, justify="left",
         )
-        self.hint.pack(anchor="w", padx=24, pady=(0, 6))
+        self.hint.pack(anchor="w", padx=12, pady=(0, 6))
 
         top = ctk.CTkFrame(self, fg_color="transparent")
-        top.pack(fill="x", padx=24)
+        top.pack(fill="x", padx=12)
         styled_button(top, "Refresh", self.refresh, kind="secondary").pack(side="left")
         styled_button(top, "Add Customer", self.open_add_dialog, kind="primary").pack(side="left", padx=8)
         styled_button(top, "Settle Credit", self.open_settle_dialog, kind="success").pack(side="left", padx=8)
@@ -4493,7 +4740,7 @@ class CustomersScreen(BaseScreen):
         self.default_limit_btn.pack(side="left", padx=8)
 
         tree_frame = ctk.CTkFrame(self, fg_color="transparent")
-        tree_frame.pack(fill="both", expand=True, padx=24, pady=10)
+        tree_frame.pack(fill="both", expand=True, padx=12, pady=10)
         self.tree = make_treeview(
             tree_frame, ["Name", "Phone", "Credit Limit", "Balance Owed", "Available Credit"],
             {"Name": 200, "Phone": 120, "Credit Limit": 100,
@@ -4746,22 +4993,22 @@ class CustomersScreen(BaseScreen):
 class OffersScreen(BaseScreen):
     def __init__(self, parent, app):
         super().__init__(parent, app)
-        self.header("Offers")
+        self.header("🎁 Promotional Offers & Discounts", subtitle="Configure percentage or fixed-amount discounts across products or categories")
         ctk.CTkLabel(
             self, text="Discounts staff set up on purpose - a product or a whole category, for "
                         "everyone or for loyalty members only. Applied automatically at checkout.\n"
                         "(For automatic near-expiry clearance discounts instead, see Promotions & Expiry.)",
             text_color=theme.TEXT_MUTED, font=ctk.CTkFont(size=11), justify="left",
-        ).pack(anchor="w", padx=24, pady=(0, 8))
+        ).pack(anchor="w", padx=12, pady=(0, 8))
 
         top = ctk.CTkFrame(self, fg_color="transparent")
-        top.pack(fill="x", padx=24)
+        top.pack(fill="x", padx=12)
         styled_button(top, "Refresh", self.refresh, kind="secondary").pack(side="left")
         styled_button(top, "New Offer", self.open_add_dialog, kind="primary").pack(side="left", padx=8)
         styled_button(top, "Turn Off Selected", self.deactivate_selected, kind="danger").pack(side="left", padx=8)
 
         tree_frame = ctk.CTkFrame(self, fg_color="transparent")
-        tree_frame.pack(fill="both", expand=True, padx=24, pady=10)
+        tree_frame.pack(fill="both", expand=True, padx=12, pady=10)
         self.tree = make_treeview(
             tree_frame, ["Name", "Applies To", "Discount", "For", "Starts", "Ends", "Active"],
             {"Name": 150, "Applies To": 170, "Discount": 80, "For": 90, "Starts": 90, "Ends": 90, "Active": 60},
@@ -4933,16 +5180,16 @@ class SuppliersScreen(BaseScreen):
 
     def __init__(self, parent, app):
         super().__init__(parent, app)
-        self.header("Suppliers")
+        self.header("🚚 Supplier Management", subtitle="Track supplier accounts, outstanding purchase balances, and post-dated cheques")
 
         self.hint = ctk.CTkLabel(
             self, text="", text_color=theme.TEXT_MUTED, font=ctk.CTkFont(size=11),
             wraplength=760, justify="left",
         )
-        self.hint.pack(anchor="w", padx=24, pady=(0, 6))
+        self.hint.pack(anchor="w", padx=12, pady=(0, 6))
 
         top = ctk.CTkFrame(self, fg_color="transparent")
-        top.pack(fill="x", padx=24)
+        top.pack(fill="x", padx=12)
         styled_button(top, "Refresh", self.refresh, kind="secondary").pack(side="left")
         styled_button(top, "Add Supplier", self.open_add_dialog, kind="primary").pack(side="left", padx=8)
         styled_button(top, "View Statement", self.open_statement_dialog, kind="secondary").pack(side="left", padx=8)
@@ -4956,7 +5203,7 @@ class SuppliersScreen(BaseScreen):
         self.return_btn.pack(side="left", padx=8)
 
         tree_frame = ctk.CTkFrame(self, fg_color="transparent")
-        tree_frame.pack(fill="both", expand=True, padx=24, pady=10)
+        tree_frame.pack(fill="both", expand=True, padx=12, pady=10)
         self.tree = make_treeview(
             tree_frame, ["Name", "Phone", "Address", "Payable Balance"],
             {"Name": 200, "Phone": 130, "Address": 240, "Payable Balance": 120},
@@ -5248,18 +5495,18 @@ class StaffScreen(BaseScreen):
 
     def __init__(self, parent, app):
         super().__init__(parent, app)
-        self.header("Staff / Cashiers")
+        self.header("👤 Staff & Access Control", subtitle="Manage cashier accounts, role permissions, and access PIN credentials")
 
         self.hint = ctk.CTkLabel(
             self, text="", font=ctk.CTkFont(size=12), text_color=theme.TEXT_MUTED, wraplength=700,
         )
-        self.hint.pack(anchor="w", padx=24, pady=(0, 8))
+        self.hint.pack(anchor="w", padx=12, pady=(0, 8))
 
         # grid, not pack/side="left" - four buttons shrink to fit a narrower
         # window or a scaled-up-DPI screen instead of the last one or two
         # running off the edge.
         top = ctk.CTkFrame(self, fg_color="transparent")
-        top.pack(fill="x", padx=24)
+        top.pack(fill="x", padx=12)
         for col in range(4):
             top.grid_columnconfigure(col, weight=1, uniform="staff_top")
         styled_button(top, "Refresh", self.refresh, kind="secondary").grid(
@@ -5272,7 +5519,7 @@ class StaffScreen(BaseScreen):
         self.toggle_btn.grid(row=0, column=3, sticky="ew", padx=(4, 0))
 
         tree_frame = ctk.CTkFrame(self, fg_color="transparent")
-        tree_frame.pack(fill="both", expand=True, padx=24, pady=10)
+        tree_frame.pack(fill="both", expand=True, padx=12, pady=10)
         self.tree = make_treeview(
             tree_frame, ["Name", "Role", "Status"], {"Name": 220, "Role": 120, "Status": 120},
         )
@@ -5558,7 +5805,7 @@ class NetworkScreen(BaseScreen):
 
     def __init__(self, parent, app):
         super().__init__(parent, app)
-        self.header("Network / Multi-Till")  # stays fixed at the top, outside the scrollable area below
+        self.header("🌐 Network & Multi-Till Sync", subtitle="Connect and synchronize multiple cash registers over local network")  # stays fixed at the top, outside the scrollable area below
 
         # Everything below goes in a scrollable frame, not straight into
         # `self` - this screen has no treeview or other expanding widget to
@@ -5574,10 +5821,10 @@ class NetworkScreen(BaseScreen):
                        "or Wi-Fi both work, this only cares that the tills are on the same network.",
             font=ctk.CTkFont(size=12), text_color=theme.TEXT_MUTED, wraplength=760, justify="left",
         )
-        self.hint.pack(anchor="w", padx=24, pady=(0, 10))
+        self.hint.pack(anchor="w", padx=12, pady=(0, 10))
 
         self.status_card = ctk.CTkFrame(body, fg_color=theme.CARD_BG_ALT, corner_radius=10)
-        self.status_card.pack(fill="x", padx=24, pady=(0, 14))
+        self.status_card.pack(fill="x", padx=12, pady=(0, 14))
         self.status_label = ctk.CTkLabel(
             self.status_card, text="", font=ctk.CTkFont(size=14, weight="bold"),
             text_color=theme.NAVY_DARK, justify="left", wraplength=700,
@@ -5590,7 +5837,7 @@ class NetworkScreen(BaseScreen):
         self.status_detail.pack(anchor="w", padx=16, pady=(0, 14))
 
         btn_row = ctk.CTkFrame(body, fg_color="transparent")
-        btn_row.pack(fill="x", padx=24)
+        btn_row.pack(fill="x", padx=12)
         self.share_btn = styled_button(btn_row, "Share This Till's Data", self.start_sharing, kind="primary")
         self.share_btn.pack(side="left")
         self.stop_share_btn = styled_button(btn_row, "Stop Sharing", self.stop_sharing, kind="danger")
@@ -5605,7 +5852,7 @@ class NetworkScreen(BaseScreen):
         self.disconnect_btn.pack(side="left", padx=8)
 
         warning_card = ctk.CTkFrame(body, fg_color=theme.CARD_BG_ALT, corner_radius=8)
-        warning_card.pack(fill="x", padx=24, pady=(16, 0))
+        warning_card.pack(fill="x", padx=12, pady=(16, 0))
         ctk.CTkLabel(
             warning_card,
             text="One till has to be the \"Main Till\" - the one whose database is the real one - and "
@@ -5825,22 +6072,22 @@ class ActivityLogScreen(BaseScreen):
 
     def __init__(self, parent, app):
         super().__init__(parent, app)
-        self.header("Activity Log")
+        self.header("📋 Security & Audit Trail", subtitle="Inspect system events, staff authorizations, PIN updates, and item alterations")
 
         self.hint = ctk.CTkLabel(
             self, text="", font=ctk.CTkFont(size=12), text_color=theme.TEXT_MUTED, wraplength=760, justify="left",
         )
-        self.hint.pack(anchor="w", padx=24, pady=(0, 8))
+        self.hint.pack(anchor="w", padx=12, pady=(0, 8))
 
         top = ctk.CTkFrame(self, fg_color="transparent")
-        top.pack(fill="x", padx=24)
+        top.pack(fill="x", padx=12)
         self.refresh_btn = styled_button(top, "Refresh", self.refresh, kind="secondary")
         self.refresh_btn.pack(side="left")
         self.notify_btn = styled_button(top, "Notification Settings", self.open_notification_settings, kind="secondary")
         self.notify_btn.pack(side="left", padx=8)
 
         tree_frame = ctk.CTkFrame(self, fg_color="transparent")
-        tree_frame.pack(fill="both", expand=True, padx=24, pady=10)
+        tree_frame.pack(fill="both", expand=True, padx=12, pady=10)
         self.tree = make_treeview(
             tree_frame, self.COLUMNS,
             {"When": 140, "Who": 140, "Role": 80, "Action": 150, "Target": 140, "Details": 160},

@@ -21,9 +21,9 @@ import json
 import ssl
 
 from smartgrocer import (
-    association, cash_drawer, customers, data_generator, db, forecasting, import_products, layout,
+    association, cash_drawer, customers, data_generator, db, forecasting, import_products,
     mobile_scan, netclient, netserver, offers, offline_sync, pos, promotions, rag_insights, receipts,
-    reports, staff, suppliers, weather_sl,
+    reports, staff, suppliers,
 )
 
 
@@ -128,42 +128,25 @@ def test_anomaly_detection_flags_something():
     assert isinstance(anomalies, list)  # not asserting count - depends on random seed/window
 
 
-def test_weather_climatology_covers_every_month():
-    from datetime import date
-    for month in range(1, 13):
-        cat = weather_sl.climatology_category(date(2026, month, 15))
-        assert cat in weather_sl.CATEGORIES
-
-
-def test_weather_log_overrides_climatology():
-    conn = _fresh_db()
-    from datetime import date
-    d = date(2026, 3, 10)  # climatology says "hot" for March
-    assert weather_sl.weather_category(conn, d) == "hot"
-    weather_sl.log_weather(conn, d, "rain")
-    assert weather_sl.weather_category(conn, d) == "rain"
-    # logging again for the same date replaces rather than duplicating
-    weather_sl.log_weather(conn, d, "dry")
-    assert weather_sl.weather_category(conn, d) == "dry"
-    assert conn.execute("SELECT COUNT(*) c FROM weather_log WHERE log_date=?", (d.isoformat(),)).fetchone()["c"] == 1
-
-
-def test_forecast_includes_weather_variant_and_matches_without_conn():
+def test_forecast_includes_festival_variant_and_works_without_conn():
+    # weather_sl.py and the SARIMAX (festival+weather) variant it fed
+    # (Objective 6a) were descoped and removed 22 Oct 2026 - this test
+    # used to also cover that variant; what's left covers what's still
+    # in the app (plain SARIMAX (festival), and conn=None still working).
     conn = _fresh_db()
     p = conn.execute(
         "SELECT p.* FROM products p WHERE p.is_staple=1 ORDER BY RANDOM() LIMIT 1"
     ).fetchone()
     result = forecasting.select_best_model(conn, p["id"])
     assert result["best_model"] is not None
-    # every scored model came from MODEL_REGISTRY, which now includes both
-    # SARIMAX variants when statsmodels is available
+    # every scored model came from MODEL_REGISTRY
     if forecasting.STATSMODELS_AVAILABLE:
         assert any("SARIMAX" in name for name in result["model_scores"])
     # rolling_origin_cv must still work with conn=None (pure pandas, e.g. a
-    # notebook/unit test with no database) - just skips the weather variant
+    # notebook/unit test with no database)
     series = forecasting.daily_sales_series(conn, p["id"])
     scores_no_conn = forecasting.rolling_origin_cv(series, None)
-    assert "SARIMAX (festival+weather)" not in scores_no_conn
+    assert isinstance(scores_no_conn, dict)
 
 
 
@@ -237,14 +220,6 @@ def test_compute_promotions_scales_to_a_real_shops_worth_of_products():
 
     assert len(rows) == 2000
     assert elapsed < 2.0, f"compute_promotions took {elapsed:.2f}s for 2,000 products - looks like the N+1 regressed"
-
-
-def test_layout_assigns_every_active_product():
-    conn = _fresh_db()
-    n_products = conn.execute("SELECT COUNT(*) c FROM products WHERE active=1").fetchone()["c"]
-    assignments = layout.compute_layout(conn)
-    assert len(assignments) == n_products
-    assert all(a["zone"] and a["shelf_tier"] for a in assignments)
 
 
 def test_reports_kpis_do_not_crash():
@@ -854,21 +829,18 @@ def test_rag_insights_generate_covers_every_signal():
     context = {
         "as_of": _date(2026, 4, 10),
         "upcoming_festivals": [{"name": "Sinhala & Tamil New Year", "date": _date(2026, 4, 14), "days_until": 4}],
-        "weather_today": "hot",
-        "weather_sensitive_categories": {"Beverages": 1.3},
         "low_stock": [{"name_en": "Test Item"}],
         "urgent_batches": [{"name": "Yoghurt Cup", "days_to_expiry": 2}],
     }
     cards = rag_insights.generate(context)
     kinds = {c["kind"] for c in cards}
-    assert kinds == {"festival", "weather", "expiry", "stock"}
+    assert kinds == {"festival", "expiry", "stock"}
     assert "Sinhala & Tamil New Year" in next(c["text"] for c in cards if c["kind"] == "festival")
 
 
 def test_rag_insights_generate_falls_back_when_nothing_is_relevant():
     context = {
-        "as_of": None, "upcoming_festivals": [], "weather_today": "dry",
-        "weather_sensitive_categories": {}, "low_stock": [], "urgent_batches": [],
+        "as_of": None, "upcoming_festivals": [], "low_stock": [], "urgent_batches": [],
     }
     cards = rag_insights.generate(context)
     assert len(cards) == 1 and cards[0]["kind"] == "ok"
@@ -981,7 +953,7 @@ def test_rag_answer_question_classifies_and_answers_each_intent():
 
     unknown = rag_insights.answer_question(conn, "how is the weather today")
     assert unknown["intent"] is None
-    assert "not sure exactly what you're asking" in unknown["text"]
+    assert "I don't understand that question yet" in unknown["text"]
     assert "what do I need to buy?" in unknown["text"]
 
 

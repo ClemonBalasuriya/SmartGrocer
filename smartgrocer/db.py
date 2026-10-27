@@ -7,8 +7,11 @@ A single SQLite file is the whole "backend". Schema covers:
  - stock_batches: each goods-received batch, so expiry dates and FIFO stock
    deduction are tracked at the batch level (not just a single stock number).
  - staff / invoices / invoice_items: the POS/checkout side.
- - layout_assignments: last computed planogram, persisted so the GUI can show
-   "current layout" without recomputing every time.
+ - layout_assignments: last computed planogram. The layout-optimisation
+   feature that wrote to this table was removed 22 Oct 2026 (Objective 4
+   was descoped from the research and the feature dropped from the app);
+   the table is kept, unused, in case any already-computed rows matter
+   for historical data - nothing in the app writes to it any more.
 
 Every other module in this package only talks to the database through the
 helpers here (get_conn / init_db) plus plain SQL - there is no ORM, which
@@ -52,8 +55,8 @@ CREATE TABLE IF NOT EXISTS products (
     pack_size       INTEGER NOT NULL DEFAULT 1,
     reorder_level   INTEGER NOT NULL DEFAULT 10,
     is_perishable   INTEGER NOT NULL DEFAULT 0, -- 1/0
-    is_staple       INTEGER NOT NULL DEFAULT 0, -- 1/0, used by layout module
-    child_target    INTEGER NOT NULL DEFAULT 0, -- 1/0, used by layout module
+    is_staple       INTEGER NOT NULL DEFAULT 0, -- 1/0, product editor + demand modelling
+    child_target    INTEGER NOT NULL DEFAULT 0, -- 1/0, product editor + demand modelling
     active          INTEGER NOT NULL DEFAULT 1,
     price_verified  INTEGER NOT NULL DEFAULT 1  -- 0 = price is a placeholder from a bulk
                                                  -- import (import_products.py), not a real
@@ -136,11 +139,11 @@ CREATE TABLE IF NOT EXISTS waste_events (
     reason       TEXT NOT NULL DEFAULT 'expired_unsold'
 );
 
--- One row per date the shop has an ACTUAL observed weather category for
--- (Objective 6's weather-aware forecasting - see weather_sl.py). Any date
--- with no row here falls back to weather_sl.climatology_category(), a
--- fixed Sri Lankan monsoon-season approximation - logging real days here
--- is what lets the SARIMAX-with-weather forecast variant improve on it.
+-- One row per date the shop logged an observed weather category.
+-- weather_sl.py and the SARIMAX-with-weather forecast variant it fed
+-- (Objective 6a) were removed 22 Oct 2026 (descoped from the research and
+-- dropped from the app) - this table is kept, unused, for any already-
+-- logged historical rows; nothing in the app writes to it any more.
 CREATE TABLE IF NOT EXISTS weather_log (
     log_date   TEXT PRIMARY KEY,               -- ISO date
     category   TEXT NOT NULL,                  -- 'rain' | 'dry' | 'hot'
@@ -291,6 +294,34 @@ CREATE TABLE IF NOT EXISTS supplier_returns (
     reason         TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_supplierreturns_supplier ON supplier_returns(supplier_id);
+
+-- Physical stock count sessions, scoped to one category at a time (see
+-- stock_take.py) - the shrinkage/variance report the sample POS system
+-- calls "Stock Take"/"Stock Verification". applied=1 once finish_session
+-- has written the counted numbers back to stock_batches; 0 means the
+-- count was kept as a report only, stock untouched.
+CREATE TABLE IF NOT EXISTS stock_takes (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    staff_id      INTEGER REFERENCES staff(id),
+    category      TEXT NOT NULL,
+    started_at    TEXT NOT NULL,
+    finished_at   TEXT,
+    applied       INTEGER NOT NULL DEFAULT 0,
+    note          TEXT
+);
+
+CREATE TABLE IF NOT EXISTS stock_take_lines (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    stock_take_id   INTEGER NOT NULL REFERENCES stock_takes(id),
+    product_id      INTEGER NOT NULL REFERENCES products(id),
+    system_qty      REAL NOT NULL,
+    counted_qty     REAL NOT NULL,
+    variance        REAL NOT NULL,          -- counted - system
+    unit_cost       REAL NOT NULL,
+    value_variance  REAL NOT NULL           -- variance * unit_cost, at cost price
+);
+CREATE INDEX IF NOT EXISTS idx_stocktakelines_take ON stock_take_lines(stock_take_id);
+CREATE INDEX IF NOT EXISTS idx_stocktakelines_product ON stock_take_lines(product_id);
 
 CREATE INDEX IF NOT EXISTS idx_invitems_product ON invoice_items(product_id);
 CREATE INDEX IF NOT EXISTS idx_invitems_invoice ON invoice_items(invoice_id);

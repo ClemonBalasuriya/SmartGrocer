@@ -29,7 +29,6 @@ import numpy as np
 import pandas as pd
 
 from .calendar_sl import is_festival_window
-from . import weather_sl
 
 try:
     from statsmodels.tsa.statespace.sarimax import SARIMAX
@@ -68,26 +67,15 @@ def build_festival_exog(date_index: pd.DatetimeIndex) -> np.ndarray:
 
 def build_exog_variants(conn: sqlite3.Connection | None, train_index: pd.DatetimeIndex,
                         future_index: pd.DatetimeIndex) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-    """The exogenous-regressor sets Objective 6 evaluates SARIMAX against:
-    festival-calendar alone (the original proposal), and festival+weather
-    (the new event/weather-aware extension - see weather_sl.py). Returning
-    both, keyed by name, lets MODEL_REGISTRY run a SARIMAX variant per set,
-    so the "with vs without the extra regressor" comparison Objective 6
-    calls for falls directly out of the normal per-model nRMSE table
-    instead of needing a separate evaluation path. conn=None (e.g. a plain
-    pandas-only unit test) skips the weather variant and behaves exactly
-    as this module did before Objective 6."""
+    """The exogenous-regressor set SARIMAX (festival) runs against: the
+    Sri Lankan festival calendar (calendar_sl.py). `conn` is accepted for
+    signature compatibility with callers but is currently unused - the
+    weather-aware exogenous variant (Objective 6a) was descoped 22 Oct 2026
+    and removed from the app the same day; this function behaves exactly
+    as it did before that variant was ever added."""
     fest_train = build_festival_exog(train_index)
     fest_future = build_festival_exog(future_index)
-    variants: dict[str, tuple[np.ndarray, np.ndarray]] = {"festival": (fest_train, fest_future)}
-    if conn is not None:
-        weather_train = weather_sl.build_weather_exog(conn, train_index)
-        weather_future = weather_sl.build_weather_exog(conn, future_index)
-        variants["festival_weather"] = (
-            np.hstack([fest_train, weather_train]),
-            np.hstack([fest_future, weather_future]),
-        )
-    return variants
+    return {"festival": (fest_train, fest_future)}
 
 
 # --------------------------------------------------------------------------- #
@@ -180,23 +168,16 @@ def forecast_sarimax(train: pd.Series, horizon: int, exog_train: np.ndarray, exo
 
 
 # Each entry takes (train, horizon, exog) where exog is the dict
-# build_exog_variants() returns - {"festival": (train_arr, future_arr),
-# "festival_weather": (...)}. The two SARIMAX variants below are the
-# Objective 6 with-vs-without-the-weather-regressor comparison: same
-# order, same festival regressor, the only difference is the added
-# weather columns - so a lower nRMSE for the "+weather" row is direct
-# evidence the weather signal helps this product, and a higher/equal one
-# is equally valid evidence that it doesn't, without needing a bespoke
-# experiment outside the normal model-selection pipeline.
+# build_exog_variants() returns - {"festival": (train_arr, future_arr)}.
+# A weather-aware second SARIMAX variant ("festival+weather") used to sit
+# alongside this one (Objective 6a) - descoped and removed 22 Oct 2026,
+# see weather_sl.py's removal note in pprs-25-step-progress-plan.md.
 MODEL_REGISTRY = {
     "Seasonal Naive": lambda train, horizon, exog: forecast_seasonal_naive(train, horizon),
     "Holt-Winters": lambda train, horizon, exog: forecast_holt_winters(train, horizon),
     "SARIMA": lambda train, horizon, exog: forecast_sarima(train, horizon),
     "SARIMAX (festival)": lambda train, horizon, exog: (
         forecast_sarimax(train, horizon, *exog["festival"]) if "festival" in exog else None
-    ),
-    "SARIMAX (festival+weather)": lambda train, horizon, exog: (
-        forecast_sarimax(train, horizon, *exog["festival_weather"]) if "festival_weather" in exog else None
     ),
 }
 
@@ -217,9 +198,9 @@ def rolling_origin_cv(series: pd.Series, conn: sqlite3.Connection | None = None,
                        n_folds: int = 3, min_train: int = 60) -> dict[str, float]:
     """Average nRMSE per model across n_folds walk-forward folds.
     A model missing from the result was unavailable/failed on at least one fold.
-    conn is only used to look up logged weather (weather_sl.py) for the
-    "festival+weather" SARIMAX variant - pass None to skip that variant
-    (e.g. a plain pandas-only unit test with no database)."""
+    conn is accepted for signature compatibility but currently unused (the
+    weather-aware SARIMAX variant that used to need it was descoped and
+    removed 22 Oct 2026)."""
     n = len(series)
     origins = [n - horizon * k for k in range(n_folds, 0, -1)]
     origins = [o for o in origins if o >= min_train]

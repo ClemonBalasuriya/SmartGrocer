@@ -1,8 +1,8 @@
 """
 Synthetic POS transaction history generator.
 
-Why this exists: SmartGrocer's analytics (forecasting, promotions, bundles,
-layout) all need months of real transaction history to be meaningful, but a
+Why this exists: SmartGrocer's analytics (forecasting, promotions, bundles)
+all need months of real transaction history to be meaningful, but a
 brand-new install - or this demo - has none. This module plays the role of
 "a shop that has been trading for ~9 months", so every module can be built,
 demonstrated and marked against realistic numbers. Swap it out once real
@@ -32,7 +32,6 @@ import numpy as np
 from . import customers as customers_module
 from . import db
 from .calendar_sl import festival_multiplier
-from .weather_sl import climatology_category, WEATHER_SENSITIVE_CATEGORIES
 from .catalog import AFFINITY_GROUPS, CATALOG, COLUMNS
 
 RNG_SEED = 42
@@ -156,12 +155,10 @@ def generate_history(
     for day_offset in range(days):
         d = start_date + timedelta(days=day_offset)
         fmult = festival_multiplier(d)
-        # Coarse monsoon-climatology weather boost (Objective 6 - gives the
-        # weather-aware SARIMAX variant a genuine, if modest, signal to find
-        # in the demo data, the same way FESTIVE_CATEGORIES does for the
-        # festival regressor). A real shop's weather_log entries (or a
-        # future weather-API feed) replace this for real evaluation.
-        weather_boost = WEATHER_SENSITIVE_CATEGORIES.get(climatology_category(d), {})
+        # A weather-driven demand boost used to sit alongside the festival
+        # multiplier here (Objective 6a) - descoped and removed 22 Oct
+        # 2026, see weather_sl.py's removal note in
+        # pprs-25-step-progress-plan.md.
         dmult = DOW_MULT[d.weekday()]
         lam = avg_invoices_per_day * fmult * dmult
         # one artificial demand-shock day for the anomaly detector to catch
@@ -185,8 +182,6 @@ def generate_history(
                 w = base_weight[code]
                 if fmult > 1.05 and products[code]["category"] in FESTIVE_CATEGORIES:
                     w *= fmult
-                if products[code]["category"] in weather_boost:
-                    w *= weather_boost[products[code]["category"]]
                 if code in slow_movers and day_offset > days - 30:
                     w *= 0.25
                 weights.append(w)

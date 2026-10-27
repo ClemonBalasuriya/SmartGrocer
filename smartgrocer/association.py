@@ -1,6 +1,11 @@
 """
-SmartGrocer - association rule mining for bundle & layout recommendations
+SmartGrocer - association rule mining for bundle recommendations
 (proposal Objective 3, citing Agrawal & Srikant 1994).
+
+Note: this module originally also fed a planogram/layout-optimisation
+feature (Objective 4). That feature was descoped from the research and
+removed from the app on 22 Oct 2026; this module itself is unaffected and
+continues to power the live Bundles screen.
 
 Implements the classic level-wise Apriori algorithm from scratch (candidate
 generation -> subset pruning -> support counting), rather than depending on
@@ -152,8 +157,13 @@ def get_bundle_recommendations(conn: sqlite3.Connection, min_support: float = 0.
 
 def export_adjacency_pairs(conn: sqlite3.Connection, min_support: float = 0.02,
                             min_lift: float = 1.05) -> list[tuple[int, int, float]]:
-    """(product_id_a, product_id_b, lift) for pair-wise rules - fed into layout.py's
-    high-lift co-location layer."""
+    """(product_id_a, product_id_b, lift) for pair-wise rules.
+
+    Originally fed layout.py's high-lift co-location layer; that feature
+    (Objective 4, store layout optimisation) was descoped and layout.py was
+    removed on 22 Oct 2026, so this function currently has no caller in the
+    app. Left in place in case a future co-location feature wants it -
+    association.py itself is otherwise unaffected and still live."""
     baskets = build_baskets(conn)
     frequent = apriori(baskets, min_support=min_support, max_len=2)
     pairs = []
