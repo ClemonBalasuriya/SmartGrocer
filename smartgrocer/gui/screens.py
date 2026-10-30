@@ -1367,515 +1367,450 @@ class POSScreen(BaseScreen):
     def __init__(self, parent, app):
         super().__init__(parent, app)
 
-        # ---- Professional POS Header (full-width dark bar) ----------------
-        # This replaces the plain header() other screens use - Checkout needs
-        # live status items (cashier name, offline badge, customer) visible
-        # at all times, not just a static title.
-        pos_hdr = ctk.CTkFrame(self, fg_color=theme.CHARCOAL_DARK, corner_radius=0, height=62)
+        # ====================================================================
+        # HEADER BAR — full-width dark bar (no scrolling, always visible)
+        # ====================================================================
+        pos_hdr = ctk.CTkFrame(self, fg_color=theme.CHARCOAL_DARK, corner_radius=0, height=58)
         pos_hdr.pack(fill="x")
         pos_hdr.pack_propagate(False)
 
-        # Left: title + offline badge
+        # Left side: icon + title + offline badge
         hdr_left = ctk.CTkFrame(pos_hdr, fg_color="transparent")
-        hdr_left.pack(side="left", padx=18, pady=12)
-        ctk.CTkLabel(hdr_left, text="🛒  CHECKOUT",
-                     font=ctk.CTkFont(family="Segoe UI", size=16, weight="bold"),
-                     text_color=theme.TEXT_ON_DARK).pack(side="left")
-        self.offline_badge = ctk.CTkLabel(hdr_left, text="",
-                                           font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
-                                           text_color=theme.DANGER_RED)
-        self.offline_badge.pack(side="left", padx=(14, 0))
+        hdr_left.pack(side="left", padx=18, pady=0, fill="y")
+        ctk.CTkLabel(hdr_left, text="🛒",
+                     font=ctk.CTkFont(family="Segoe UI", size=22),
+                     text_color=theme.TEAL).pack(side="left", padx=(0, 8))
+        title_col = ctk.CTkFrame(hdr_left, fg_color="transparent")
+        title_col.pack(side="left")
+        ctk.CTkLabel(title_col, text="POINT OF SALE",
+                     font=ctk.CTkFont(family="Segoe UI", size=15, weight="bold"),
+                     text_color=theme.TEXT_ON_DARK).pack(anchor="w")
+        ctk.CTkLabel(title_col, text="Balasuriya Group · SmartGrocer",
+                     font=ctk.CTkFont(family="Segoe UI", size=9),
+                     text_color="#64748B").pack(anchor="w")
 
-        # Right: modern cashier pill chip
+        self.offline_badge = ctk.CTkLabel(hdr_left, text="",
+                                           font=ctk.CTkFont(family="Segoe UI", size=10, weight="bold"),
+                                           text_color=theme.DANGER_RED)
+        self.offline_badge.pack(side="left", padx=(18, 0))
+
+        # Right side: cashier pill chip
         hdr_right = ctk.CTkFrame(pos_hdr, fg_color=theme.CHARCOAL_MED, corner_radius=20,
                                  border_width=1, border_color=theme.BORDER_DARK)
-        hdr_right.pack(side="right", padx=16, pady=12)
+        hdr_right.pack(side="right", padx=16, pady=10)
         hdr_right_inner = ctk.CTkFrame(hdr_right, fg_color="transparent")
-        hdr_right_inner.pack(padx=14, pady=6)
-        ctk.CTkLabel(hdr_right_inner, text="CASHIER:", font=ctk.CTkFont(family="Segoe UI", size=10, weight="bold"),
-                     text_color="#94A3B8").pack(side="left", padx=(0, 6))
+        hdr_right_inner.pack(padx=14, pady=5)
+        ctk.CTkLabel(hdr_right_inner, text="CASHIER:",
+                     font=ctk.CTkFont(family="Segoe UI", size=9, weight="bold"),
+                     text_color="#64748B").pack(side="left", padx=(0, 6))
         self.cashier_label = ctk.CTkLabel(hdr_right_inner, text="Not logged in",
                                            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
                                            text_color="#CBD5E1")
         self.cashier_label.pack(side="left")
 
-        # Thin teal accent divider under header
+        # Teal accent divider
         ctk.CTkFrame(self, height=2, fg_color=theme.TEAL, corner_radius=0).pack(fill="x")
 
-
+        # ====================================================================
+        # TWO-COLUMN BODY — left (search/input) | right (cart/checkout)
+        # No CTkScrollableFrame as the root container — both panels use
+        # fill+expand inside a grid row. Same split layout as Square / Shopify.
+        # ====================================================================
         self.cart: list[dict] = []
 
+        body_row = ctk.CTkFrame(self, fg_color=theme.BG_MAIN, corner_radius=0)
+        body_row.pack(fill="both", expand=True)
+        body_row.grid_columnconfigure(0, weight=0)   # left panel: fixed width
+        body_row.grid_columnconfigure(1, weight=1)   # right panel: fills rest
+        body_row.grid_rowconfigure(0, weight=1)
 
+        # ====================================================================
+        # LEFT PANEL — product discovery & entry (scrollable)
+        # ====================================================================
+        left_panel = ctk.CTkScrollableFrame(body_row, fg_color=theme.BG_MAIN,
+                                             corner_radius=0, width=490)
+        left_panel.grid(row=0, column=0, sticky="nsew")
+        left_panel.grid_columnconfigure(0, weight=1)
 
-        # Everything below goes in a scrollable frame, not straight into
-        # `self` - this screen has a lot stacked vertically (search/filter
-        # row, results, quick items, the cart, and two rows of action
-        # buttons), and on a smaller screen, a laptop with taskbar/title bar
-        # eating into the usable height, or Windows display scaling above
-        # 100%, that stack is taller than the window. Without a scrollbar
-        # the bottom of it (the Checkout button, Hold/Resume/Return/Phone
-        # Scanner) was simply cut off with no way to reach it at all -
-        # CTkScrollableFrame fixes that regardless of how small the window
-        # or screen ends up being.
-        body = ctk.CTkScrollableFrame(self, fg_color="transparent")
-        body.pack(fill="both", expand=True)
-
-        # ---- Search card -------------------------------------------------
-        # Search/find-an-item lives right at the top of the screen - the first
-        # thing a cashier reaches the moment this screen opens, so a scan or
-        # typed search can start immediately. The barcode/name boxes further down
-        # (right above the checkout list) are a second, quicker entry point
-        # once a sale is already under way.
-        search_card = ctk.CTkFrame(body, fg_color=theme.CARD_BG, corner_radius=10,
+        # ── PRODUCT SEARCH CARD ──────────────────────────────────────────────
+        search_card = ctk.CTkFrame(left_panel, fg_color=theme.CARD_BG, corner_radius=12,
                                     border_width=1, border_color=theme.BORDER)
-        search_card.pack(fill="x", padx=12, pady=(10, 0))
+        search_card.pack(fill="x", padx=12, pady=(12, 0))
 
-        search_hdr = ctk.CTkFrame(search_card, fg_color=theme.CHARCOAL_DARK, corner_radius=0)
+        search_hdr = ctk.CTkFrame(search_card, fg_color=theme.CHARCOAL_MED, corner_radius=0,
+                                   height=36)
         search_hdr.pack(fill="x")
+        search_hdr.pack_propagate(False)
         ctk.CTkLabel(search_hdr, text="🔍  PRODUCT SEARCH",
-                     font=ctk.CTkFont(size=11, weight="bold"),
-                     text_color=theme.TEXT_ON_DARK).pack(side="left", padx=14, pady=8)
+                     font=ctk.CTkFont(family="Segoe UI", size=10, weight="bold"),
+                     text_color=theme.TEXT_ON_DARK).pack(side="left", padx=14, pady=0, fill="y")
 
-        search_row = ctk.CTkFrame(search_card, fg_color="transparent")
-        search_row.pack(fill="x", padx=12, pady=10)
+        search_body = ctk.CTkFrame(search_card, fg_color="transparent")
+        search_body.pack(fill="x", padx=12, pady=10)
 
-        ctk.CTkLabel(search_row, text="Scan / Search:", text_color=theme.TEXT_MUTED,
-                     font=ctk.CTkFont(size=11)).grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(search_body, text="Scan / Search:", text_color=theme.TEXT_MUTED,
+                     font=ctk.CTkFont(family="Segoe UI", size=10)).grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(search_body, text="Category:", text_color=theme.TEXT_MUTED,
+                     font=ctk.CTkFont(family="Segoe UI", size=10)).grid(row=0, column=1, padx=(12, 0), sticky="w")
+
         self.search_var = tk.StringVar()
-        self.search_entry = ctk.CTkEntry(search_row, textvariable=self.search_var, width=280,
-                                          height=34, corner_radius=6,
-                                          placeholder_text="Barcode or product name…")
-        self.search_entry.grid(row=1, column=0, sticky="w")
+        self.search_entry = ctk.CTkEntry(search_body, textvariable=self.search_var, width=220,
+                                          height=34, corner_radius=8,
+                                          placeholder_text="Barcode or product name\u2026",
+                                          font=ctk.CTkFont(family="Segoe UI", size=11))
+        self.search_entry.grid(row=1, column=0, sticky="ew")
         self.search_entry.bind("<Return>", lambda e: self.do_search())
-        # Live-as-you-type: fires on every keystroke (not just Enter/Search),
-        # so the results list below fills in with whatever matches the
-        # letters typed so far - a cashier doesn't have to finish typing or
-        # press anything to see candidates. Debounced (see
-        # _on_search_changed) rather than querying on every single
-        # keystroke, since a barcode scanner "types" a whole code far
-        # faster than anyone could by hand.
+
         self._search_debounce_id: str | None = None
         self.search_var.trace_add("write", lambda *a: self._on_search_changed())
-        # Remembers that this box had the cursor last, out of every input
-        # on this screen a scan could plausibly land in - see
-        # _route_scanned_code, which the one "Link Phone Scanner" button
-        # (in the sidebar) now routes every scan through instead of each
-        # box needing its own separate "Scan with Phone" button.
         self.search_entry.bind("<FocusIn>", lambda e: self._mark_focus("search"))
-        # <FocusIn> alone turned out not to be trustworthy enough to base
-        # scanner routing on - cashiers reported a scan still landing in
-        # the "Add item - barcode" box even right after clicking into
-        # this one. A plain mouse click or a keystroke landing in this
-        # box is about as certain a signal as Tkinter offers that this is
-        # genuinely the box in use right now, so both are wired to the
-        # same flag as a second, independent way of catching it (add="+"
-        # so this doesn't replace the <FocusIn> binding above, and
-        # <Button-1>/<KeyRelease> because a widget always gets its own
-        # literal click/keystroke, unlike focus-change notifications).
         self.search_entry.bind("<Button-1>", lambda e: self._mark_focus("search"), add="+")
         self.search_entry.bind("<KeyRelease>", lambda e: self._mark_focus("search"), add="+")
-        # No separate Search button - typing already searches live
-        # (_on_search_changed, bound to search_var's trace below), and
-        # Enter still runs do_search directly for a scanner's Enter/wedge
-        # keystroke, so the button was a redundant extra click/target.
 
-        ctk.CTkLabel(search_row, text="Category:", text_color=theme.TEXT_MUTED,
-                     font=ctk.CTkFont(size=11)).grid(row=0, column=1, padx=(16, 0), sticky="w")
         self.category_var = tk.StringVar(value="All categories")
         self.category_menu = SearchableDropdown(
-            search_row, values=["All categories"], variable=self.category_var, width=160, label="Category")
-        self.category_menu.grid(row=1, column=1, padx=(16, 0))
-        # Picking a category re-runs the live search immediately (same as
-        # typing a letter) so it narrows/filters what's already been typed,
-        # rather than waiting for another keystroke.
+            search_body, values=["All categories"], variable=self.category_var,
+            width=150, label="Category")
+        self.category_menu.grid(row=1, column=1, padx=(12, 0), sticky="ew")
         self.category_var.trace_add("write", lambda *a: self._on_search_changed())
 
-        # Qty + Add button in the same row, on the right
-        ctk.CTkLabel(search_row, text="Qty:", text_color=theme.TEXT_MUTED,
-                     font=ctk.CTkFont(size=11)).grid(row=0, column=2, padx=(16, 0), sticky="w")
+        ctk.CTkLabel(search_body, text="Qty:", text_color=theme.TEXT_MUTED,
+                     font=ctk.CTkFont(family="Segoe UI", size=10)).grid(row=2, column=0, sticky="w", pady=(8, 0))
+        qty_row = ctk.CTkFrame(search_body, fg_color="transparent")
+        qty_row.grid(row=3, column=0, columnspan=2, sticky="ew")
         self.qty_var = tk.StringVar(value="1")
-        ctk.CTkEntry(search_row, textvariable=self.qty_var, width=60, height=34,
-                     corner_radius=6).grid(row=1, column=2, padx=(16, 0), sticky="w")
-        styled_button(search_row, "＋ Add to Cart", self.add_selected_to_cart,
-                      kind="primary", height=34, width=130).grid(row=1, column=3, padx=(10, 0), sticky="w")
+        ctk.CTkEntry(qty_row, textvariable=self.qty_var, width=70, height=34,
+                     corner_radius=8, font=ctk.CTkFont(family="Segoe UI", size=11)).pack(side="left")
+        styled_button(qty_row, "\uff0b  Add to Cart", self.add_selected_to_cart,
+                      kind="primary", height=34, width=160,
+                      font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold")).pack(side="left", padx=(10, 0))
 
-        # A quiet inline "not found" label (not a modal popup) - a popup is a
-        # modal dialog that steals the keyboard/mouse and brings a continuous
-        # scanning session to a dead stop the moment ONE scanned code doesn't
-        # match anything. This label says the same thing without blocking.
+        search_body.grid_columnconfigure(0, weight=1)
+        search_body.grid_columnconfigure(1, weight=1)
+
         self.search_status_label = ctk.CTkLabel(
-            search_card, text="", text_color=theme.DANGER_RED, font=ctk.CTkFont(size=11),
-            wraplength=560, justify="left",
-        )
+            search_card, text="", text_color=theme.DANGER_RED,
+            font=ctk.CTkFont(family="Segoe UI", size=10),
+            wraplength=440, justify="left")
         self.search_status_label.pack(fill="x", padx=14, pady=(0, 4), anchor="w")
 
-        # Search results compact table
-        results_card_inner = ctk.CTkFrame(search_card, fg_color=theme.BG_MAIN, corner_radius=6)
-        results_card_inner.pack(fill="x", padx=12, pady=(0, 12))
+        results_wrap = ctk.CTkFrame(search_card, fg_color=theme.BG_MAIN, corner_radius=8)
+        results_wrap.pack(fill="x", padx=12, pady=(0, 12))
         self.results_tree = make_treeview(
-            results_card_inner, ["Code", "Name", "Cash Price", "Stock"],
-            {"Code": 90, "Name": 300, "Cash Price": 100, "Stock": 80},
-            rows=5,
-        )
-        # .configure(height=...) alone doesn't stick here: by default a
-        # frame resizes itself to fit whatever its own children ask for
-        # (grid_propagate defaults to True), so the treeview's own natural
-        # height silently overrode the 140px request - this box was meant
-        # to be a compact 5-row search-results list, not one stretching to
-        # fill most of the window. grid_propagate(False) makes the
-        # requested height actually stick, and it now scrolls internally
-        # (make_treeview's own scrollbar) once live search fills it with
-        # more matches than fit in those 5 rows.
-        self.results_tree.master_frame.configure(height=140)
+            results_wrap, ["Code", "Name", "Cash Price", "Stock"],
+            {"Code": 80, "Name": 210, "Cash Price": 90, "Stock": 70},
+            rows=5)
+        self.results_tree.master_frame.configure(height=130)
         self.results_tree.master_frame.grid_propagate(False)
         self.results_tree.master_frame.pack(fill="x")
         self.results_tree.bind("<Double-1>", lambda e: self.add_selected_to_cart())
 
         self._search_results: list = []
 
-
-
-        # ---- Sale Settings card (Tier / Payment / Customer) ---------------
-        # Per-sale settings (tier/payment/customer) - things you set once and
-        # rarely touch again mid-sale. Customer lookup moved here from the old
-        # search row - who's serving and who's being served sit together.
-        sale_card = ctk.CTkFrame(body, fg_color=theme.CARD_BG, corner_radius=10,
+        # ── SALE SETTINGS CARD ──────────────────────────────────────────────
+        sale_card = ctk.CTkFrame(left_panel, fg_color=theme.CARD_BG, corner_radius=12,
                                   border_width=1, border_color=theme.BORDER)
         sale_card.pack(fill="x", padx=12, pady=(10, 0))
 
-        sale_hdr = ctk.CTkFrame(sale_card, fg_color=theme.CHARCOAL_DARK, corner_radius=0)
+        sale_hdr = ctk.CTkFrame(sale_card, fg_color=theme.CHARCOAL_MED, corner_radius=0, height=36)
         sale_hdr.pack(fill="x")
-        ctk.CTkLabel(sale_hdr, text="⚙  SALE SETTINGS",
-                     font=ctk.CTkFont(size=11, weight="bold"),
-                     text_color=theme.TEXT_ON_DARK).pack(side="left", padx=14, pady=8)
+        sale_hdr.pack_propagate(False)
+        ctk.CTkLabel(sale_hdr, text="\u2699  SALE SETTINGS",
+                     font=ctk.CTkFont(family="Segoe UI", size=10, weight="bold"),
+                     text_color=theme.TEXT_ON_DARK).pack(side="left", padx=14, fill="y")
 
-        top = ctk.CTkFrame(sale_card, fg_color="transparent")
-        top.pack(fill="x", padx=12, pady=10)
+        sale_body = ctk.CTkFrame(sale_card, fg_color="transparent")
+        sale_body.pack(fill="x", padx=12, pady=10)
 
-        ctk.CTkLabel(top, text="Price Tier:", text_color=theme.TEXT_MUTED,
-                     font=ctk.CTkFont(size=11)).grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(sale_body, text="Price Tier:", text_color=theme.TEXT_MUTED,
+                     font=ctk.CTkFont(family="Segoe UI", size=10)).grid(row=0, column=0, sticky="w")
         self.tier_var = tk.StringVar(value="cash")
-        ctk.CTkOptionMenu(top, values=["cash", "credit", "wholesale"], variable=self.tier_var,
+        ctk.CTkOptionMenu(sale_body, values=["cash", "credit", "wholesale"], variable=self.tier_var,
                           height=32, fg_color=theme.BG_MAIN, text_color=theme.TEXT_DARK,
                           button_color=theme.TEAL, button_hover_color=theme.TEAL_HOVER,
-                          corner_radius=6).grid(row=1, column=0)
+                          corner_radius=6, font=ctk.CTkFont(family="Segoe UI", size=10),
+                          dropdown_font=ctk.CTkFont(family="Segoe UI", size=10)
+                          ).grid(row=1, column=0, sticky="ew")
 
-        ctk.CTkLabel(top, text="Payment:", text_color=theme.TEXT_MUTED,
-                     font=ctk.CTkFont(size=11)).grid(row=0, column=1, padx=(16, 0), sticky="w")
+        ctk.CTkLabel(sale_body, text="Payment:", text_color=theme.TEXT_MUTED,
+                     font=ctk.CTkFont(family="Segoe UI", size=10)).grid(row=0, column=1, padx=(12, 0), sticky="w")
         self.payment_var = tk.StringVar(value="cash")
-        ctk.CTkOptionMenu(top, values=["cash", "card", "cheque", "credit", "split"],
+        ctk.CTkOptionMenu(sale_body, values=["cash", "card", "cheque", "credit", "split"],
                           variable=self.payment_var, height=32,
                           fg_color=theme.BG_MAIN, text_color=theme.TEXT_DARK,
                           button_color=theme.TEAL, button_hover_color=theme.TEAL_HOVER,
-                          corner_radius=6).grid(row=1, column=1, padx=(16, 0))
+                          corner_radius=6, font=ctk.CTkFont(family="Segoe UI", size=10),
+                          dropdown_font=ctk.CTkFont(family="Segoe UI", size=10)
+                          ).grid(row=1, column=1, padx=(12, 0), sticky="ew")
 
-        # One box does the whole job of attaching a customer to this sale -
-        # a phone number IS their loyalty ID (see customers.py). Type a
-        # number and press Enter (live suggestions drop down as you type -
-        # no separate Search button needed any more) to identify them -
-        # their name then appears right next to the box, inline, in
-        # customer_found_label. Leave it blank for an anonymous Walk-in
-        # sale, which is the default.
-        ctk.CTkLabel(top, text="Customer (phone):", text_color=theme.TEXT_MUTED,
-                     font=ctk.CTkFont(size=11)).grid(row=0, column=2, padx=(16, 0), sticky="w")
-        customer_lookup_row = ctk.CTkFrame(top, fg_color="transparent")
-        customer_lookup_row.grid(row=1, column=2, padx=(16, 0), sticky="w")
+        ctk.CTkLabel(sale_body, text="Customer (phone):", text_color=theme.TEXT_MUTED,
+                     font=ctk.CTkFont(family="Segoe UI", size=10)).grid(row=2, column=0, columnspan=2,
+                                                                          sticky="w", pady=(8, 0))
+        cust_row = ctk.CTkFrame(sale_body, fg_color="transparent")
+        cust_row.grid(row=3, column=0, columnspan=2, sticky="ew")
         self.customer_lookup_var = tk.StringVar()
-        self.customer_lookup_entry = ctk.CTkEntry(customer_lookup_row,
-                                                   textvariable=self.customer_lookup_var,
-                                                   width=160, height=32, corner_radius=6,
-                                                   placeholder_text="Phone number…")
+        self.customer_lookup_entry = ctk.CTkEntry(cust_row, textvariable=self.customer_lookup_var,
+                                                   width=160, height=32, corner_radius=8,
+                                                   placeholder_text="Phone number\u2026",
+                                                   font=ctk.CTkFont(family="Segoe UI", size=11))
         self.customer_lookup_entry.pack(side="left")
         self.customer_lookup_entry.bind("<Return>", lambda e: self.identify_customer(self.customer_lookup_var.get()))
         self.customer_lookup_entry.bind("<FocusIn>", lambda e: self._mark_focus("customer"))
-        # See the matching comment on search_entry above - <FocusIn> alone
-        # wasn't reliable enough for scanner routing, so a click or a
-        # keystroke landing here also marks it as the current box.
-        self.customer_lookup_entry.bind(
-            "<Button-1>", lambda e: self._mark_focus("customer"), add="+")
-        self.customer_lookup_entry.bind(
-            "<KeyRelease>", lambda e: self._mark_focus("customer"), add="+")
-        # Right next to the box, not below it - the moment a phone number
-        # resolves to someone, their name appears here immediately, same
-        # row, no separate loyalty tag alongside it (whether the sale
-        # counts as a loyalty sale is still tracked internally via
-        # _current_is_loyalty() for offer pricing - it just isn't its own
-        # label on screen any more).
-        self.customer_found_label = ctk.CTkLabel(customer_lookup_row, text="Walk-in",
-                                                  font=ctk.CTkFont(size=12, weight="bold"),
+        self.customer_lookup_entry.bind("<Button-1>", lambda e: self._mark_focus("customer"), add="+")
+        self.customer_lookup_entry.bind("<KeyRelease>", lambda e: self._mark_focus("customer"), add="+")
+
+        self.customer_found_label = ctk.CTkLabel(cust_row, text="Walk-in",
+                                                  font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
                                                   text_color=theme.TEXT_MUTED)
         self.customer_found_label.pack(side="left", padx=(10, 0))
-        # Live suggestions as digits (or a name) go in - matching customers
-        # drop down right below, phone-prefix matches first; picking one
-        # identifies them immediately, same as typing the full number and
-        # pressing Enter would. min_chars=0 (rather than the usual 1) so
-        # this also opens on a plain click into an still-empty box,
-        # showing "Walk-in" as a default, explicit option to pick - the
-        # same reset Enter-on-an-empty-box already does, just discoverable
-        # without needing to know that shortcut.
+
         def _customer_suggestions(q: str):
             if not q:
-                return [("🚶 Walk-in (not a loyalty customer)", None)]
-            return [(f"{c['phone']} — {c['name']}", c) for c in customers_module.search_customers(self.conn, q)]
+                return [("\U0001f6b6 Walk-in (not a loyalty customer)", None)]
+            return [(f"{c['phone']} \u2014 {c['name']}", c) for c in customers_module.search_customers(self.conn, q)]
 
         def _on_customer_suggestion(payload):
             self.identify_customer(payload["phone"] if payload is not None else "")
 
-        # Kept as an attribute (unlike the other SuggestionBox instances
-        # below) so code elsewhere on this screen that resets this box's
-        # text from OUTSIDE normal typing can call
-        # customer_suggestion_box.suppress_next_change() first - see that
-        # method's own docstring for why that's needed here specifically.
         self.customer_suggestion_box = SuggestionBox(
             self.customer_lookup_entry, self.customer_lookup_var,
-            fetch_fn=_customer_suggestions, on_select=_on_customer_suggestion, min_chars=0,
-        )
+            fetch_fn=_customer_suggestions, on_select=_on_customer_suggestion, min_chars=0)
 
-        # Internal state only - not shown as a widget of its own any more.
-        # Tracks whichever customer (by name) is currently attached to the
-        # sale; identify_customer() sets it after a successful phone
-        # lookup, "Walk-in" otherwise. Recompute the cart's offer discounts
-        # the moment it changes - a loyalty-only offer switches on/off with
-        # it, so a line added before the customer was identified needs
-        # re-pricing too, not just lines added afterward.
         self.customer_var = tk.StringVar(value="Walk-in")
         self.customer_var.trace_add("write", lambda *a: self._on_customer_changed())
 
-        # Cashier label is now in the POS header bar (pos_hdr / hdr_right),
-        # no longer duplicated in the `top` sale-settings row.
+        sale_body.grid_columnconfigure(0, weight=1)
+        sale_body.grid_columnconfigure(1, weight=1)
 
-        # ---- Quick Items panel (top sellers / customer favourites) ---------
-        quick_card = ctk.CTkFrame(body, fg_color=theme.CARD_BG, corner_radius=10,
+        # ── QUICK ADD CARD ───────────────────────────────────────────────────
+        quick_card = ctk.CTkFrame(left_panel, fg_color=theme.CARD_BG, corner_radius=12,
                                    border_width=1, border_color=theme.BORDER)
         quick_card.pack(fill="x", padx=12, pady=(10, 0))
-        qi_hdr = ctk.CTkFrame(quick_card, fg_color=theme.CHARCOAL_DARK, corner_radius=0)
+
+        qi_hdr = ctk.CTkFrame(quick_card, fg_color=theme.CHARCOAL_MED, corner_radius=0, height=36)
         qi_hdr.pack(fill="x")
-        ctk.CTkLabel(qi_hdr, text="⚡  QUICK ADD",
-                     font=ctk.CTkFont(size=11, weight="bold"),
-                     text_color=theme.TEXT_ON_DARK).pack(side="left", padx=14, pady=8)
+        qi_hdr.pack_propagate(False)
+        ctk.CTkLabel(qi_hdr, text="\u26a1  QUICK ADD  \u2014  Top Sellers",
+                     font=ctk.CTkFont(family="Segoe UI", size=10, weight="bold"),
+                     text_color=theme.TEXT_ON_DARK).pack(side="left", padx=14, fill="y")
+
         self.quick_items_frame = ctk.CTkFrame(quick_card, fg_color="transparent")
-        self.quick_items_frame.pack(fill="x", padx=12, pady=10)
+        self.quick_items_frame.pack(fill="x", padx=10, pady=10)
         self.tier_var.trace_add("write", lambda *a: self._refresh_quick_items())
 
-
-
-        # ---- Add Item card (barcode / name direct entry) ------------------
-        # A second way to add an item, right above the checkout list itself
-        # rather than at the search box at the top of the screen - two
-        # separate, dedicated boxes (barcode, and item name) rather than
-        # one box guessing which of the two you meant, each with its own
-        # live suggestion dropdown (SuggestionBox) so a cashier can either
-        # finish typing/scanning an exact value or just pick a match off
-        # the list. One shared Qty and "Add" apply to whichever of the two
-        # currently has something typed in it.
-        add_card = ctk.CTkFrame(body, fg_color=theme.CARD_BG, corner_radius=10,
+        # ── ADD ITEM DIRECTLY CARD ───────────────────────────────────────────
+        add_card = ctk.CTkFrame(left_panel, fg_color=theme.CARD_BG, corner_radius=12,
                                  border_width=1, border_color=theme.BORDER)
-        add_card.pack(fill="x", padx=12, pady=(10, 0))
-        add_hdr = ctk.CTkFrame(add_card, fg_color=theme.CHARCOAL_DARK, corner_radius=0)
+        add_card.pack(fill="x", padx=12, pady=(10, 12))
+
+        add_hdr = ctk.CTkFrame(add_card, fg_color=theme.CHARCOAL_MED, corner_radius=0, height=36)
         add_hdr.pack(fill="x")
-        ctk.CTkLabel(add_hdr, text="📥  ADD ITEM DIRECTLY",
-                     font=ctk.CTkFont(size=11, weight="bold"),
-                     text_color=theme.TEXT_ON_DARK).pack(side="left", padx=14, pady=8)
+        add_hdr.pack_propagate(False)
+        ctk.CTkLabel(add_hdr, text="\U0001f4e5  ADD ITEM DIRECTLY",
+                     font=ctk.CTkFont(family="Segoe UI", size=10, weight="bold"),
+                     text_color=theme.TEXT_ON_DARK).pack(side="left", padx=14, fill="y")
 
-        add_item_row = ctk.CTkFrame(add_card, fg_color="transparent")
-        add_item_row.pack(fill="x", padx=12, pady=10)
+        add_body = ctk.CTkFrame(add_card, fg_color="transparent")
+        add_body.pack(fill="x", padx=12, pady=10)
 
-        ctk.CTkLabel(add_item_row, text="Barcode:", text_color=theme.TEXT_MUTED,
-                     font=ctk.CTkFont(size=11)).grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(add_body, text="Barcode:", text_color=theme.TEXT_MUTED,
+                     font=ctk.CTkFont(family="Segoe UI", size=10)).grid(row=0, column=0, sticky="w")
         self.cart_add_barcode_var = tk.StringVar()
-        self.cart_add_barcode_entry = ctk.CTkEntry(add_item_row, textvariable=self.cart_add_barcode_var,
-                                                    width=160, height=32, corner_radius=6)
-        self.cart_add_barcode_entry.grid(row=1, column=0, sticky="w")
+        self.cart_add_barcode_entry = ctk.CTkEntry(add_body, textvariable=self.cart_add_barcode_var,
+                                                    width=130, height=32, corner_radius=8,
+                                                    font=ctk.CTkFont(family="Segoe UI", size=11))
+        self.cart_add_barcode_entry.grid(row=1, column=0, sticky="ew")
         self.cart_add_barcode_entry.bind("<Return>", lambda e: self.add_item_by_barcode())
         self.cart_add_barcode_entry.bind("<FocusIn>", lambda e: self._mark_focus("barcode"))
-        # See the matching comment on search_entry above.
-        self.cart_add_barcode_entry.bind(
-            "<Button-1>", lambda e: self._mark_focus("barcode"), add="+")
-        self.cart_add_barcode_entry.bind(
-            "<KeyRelease>", lambda e: self._mark_focus("barcode"), add="+")
+        self.cart_add_barcode_entry.bind("<Button-1>", lambda e: self._mark_focus("barcode"), add="+")
+        self.cart_add_barcode_entry.bind("<KeyRelease>", lambda e: self._mark_focus("barcode"), add="+")
         SuggestionBox(
             self.cart_add_barcode_entry, self.cart_add_barcode_var,
-            fetch_fn=lambda q: [(f"{p['code']} — {p['name_en']}", p) for p in pos.search_products_by_code(self.conn, q)],
-            on_select=self._add_product_from_suggestion(self.cart_add_barcode_entry),
-        )
+            fetch_fn=lambda q: [(f"{p['code']} \u2014 {p['name_en']}", p) for p in pos.search_products_by_code(self.conn, q)],
+            on_select=self._add_product_from_suggestion(self.cart_add_barcode_entry))
 
-        ctk.CTkLabel(add_item_row, text="Item Name:", text_color=theme.TEXT_MUTED,
-                     font=ctk.CTkFont(size=11)).grid(row=0, column=1, padx=(16, 0), sticky="w")
+        ctk.CTkLabel(add_body, text="Item Name:", text_color=theme.TEXT_MUTED,
+                     font=ctk.CTkFont(family="Segoe UI", size=10)).grid(row=0, column=1, padx=(12, 0), sticky="w")
         self.cart_add_name_var = tk.StringVar()
-        self.cart_add_name_entry = ctk.CTkEntry(add_item_row, textvariable=self.cart_add_name_var,
-                                                 width=200, height=32, corner_radius=6)
-        self.cart_add_name_entry.grid(row=1, column=1, padx=(16, 0), sticky="w")
+        self.cart_add_name_entry = ctk.CTkEntry(add_body, textvariable=self.cart_add_name_var,
+                                                 width=150, height=32, corner_radius=8,
+                                                 font=ctk.CTkFont(family="Segoe UI", size=11))
+        self.cart_add_name_entry.grid(row=1, column=1, padx=(12, 0), sticky="ew")
         self.cart_add_name_entry.bind("<Return>", lambda e: self.add_item_by_name())
         self.cart_add_name_entry.bind("<FocusIn>", lambda e: self._mark_focus("name"))
-        # See the matching comment on search_entry above.
-        self.cart_add_name_entry.bind(
-            "<Button-1>", lambda e: self._mark_focus("name"), add="+")
-        self.cart_add_name_entry.bind(
-            "<KeyRelease>", lambda e: self._mark_focus("name"), add="+")
+        self.cart_add_name_entry.bind("<Button-1>", lambda e: self._mark_focus("name"), add="+")
+        self.cart_add_name_entry.bind("<KeyRelease>", lambda e: self._mark_focus("name"), add="+")
         SuggestionBox(
             self.cart_add_name_entry, self.cart_add_name_var,
             fetch_fn=lambda q: [(f"{p['name_en']} ({p['code']})", p) for p in pos.search_products(self.conn, q)],
-            on_select=self._add_product_from_suggestion(self.cart_add_name_entry),
-        )
+            on_select=self._add_product_from_suggestion(self.cart_add_name_entry))
 
-        ctk.CTkLabel(add_item_row, text="Qty:", text_color=theme.TEXT_MUTED,
-                     font=ctk.CTkFont(size=11)).grid(row=0, column=2, padx=(16, 0), sticky="w")
+        ctk.CTkLabel(add_body, text="Qty:", text_color=theme.TEXT_MUTED,
+                     font=ctk.CTkFont(family="Segoe UI", size=10)).grid(row=0, column=2, padx=(12, 0), sticky="w")
         self.cart_add_qty_var = tk.StringVar(value="1")
-        ctk.CTkEntry(add_item_row, textvariable=self.cart_add_qty_var, width=60,
-                     height=32, corner_radius=6).grid(row=1, column=2, padx=(16, 0), sticky="w")
-        styled_button(add_item_row, "＋ Add", self._add_item_from_whichever_box_has_text,
-                      kind="primary", height=32, width=90).grid(row=1, column=3, padx=(10, 0), sticky="w")
+        ctk.CTkEntry(add_body, textvariable=self.cart_add_qty_var, width=50,
+                     height=32, corner_radius=8,
+                     font=ctk.CTkFont(family="Segoe UI", size=11)).grid(row=1, column=2, padx=(12, 0), sticky="ew")
+        styled_button(add_body, "\uff0b Add", self._add_item_from_whichever_box_has_text,
+                      kind="primary", height=32, width=70,
+                      font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold")
+                      ).grid(row=1, column=3, padx=(8, 0), sticky="ew")
 
-        # Same reasoning as search_status_label above - a "not found" here
-        # is exactly as likely to come from a continuous scanning session
-        # as the top search box is (this pair is what a scan lands in
-        # once the cashier's already clicked into one of them for this
-        # sale), so it gets the same non-blocking treatment instead of a
-        # popup that would stop every scan after it cold.
         self.cart_add_status_label = ctk.CTkLabel(
-            add_item_row, text="", text_color=theme.DANGER_RED, font=ctk.CTkFont(size=11),
-            wraplength=560, justify="left",
-        )
+            add_body, text="", text_color=theme.DANGER_RED,
+            font=ctk.CTkFont(family="Segoe UI", size=10),
+            wraplength=440, justify="left")
         self.cart_add_status_label.grid(row=2, column=0, columnspan=4, sticky="w", pady=(4, 0))
-        # add_item_by_barcode/add_item_by_name only clear this label when
-        # THEY run (Enter, the Add button, or a scan landing here) - typing
-        # or deleting text without triggering either of those (e.g.
-        # clearing the box by hand after a "Not found" line appeared, or
-        # just backspacing it out) left a stale message sitting there with
-        # nothing left in the box to explain it, reported directly. These
 
-        # traces clear it on every change to either box - typed, deleted,
-        # or a suggestion picked - same as search_var's own trace already
-        # does for search_status_label above; no debounce needed since
-        # clearing a label is free, unlike that box's live results query.
         self.cart_add_barcode_var.trace_add("write", self._on_cart_add_changed)
         self.cart_add_name_var.trace_add("write", self._on_cart_add_changed)
 
-        # ---- Cart card (bordered) ----------------------------------------
-        # fill="both" WITHOUT expand=True: inside a CTkScrollableFrame, "expand"
-        # fights the scrollbar's own content sizing. Fixed row count + internal
-        # scrollbar keeps height predictable.
-        cart_card = ctk.CTkFrame(body, fg_color=theme.CARD_BG, corner_radius=10,
+        add_body.grid_columnconfigure(0, weight=2)
+        add_body.grid_columnconfigure(1, weight=3)
+        add_body.grid_columnconfigure(2, weight=1)
+        add_body.grid_columnconfigure(3, weight=1)
+
+        # ====================================================================
+        # RIGHT PANEL — cart + checkout (fills remaining horizontal space)
+        # ====================================================================
+        right_panel = ctk.CTkFrame(body_row, fg_color=theme.BG_MAIN, corner_radius=0)
+        right_panel.grid(row=0, column=1, sticky="nsew")
+        right_panel.grid_rowconfigure(0, weight=1)   # cart treeview grows with window
+        right_panel.grid_rowconfigure(1, weight=0)   # edit-qty strip
+        right_panel.grid_rowconfigure(2, weight=0)   # summary checkout bar
+        right_panel.grid_rowconfigure(3, weight=0)   # action buttons row
+        right_panel.grid_columnconfigure(0, weight=1)
+
+        # ── CART CARD (fills available height) ──────────────────────────────
+        cart_card = ctk.CTkFrame(right_panel, fg_color=theme.CARD_BG, corner_radius=12,
                                   border_width=1, border_color=theme.BORDER)
-        cart_card.pack(fill="both", padx=12, pady=(8, 0))
+        cart_card.grid(row=0, column=0, sticky="nsew", padx=10, pady=(12, 0))
+        cart_card.grid_rowconfigure(1, weight=1)
+        cart_card.grid_columnconfigure(0, weight=1)
 
-        cart_hdr = ctk.CTkFrame(cart_card, fg_color=theme.CHARCOAL_DARK, corner_radius=0)
-        cart_hdr.pack(fill="x")
-        ctk.CTkLabel(cart_hdr, text="🛒  CART ITEMS",
-                     font=ctk.CTkFont(size=11, weight="bold"),
-                     text_color=theme.TEXT_ON_DARK).pack(side="left", padx=14, pady=8)
+        cart_hdr = ctk.CTkFrame(cart_card, fg_color=theme.CHARCOAL_DARK, corner_radius=0, height=36)
+        cart_hdr.grid(row=0, column=0, sticky="ew")
+        cart_hdr.grid_columnconfigure(0, weight=1)
+        cart_hdr.grid_propagate(False)
+        ctk.CTkLabel(cart_hdr, text="\U0001f6d2  CART  \u2014  Items in this Sale",
+                     font=ctk.CTkFont(family="Segoe UI", size=10, weight="bold"),
+                     text_color=theme.TEXT_ON_DARK).grid(row=0, column=0, sticky="w", padx=14)
 
-        cart_body = ctk.CTkFrame(cart_card, fg_color="transparent")
-        cart_body.pack(fill="both", padx=4, pady=4)
+        cart_inner = ctk.CTkFrame(cart_card, fg_color="transparent")
+        cart_inner.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
+        cart_inner.grid_rowconfigure(0, weight=1)
+        cart_inner.grid_columnconfigure(0, weight=1)
+
         self.cart_tree = make_treeview(
-            cart_body, ["Item", "Qty", "Unit Price", "Discount", "Line Total"],
-            {"Item": 280, "Qty": 70, "Unit Price": 90, "Discount": 90, "Line Total": 100},
-            rows=10,
-        )
-        self.cart_tree.master_frame.pack(fill="both")
-        # Prefills the qty box below with whatever's already on the line
-        # picked - a cashier adjusting "3" to "5" shouldn't have to first
-        # go check what it currently says.
+            cart_inner, ["Item", "Qty", "Unit Price", "Discount", "Line Total"],
+            {"Item": 260, "Qty": 60, "Unit Price": 90, "Discount": 90, "Line Total": 100},
+            rows=12)
+        self.cart_tree.master_frame.grid(row=0, column=0, sticky="nsew")
+        self.cart_tree.master_frame.grid_rowconfigure(0, weight=1)
+        self.cart_tree.master_frame.grid_columnconfigure(0, weight=1)
         self.cart_tree.bind("<<TreeviewSelect>>", lambda e: self._on_cart_line_selected())
 
-        # ---- Edit-qty row (inside the cart card) -------------------------
-        eq_row = ctk.CTkFrame(cart_card, fg_color="transparent")
-        eq_row.pack(fill="x", padx=12, pady=(4, 8))
-        ctk.CTkLabel(eq_row, text="Selected line qty:", text_color=theme.TEXT_MUTED,
-                     font=ctk.CTkFont(size=11)).pack(side="left")
+        # ── EDIT-QTY STRIP ──────────────────────────────────────────────────
+        eq_wrap = ctk.CTkFrame(right_panel, fg_color=theme.CARD_BG, corner_radius=0,
+                                border_width=1, border_color=theme.BORDER)
+        eq_wrap.grid(row=1, column=0, sticky="ew", padx=10, pady=(4, 0))
+        eq_row = ctk.CTkFrame(eq_wrap, fg_color="transparent")
+        eq_row.pack(fill="x", padx=14, pady=8)
+        ctk.CTkLabel(eq_row, text="Selected qty:",
+                     text_color=theme.TEXT_MUTED,
+                     font=ctk.CTkFont(family="Segoe UI", size=10)).pack(side="left")
         self.cart_edit_qty_var = tk.StringVar()
-        ctk.CTkEntry(eq_row, textvariable=self.cart_edit_qty_var, width=70, height=32,
-                     corner_radius=6).pack(side="left", padx=6)
-        styled_button(eq_row, "Update Qty", self.update_selected_line_qty,
-                      kind="secondary", height=32).pack(side="left")
-        styled_button(eq_row, "✕ Remove Line", self.remove_selected_line,
-                      kind="danger", height=32).pack(side="left", padx=6)
-        styled_button(eq_row, "Clear All", self.clear_cart,
-                      kind="secondary", height=32).pack(side="left")
+        ctk.CTkEntry(eq_row, textvariable=self.cart_edit_qty_var, width=65, height=30,
+                     corner_radius=6, font=ctk.CTkFont(family="Segoe UI", size=11)
+                     ).pack(side="left", padx=6)
+        styled_button(eq_row, "\u270e Update Qty", self.update_selected_line_qty,
+                      kind="secondary", height=30,
+                      font=ctk.CTkFont(family="Segoe UI", size=10)).pack(side="left")
+        styled_button(eq_row, "\u2715 Remove", self.remove_selected_line,
+                      kind="danger", height=30,
+                      font=ctk.CTkFont(family="Segoe UI", size=10)).pack(side="left", padx=6)
+        styled_button(eq_row, "\U0001f5d1 Clear All", self.clear_cart,
+                      kind="secondary", height=30,
+                      font=ctk.CTkFont(family="Segoe UI", size=10)).pack(side="left")
 
-        # ---- Totals + Checkout summary bar --------------------------------
-        summary_bar = ctk.CTkFrame(body, fg_color=theme.CHARCOAL_DARK,
-                                    corner_radius=12, border_width=1, border_color=theme.BORDER_DARK)
-        summary_bar.pack(fill="x", padx=12, pady=(12, 0))
+        # ── CHECKOUT SUMMARY BAR ─────────────────────────────────────────────
+        summary_bar = ctk.CTkFrame(right_panel, fg_color=theme.CHARCOAL_DARK,
+                                    corner_radius=0, height=110)
+        summary_bar.grid(row=2, column=0, sticky="ew", padx=10, pady=(6, 0))
+        summary_bar.grid_propagate(False)
+        summary_bar.grid_columnconfigure(0, weight=1)
+        summary_bar.grid_columnconfigure(1, weight=0)
 
-        # Left: Net total + discount controls
         sb_left = ctk.CTkFrame(summary_bar, fg_color="transparent")
-        sb_left.pack(side="left", padx=20, pady=14)
+        sb_left.grid(row=0, column=0, sticky="w", padx=20, pady=8)
 
         self.total_label = ctk.CTkLabel(sb_left, text="Net Total: LKR 0.00",
-                                         font=ctk.CTkFont(family="Segoe UI", size=15, weight="bold"),
+                                         font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"),
                                          text_color=theme.TEXT_ON_DARK)
         self.total_label.pack(anchor="w")
 
-        # A one-off cashier-typed discount for this sale only (Admin/Owner only).
-        # Separate from automatic Offers/Promotions discounts. Spread proportionally
-        # across cart lines at checkout (see checkout()) for per-line receipt records.
         disc_row = ctk.CTkFrame(sb_left, fg_color="transparent")
-        disc_row.pack(anchor="w", pady=(8, 0))
-        ctk.CTkLabel(disc_row, text="Manual Discount:", text_color="#94A3B8",
-                     font=ctk.CTkFont(family="Segoe UI", size=11)).pack(side="left")
+        disc_row.pack(anchor="w", pady=(6, 0))
+        ctk.CTkLabel(disc_row, text="Manual Discount:",
+                     text_color="#94A3B8",
+                     font=ctk.CTkFont(family="Segoe UI", size=10)).pack(side="left")
         self.discount_mode_var = tk.StringVar(value="LKR")
         self.discount_mode_var.trace_add("write", lambda *a: self._update_payable_label())
         self.discount_mode_menu = ctk.CTkOptionMenu(
             disc_row, values=["LKR", "%"], variable=self.discount_mode_var,
-            width=70, height=30, fg_color=theme.CHARCOAL_MED,
+            width=65, height=28, fg_color=theme.CHARCOAL_MED,
             button_color=theme.CHARCOAL_HOVER, text_color=theme.TEXT_ON_DARK,
-            corner_radius=6, state="disabled")
+            corner_radius=6, state="disabled",
+            font=ctk.CTkFont(family="Segoe UI", size=10),
+            dropdown_font=ctk.CTkFont(family="Segoe UI", size=10))
         self.discount_mode_menu.pack(side="left", padx=(8, 0))
         self.manual_discount_var = tk.StringVar(value="0")
         self.manual_discount_var.trace_add("write", lambda *a: self._update_payable_label())
         self.manual_discount_entry = ctk.CTkEntry(
-            disc_row, textvariable=self.manual_discount_var, width=96, height=30,
+            disc_row, textvariable=self.manual_discount_var, width=90, height=28,
             corner_radius=6, fg_color=theme.CHARCOAL_MED, text_color=theme.TEXT_ON_DARK,
-            border_color=theme.BORDER_DARK, state="disabled")
+            border_color=theme.BORDER_DARK, state="disabled",
+            font=ctk.CTkFont(family="Segoe UI", size=11))
         self.manual_discount_entry.pack(side="left", padx=(6, 0))
 
-        # Right: Payable amount + big Checkout button
-        # Payable sits directly above the Checkout button - it's the last figure
-        # a cashier's eye lands on before pressing Checkout.
         sb_right = ctk.CTkFrame(summary_bar, fg_color="transparent")
-        sb_right.pack(side="right", padx=20, pady=12)
+        sb_right.grid(row=0, column=1, sticky="e", padx=20, pady=10)
 
         self.payable_label = ctk.CTkLabel(
-            sb_right, text="Payable: LKR 0.00",
-            font=ctk.CTkFont(family="Segoe UI", size=22, weight="bold"),
+            sb_right, text="TOTAL: LKR 0.00",
+            font=ctk.CTkFont(family="Segoe UI", size=20, weight="bold"),
             text_color=theme.SUCCESS_GREEN)
         self.payable_label.pack(anchor="e")
 
-        styled_button(sb_right, "✓  PROCEED TO CHECKOUT", self.checkout, kind="success",
-                      width=220, height=44,
-                      font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold")).pack(anchor="e", pady=(6, 0))
+        styled_button(sb_right, "\u2714  CHECKOUT", self.checkout, kind="success",
+                      width=200, height=42,
+                      font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold")
+                      ).pack(anchor="e", pady=(6, 0))
 
-        # ---- Action buttons row (Hold / Resume / Return / Reprint / Void) --
-        # grid (not pack/side="left") so these shrink to fit a narrower window
-        # or a smaller/scaled-up-DPI screen instead of running off the edge.
-        bottom2 = ctk.CTkFrame(body, fg_color="transparent")
-        bottom2.pack(fill="x", padx=12, pady=(8, 16))
+        # ── SECONDARY ACTION BUTTONS ─────────────────────────────────────────
+        bottom_bar = ctk.CTkFrame(right_panel, fg_color=theme.BG_MAIN, corner_radius=0)
+        bottom_bar.grid(row=3, column=0, sticky="ew", padx=10, pady=(4, 10))
         for col in range(5):
-            bottom2.grid_columnconfigure(col, weight=1, uniform="bottom2")
-        styled_button(bottom2, "⏸  Hold Invoice", self.hold_invoice, kind="secondary",
-                      height=36).grid(row=0, column=0, sticky="ew", padx=(0, 4))
-        styled_button(bottom2, "▶  Resume Held", self.resume_invoice, kind="secondary",
-                      height=36).grid(row=0, column=1, sticky="ew", padx=4)
-        styled_button(bottom2, "↩  Return / Refund", self.open_return_dialog, kind="danger",
-                      height=36).grid(row=0, column=2, sticky="ew", padx=4)
-        styled_button(bottom2, "🖨  Reprint Receipt", self.open_reprint_dialog, kind="secondary",
-                      height=36).grid(row=0, column=3, sticky="ew", padx=4)
-        styled_button(bottom2, "⊗  Void Sale", self.open_void_dialog, kind="danger",
-                      height=36).grid(row=0, column=4, sticky="ew", padx=(4, 0))
+            bottom_bar.grid_columnconfigure(col, weight=1, uniform="bb")
+        styled_button(bottom_bar, "\u23f8  Hold", self.hold_invoice, kind="secondary",
+                      height=34, font=ctk.CTkFont(family="Segoe UI", size=10)
+                      ).grid(row=0, column=0, sticky="ew", padx=(0, 3))
+        styled_button(bottom_bar, "\u25b6  Resume", self.resume_invoice, kind="secondary",
+                      height=34, font=ctk.CTkFont(family="Segoe UI", size=10)
+                      ).grid(row=0, column=1, sticky="ew", padx=3)
+        styled_button(bottom_bar, "\u21a9  Return", self.open_return_dialog, kind="danger",
+                      height=34, font=ctk.CTkFont(family="Segoe UI", size=10)
+                      ).grid(row=0, column=2, sticky="ew", padx=3)
+        styled_button(bottom_bar, "\U0001f5a8  Reprint", self.open_reprint_dialog, kind="secondary",
+                      height=34, font=ctk.CTkFont(family="Segoe UI", size=10)
+                      ).grid(row=0, column=3, sticky="ew", padx=3)
+        styled_button(bottom_bar, "\u2297  Void Sale", self.open_void_dialog, kind="danger",
+                      height=34, font=ctk.CTkFont(family="Segoe UI", size=10)
+                      ).grid(row=0, column=4, sticky="ew", padx=(3, 0))
 
-
-
-        # Which of this screen's own text boxes last had the keyboard
-        # cursor - "search" by default, since on_show() below focuses the
-        # search box the moment this screen opens. This is the ONE thing
-        # that decides where a linked phone's scan lands (_route_scanned_
-        # code): rather than a separate "Scan with Phone" button next to
-        # every single box, there's one "Link Phone Scanner" button (now in
-        # the app's left sidebar), and once it's linked, a scan just goes
-        # wherever you were about to type anyway - exactly like a real
-        # USB/Bluetooth scanner does.
+        # Track which entry box had focus last (for phone scanner routing)
         self._mark_focus("search")
+
 
     def on_show(self):
         if isinstance(self.app.conn, offline_sync.OfflineConnection) and not self.app.conn.is_online:
@@ -2070,12 +2005,14 @@ class POSScreen(BaseScreen):
             if p is None:
                 continue
             price = p[tier_field]
+            name_short = p["name_en"][:18] + ("…" if len(p["name_en"]) > 18 else "")
             btn = styled_button(
-                self.quick_items_frame, f"{p['name_en'][:15]}\nLKR {price:,.2f}",
+                self.quick_items_frame,
+                f"{name_short}\nLKR {price:,.2f}",
                 lambda pid=product_id: self._quick_add(pid), kind="secondary",
-                font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"), height=50,
+                font=ctk.CTkFont(family="Segoe UI", size=10, weight="bold"), height=56,
             )
-            btn.grid(row=i // cols, column=i % cols, padx=4, pady=4, sticky="nsew")
+            btn.grid(row=i // cols, column=i % cols, padx=3, pady=3, sticky="nsew")
         for c in range(cols):
             self.quick_items_frame.grid_columnconfigure(c, weight=1)
 
@@ -2596,7 +2533,7 @@ class POSScreen(BaseScreen):
         finding out only after confirming payment."""
         total = sum(line["qty"] * line["unit_price"] - line.get("discount", 0.0) for line in self.cart)
         payable = max(0.0, total - self._manual_discount_amount(total))
-        self.payable_label.configure(text=f"Payable: LKR {payable:,.2f}")
+        self.payable_label.configure(text=f"TOTAL: LKR {payable:,.2f}")
 
     def _on_cart_line_selected(self):
         sel = self.cart_tree.selection()
