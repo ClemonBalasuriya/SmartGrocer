@@ -13,42 +13,45 @@ from pathlib import Path
 from tkinter import ttk
 
 # ---------------------------------------------------------------------------
-# Core palette - Dark Charcoal + Teal
+# Core palette - Modern Enterprise Dark Slate + Emerald-Teal
 # ---------------------------------------------------------------------------
-CHARCOAL_DARK   = "#1A1F2E"   # top toolbar / sidebar background
-CHARCOAL_MED    = "#232839"   # card backgrounds on dark surfaces
-CHARCOAL_HOVER  = "#2E3447"   # hover / pressed on dark surfaces
+CHARCOAL_DARK   = "#0F172A"   # deep slate-900: cleaner, richer sidebar background
+CHARCOAL_MED    = "#1E293B"   # slate-800: card backgrounds on dark surfaces / headers
+CHARCOAL_HOVER  = "#334155"   # slate-700: hover / pressed on dark surfaces
 
-TEAL            = "#00B4A6"   # primary action buttons / active nav
-TEAL_HOVER      = "#009A8E"   # hover on primary teal buttons
-TEAL_LIGHT      = "#E0F7F6"   # very light teal tint for highlights
+TEAL            = "#0D9488"   # teal-600: vibrant, elegant enterprise teal
+TEAL_HOVER      = "#0F766E"   # teal-700: rich tactile hover
+TEAL_LIGHT      = "#CCFBF1"   # teal-100: crisp light tint for badge pills
+TEAL_ACCENT     = "#14B8A6"   # teal-500: bright focus ring & indicators
 
-ACCENT_AMBER    = "#F59E0B"   # warnings, stock alerts (amber)
-ACCENT_AMBER_HOVER = "#D97706"
+ACCENT_AMBER    = "#F59E0B"   # warnings, stock alerts (amber-500)
+ACCENT_AMBER_HOVER = "#D97706"# amber-600
 
 # Background / surface system
-BG_MAIN         = "#F0F2F5"   # main content area background
-BG_DARK         = "#1A1F2E"   # toolbar / sidebar background (= CHARCOAL_DARK)
-CARD_BG         = "#FFFFFF"   # card / panel background
-CARD_BG_ALT     = "#F5F7FA"   # alternating table row stripe
+BG_MAIN         = "#F8FAFC"   # slate-50: crisp, ultra-clean neutral background
+BG_DARK         = "#0F172A"   # dark surface (= CHARCOAL_DARK)
+CARD_BG         = "#FFFFFF"   # pure white cards
+CARD_BG_ALT     = "#F8FAFC"   # alternating table row stripe
+SURFACE_HOVER   = "#F1F5F9"   # table & list item hover highlight
 
-# Borders
-BORDER          = "#E2E8F0"   # card borders, input borders
-BORDER_DARK     = "#2E3447"   # borders on dark surfaces
+# Borders & Dividers
+BORDER          = "#E2E8F0"   # slate-200: subtle, crisp card borders
+BORDER_SUBTLE   = "#EDF2F7"   # very faint divider
+BORDER_DARK     = "#334155"   # slate-700: borders on dark surfaces
 
 # Typography
-TEXT_DARK       = "#1E293B"   # primary body text
-TEXT_MUTED      = "#64748B"   # secondary / placeholder text
-TEXT_ON_DARK    = "#F1F5F9"   # text on dark charcoal surfaces
-TEXT_ON_TEAL    = "#FFFFFF"   # text on teal buttons
+TEXT_DARK       = "#0F172A"   # slate-900: high legibility dark text
+TEXT_MUTED      = "#64748B"   # slate-500: crisp secondary/meta text
+TEXT_ON_DARK    = "#F8FAFC"   # slate-50: high-contrast text on dark surfaces
+TEXT_ON_TEAL    = "#FFFFFF"   # pure white text on teal buttons
 
 # Semantic colors
-SUCCESS_GREEN       = "#10B981"   # completed / positive
-SUCCESS_GREEN_HOVER = "#059669"
-DANGER_RED          = "#EF4444"   # destructive / error
-DANGER_RED_HOVER    = "#DC2626"
-INFO_BLUE           = "#3B82F6"   # informational
-INFO_BLUE_HOVER     = "#2563EB"
+SUCCESS_GREEN       = "#10B981"   # emerald-500
+SUCCESS_GREEN_HOVER = "#059669"   # emerald-600
+DANGER_RED          = "#EF4444"   # red-500
+DANGER_RED_HOVER    = "#DC2626"   # red-600
+INFO_BLUE           = "#3B82F6"   # blue-500
+INFO_BLUE_HOVER     = "#2563EB"   # blue-600
 
 # ---------------------------------------------------------------------------
 # Legacy aliases kept so existing code that references the old navy names
@@ -127,7 +130,7 @@ def apply_global_style() -> None:
         background=CARD_BG,
         fieldbackground=CARD_BG,
         foreground=TEXT_DARK,
-        rowheight=34,
+        rowheight=36,
         borderwidth=0,
         font=("Segoe UI", 10),
     )
@@ -144,22 +147,22 @@ def apply_global_style() -> None:
         foreground=TEXT_ON_DARK,
         relief="flat",
         font=("Segoe UI", 10, "bold"),
-        padding=(10, 10),
+        padding=(10, 11),
     )
-    style.map("Treeview.Heading", background=[("active", CHARCOAL_HOVER)])
+    style.map("Treeview.Heading", background=[("active", CHARCOAL_MED)])
 
     # Scrollbars
     style.configure(
         "Vertical.TScrollbar",
-        background=BG_MAIN,
-        troughcolor=BG_MAIN,
+        background="#CBD5E1",
+        troughcolor="#F1F5F9",
         borderwidth=0,
         arrowcolor=TEXT_MUTED,
     )
     style.configure(
         "Horizontal.TScrollbar",
-        background=BG_MAIN,
-        troughcolor=BG_MAIN,
+        background="#CBD5E1",
+        troughcolor="#F1F5F9",
         borderwidth=0,
         arrowcolor=TEXT_MUTED,
     )

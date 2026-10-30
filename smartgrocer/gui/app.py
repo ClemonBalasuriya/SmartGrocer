@@ -209,58 +209,62 @@ class SmartGrocerApp(ctk.CTk):
 
     def _build_operator_strip(self):
         """Compact operator / day-status card inside the sidebar."""
-        op_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
-        op_frame.pack(fill="x", padx=12, pady=(8, 4))
+        op_card = ctk.CTkFrame(self.sidebar, fg_color=theme.CHARCOAL_MED,
+                               corner_radius=10, border_width=1, border_color=theme.BORDER_DARK)
+        op_card.pack(fill="x", padx=12, pady=(10, 6))
+
+        op_inner = ctk.CTkFrame(op_card, fg_color="transparent")
+        op_inner.pack(fill="x", padx=10, pady=10)
 
         # Cashier row
-        cashier_row = ctk.CTkFrame(op_frame, fg_color="transparent")
-        cashier_row.pack(fill="x", pady=(0, 2))
-        ctk.CTkLabel(cashier_row, text="OPERATOR", font=ctk.CTkFont(size=9, weight="bold"),
-                     text_color="#4A5568").pack(side="left")
+        cashier_row = ctk.CTkFrame(op_inner, fg_color="transparent")
+        cashier_row.pack(fill="x", pady=(0, 4))
+        ctk.CTkLabel(cashier_row, text="OPERATOR", font=ctk.CTkFont(family="Segoe UI", size=9, weight="bold"),
+                     text_color="#64748B").pack(side="left")
         self.cashier_label = ctk.CTkLabel(cashier_row, text="Not logged in",
-                                           font=ctk.CTkFont(size=11, weight="bold"),
-                                           text_color="#94A3B8")
+                                           font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
+                                           text_color="#CBD5E1")
         self.cashier_label.pack(side="right")
 
         # Day status row
-        day_row = ctk.CTkFrame(op_frame, fg_color="transparent")
-        day_row.pack(fill="x", pady=(0, 6))
-        ctk.CTkLabel(day_row, text="DAY STATUS", font=ctk.CTkFont(size=9, weight="bold"),
-                     text_color="#4A5568").pack(side="left")
+        day_row = ctk.CTkFrame(op_inner, fg_color="transparent")
+        day_row.pack(fill="x", pady=(0, 8))
+        ctk.CTkLabel(day_row, text="DAY STATUS", font=ctk.CTkFont(family="Segoe UI", size=9, weight="bold"),
+                     text_color="#64748B").pack(side="left")
         self.day_label = ctk.CTkLabel(day_row, text="● CLOSED",
-                                       font=ctk.CTkFont(size=11, weight="bold"),
+                                       font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
                                        text_color=theme.DANGER_RED)
         self.day_label.pack(side="right")
 
         # Action buttons row
-        btn_row = ctk.CTkFrame(op_frame, fg_color="transparent")
+        btn_row = ctk.CTkFrame(op_inner, fg_color="transparent")
         btn_row.pack(fill="x")
 
         ctk.CTkButton(
-            btn_row, text="Login", height=30, width=90,
-            font=ctk.CTkFont(size=11, weight="bold"),
+            btn_row, text="Login", height=28, width=86,
+            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
             fg_color=theme.TEAL, hover_color=theme.TEAL_HOVER,
             text_color=theme.TEXT_ON_TEAL, corner_radius=6,
             command=self.open_login_dialog,
         ).pack(side="left", padx=(0, 4))
 
         ctk.CTkButton(
-            btn_row, text="Close Day", height=30, width=90,
-            font=ctk.CTkFont(size=11),
+            btn_row, text="Close Day", height=28, width=86,
+            font=ctk.CTkFont(family="Segoe UI", size=11),
             fg_color="transparent", hover_color=theme.CHARCOAL_HOVER,
-            text_color=theme.DANGER_RED, border_width=1, border_color=theme.DANGER_RED,
+            text_color="#EF4444", border_width=1, border_color="#DC2626",
             corner_radius=6, command=self.open_close_day_dialog,
         ).pack(side="left")
 
         # Change PIN link-style button (only shows when logged in)
         self.change_pin_btn = ctk.CTkButton(
-            op_frame, text="🔑 Change my PIN", height=22, width=196,
-            font=ctk.CTkFont(size=10),
+            op_inner, text="🔑 Change my PIN", height=20, width=176,
+            font=ctk.CTkFont(family="Segoe UI", size=10),
             fg_color="transparent", hover_color=theme.CHARCOAL_HOVER,
-            text_color="#7A8BA6", corner_radius=4,
+            text_color="#94A3B8", corner_radius=4,
             command=self.open_change_my_pin_dialog, state="disabled",
         )
-        self.change_pin_btn.pack(fill="x", pady=(4, 0))
+        self.change_pin_btn.pack(fill="x", pady=(6, 0))
 
     def _build_sidebar_nav(self):
         """Build grouped navigation buttons in the sidebar."""
@@ -281,14 +285,14 @@ class SmartGrocerApp(ctk.CTk):
 
             # Group label
             ctk.CTkLabel(nav_scroll, text=f"  {group.upper()}",
-                         font=ctk.CTkFont(size=9, weight="bold"),
-                         text_color="#4A5568").pack(anchor="w", padx=12, pady=(10, 2))
+                         font=ctk.CTkFont(family="Segoe UI", size=9, weight="bold"),
+                         text_color="#64748B").pack(anchor="w", padx=14, pady=(12, 4))
 
             for label, key in items:
                 btn = ctk.CTkButton(
                     nav_scroll, text=f"  {label}", anchor="w",
-                    corner_radius=8, height=38, width=196,
-                    font=ctk.CTkFont(size=12),
+                    corner_radius=8, height=36, width=196,
+                    font=ctk.CTkFont(family="Segoe UI", size=12),
                     fg_color="transparent", hover_color=theme.CHARCOAL_HOVER,
                     text_color="#94A3B8",
                     command=lambda k=key: self.show_frame(k),
@@ -310,7 +314,7 @@ class SmartGrocerApp(ctk.CTk):
             btn.configure(
                 fg_color=theme.TEAL if is_active else "transparent",
                 text_color=theme.TEXT_ON_TEAL if is_active else "#94A3B8",
-                font=ctk.CTkFont(size=12, weight="bold" if is_active else "normal"),
+                font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold" if is_active else "normal"),
             )
         frame = self.frames[key]
         if hasattr(frame, "on_show"):

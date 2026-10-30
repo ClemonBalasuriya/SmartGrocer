@@ -883,25 +883,28 @@ class BaseScreen(ctk.CTkFrame):
         consistent, branded title bar across all pages.
         """
         hdr = ctk.CTkFrame(self, fg_color=theme.CARD_BG,
-                            corner_radius=0, border_width=0)
+                            corner_radius=0, border_width=0, height=64)
         hdr.pack(fill="x")
+        hdr.pack_propagate(False)
 
         # Teal accent bar on the left
         ctk.CTkFrame(hdr, width=4, fg_color=theme.TEAL, corner_radius=0).pack(
             side="left", fill="y")
 
         text_col = ctk.CTkFrame(hdr, fg_color="transparent")
-        text_col.pack(side="left", padx=(14, 0), pady=14)
+        text_col.pack(side="left", padx=(16, 0), pady=12)
 
         ctk.CTkLabel(text_col, text=text,
-                     font=ctk.CTkFont(family="Segoe UI", size=20, weight="bold"),
-                     text_color=theme.CHARCOAL_DARK).pack(anchor="w")
+                     font=ctk.CTkFont(family="Segoe UI", size=18, weight="bold"),
+                     text_color=theme.TEXT_DARK).pack(anchor="w")
         if subtitle:
             ctk.CTkLabel(text_col, text=subtitle,
-                         font=ctk.CTkFont(size=11), text_color=theme.TEXT_MUTED).pack(anchor="w")
+                         font=ctk.CTkFont(family="Segoe UI", size=11),
+                         text_color=theme.TEXT_MUTED).pack(anchor="w")
 
-        # Thin bottom divider
+        # Crisp bottom border
         ctk.CTkFrame(self, height=1, fg_color=theme.BORDER, corner_radius=0).pack(fill="x")
+
 
 
 
@@ -1368,33 +1371,37 @@ class POSScreen(BaseScreen):
         # This replaces the plain header() other screens use - Checkout needs
         # live status items (cashier name, offline badge, customer) visible
         # at all times, not just a static title.
-        pos_hdr = ctk.CTkFrame(self, fg_color=theme.CHARCOAL_DARK, corner_radius=0)
+        pos_hdr = ctk.CTkFrame(self, fg_color=theme.CHARCOAL_DARK, corner_radius=0, height=62)
         pos_hdr.pack(fill="x")
+        pos_hdr.pack_propagate(False)
 
         # Left: title + offline badge
         hdr_left = ctk.CTkFrame(pos_hdr, fg_color="transparent")
-        hdr_left.pack(side="left", padx=16, pady=10)
+        hdr_left.pack(side="left", padx=18, pady=12)
         ctk.CTkLabel(hdr_left, text="🛒  CHECKOUT",
                      font=ctk.CTkFont(family="Segoe UI", size=16, weight="bold"),
                      text_color=theme.TEXT_ON_DARK).pack(side="left")
         self.offline_badge = ctk.CTkLabel(hdr_left, text="",
-                                           font=ctk.CTkFont(size=11, weight="bold"),
+                                           font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
                                            text_color=theme.DANGER_RED)
         self.offline_badge.pack(side="left", padx=(14, 0))
 
-        # Right: cashier chip
-        hdr_right = ctk.CTkFrame(pos_hdr, fg_color="transparent")
-        hdr_right.pack(side="right", padx=16, pady=8)
-        ctk.CTkLabel(hdr_right, text="CASHIER", font=ctk.CTkFont(size=9, weight="bold"),
-                     text_color="#4A5568").pack(anchor="e")
-        self.cashier_label = ctk.CTkLabel(hdr_right, text="Not logged in",
-                                           font=ctk.CTkFont(size=12, weight="bold"),
-                                           text_color="#94A3B8")
-        self.cashier_label.pack(anchor="e")
+        # Right: modern cashier pill chip
+        hdr_right = ctk.CTkFrame(pos_hdr, fg_color=theme.CHARCOAL_MED, corner_radius=20,
+                                 border_width=1, border_color=theme.BORDER_DARK)
+        hdr_right.pack(side="right", padx=16, pady=12)
+        hdr_right_inner = ctk.CTkFrame(hdr_right, fg_color="transparent")
+        hdr_right_inner.pack(padx=14, pady=6)
+        ctk.CTkLabel(hdr_right_inner, text="CASHIER:", font=ctk.CTkFont(family="Segoe UI", size=10, weight="bold"),
+                     text_color="#94A3B8").pack(side="left", padx=(0, 6))
+        self.cashier_label = ctk.CTkLabel(hdr_right_inner, text="Not logged in",
+                                           font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
+                                           text_color="#CBD5E1")
+        self.cashier_label.pack(side="left")
 
-        # Thin teal underline
-        ctk.CTkFrame(self, height=3, fg_color=theme.TEAL, corner_radius=0).pack(fill="x")
-        ctk.CTkFrame(self, height=1, fg_color=theme.BORDER, corner_radius=0).pack(fill="x")
+        # Thin teal accent divider under header
+        ctk.CTkFrame(self, height=2, fg_color=theme.TEAL, corner_radius=0).pack(fill="x")
+
 
         self.cart: list[dict] = []
 
@@ -1787,16 +1794,16 @@ class POSScreen(BaseScreen):
                       kind="secondary", height=32).pack(side="left")
 
         # ---- Totals + Checkout summary bar --------------------------------
-        summary_bar = ctk.CTkFrame(body, fg_color=theme.CHARCOAL_MED,
-                                    corner_radius=10, border_width=1, border_color=theme.BORDER_DARK)
-        summary_bar.pack(fill="x", padx=12, pady=(10, 0))
+        summary_bar = ctk.CTkFrame(body, fg_color=theme.CHARCOAL_DARK,
+                                    corner_radius=12, border_width=1, border_color=theme.BORDER_DARK)
+        summary_bar.pack(fill="x", padx=12, pady=(12, 0))
 
         # Left: Net total + discount controls
         sb_left = ctk.CTkFrame(summary_bar, fg_color="transparent")
-        sb_left.pack(side="left", padx=16, pady=10)
+        sb_left.pack(side="left", padx=20, pady=14)
 
         self.total_label = ctk.CTkLabel(sb_left, text="Net Total: LKR 0.00",
-                                         font=ctk.CTkFont(size=15, weight="bold"),
+                                         font=ctk.CTkFont(family="Segoe UI", size=15, weight="bold"),
                                          text_color=theme.TEXT_ON_DARK)
         self.total_label.pack(anchor="w")
 
@@ -1804,40 +1811,40 @@ class POSScreen(BaseScreen):
         # Separate from automatic Offers/Promotions discounts. Spread proportionally
         # across cart lines at checkout (see checkout()) for per-line receipt records.
         disc_row = ctk.CTkFrame(sb_left, fg_color="transparent")
-        disc_row.pack(anchor="w", pady=(6, 0))
-        ctk.CTkLabel(disc_row, text="Discount:", text_color="#94A3B8",
-                     font=ctk.CTkFont(size=11)).pack(side="left")
+        disc_row.pack(anchor="w", pady=(8, 0))
+        ctk.CTkLabel(disc_row, text="Manual Discount:", text_color="#94A3B8",
+                     font=ctk.CTkFont(family="Segoe UI", size=11)).pack(side="left")
         self.discount_mode_var = tk.StringVar(value="LKR")
         self.discount_mode_var.trace_add("write", lambda *a: self._update_payable_label())
         self.discount_mode_menu = ctk.CTkOptionMenu(
             disc_row, values=["LKR", "%"], variable=self.discount_mode_var,
-            width=70, height=28, fg_color=theme.CHARCOAL_HOVER,
+            width=70, height=30, fg_color=theme.CHARCOAL_MED,
             button_color=theme.CHARCOAL_HOVER, text_color=theme.TEXT_ON_DARK,
-            state="disabled")
+            corner_radius=6, state="disabled")
         self.discount_mode_menu.pack(side="left", padx=(8, 0))
         self.manual_discount_var = tk.StringVar(value="0")
         self.manual_discount_var.trace_add("write", lambda *a: self._update_payable_label())
         self.manual_discount_entry = ctk.CTkEntry(
-            disc_row, textvariable=self.manual_discount_var, width=90, height=28,
-            corner_radius=6, fg_color=theme.CHARCOAL_HOVER, text_color=theme.TEXT_ON_DARK,
-            state="disabled")
+            disc_row, textvariable=self.manual_discount_var, width=96, height=30,
+            corner_radius=6, fg_color=theme.CHARCOAL_MED, text_color=theme.TEXT_ON_DARK,
+            border_color=theme.BORDER_DARK, state="disabled")
         self.manual_discount_entry.pack(side="left", padx=(6, 0))
 
         # Right: Payable amount + big Checkout button
         # Payable sits directly above the Checkout button - it's the last figure
         # a cashier's eye lands on before pressing Checkout.
         sb_right = ctk.CTkFrame(summary_bar, fg_color="transparent")
-        sb_right.pack(side="right", padx=16, pady=10)
+        sb_right.pack(side="right", padx=20, pady=12)
 
         self.payable_label = ctk.CTkLabel(
             sb_right, text="Payable: LKR 0.00",
-            font=ctk.CTkFont(family="Segoe UI", size=20, weight="bold"),
+            font=ctk.CTkFont(family="Segoe UI", size=22, weight="bold"),
             text_color=theme.SUCCESS_GREEN)
         self.payable_label.pack(anchor="e")
 
-        styled_button(sb_right, "✓  CHECKOUT", self.checkout, kind="success",
-                      width=180, height=46,
-                      font=ctk.CTkFont(size=14, weight="bold")).pack(anchor="e", pady=(8, 0))
+        styled_button(sb_right, "✓  PROCEED TO CHECKOUT", self.checkout, kind="success",
+                      width=220, height=44,
+                      font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold")).pack(anchor="e", pady=(6, 0))
 
         # ---- Action buttons row (Hold / Resume / Return / Reprint / Void) --
         # grid (not pack/side="left") so these shrink to fit a narrower window
@@ -2064,9 +2071,9 @@ class POSScreen(BaseScreen):
                 continue
             price = p[tier_field]
             btn = styled_button(
-                self.quick_items_frame, f"{p['name_en'][:16]}\nLKR {price:.2f}",
+                self.quick_items_frame, f"{p['name_en'][:15]}\nLKR {price:,.2f}",
                 lambda pid=product_id: self._quick_add(pid), kind="secondary",
-                font=ctk.CTkFont(size=11), height=48,
+                font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"), height=50,
             )
             btn.grid(row=i // cols, column=i % cols, padx=4, pady=4, sticky="nsew")
         for c in range(cols):
@@ -4406,21 +4413,28 @@ class ForecastingScreen(BaseScreen):
 class BundlesScreen(BaseScreen):
     def __init__(self, parent, app):
         super().__init__(parent, app)
-        self.header("🛍️ Bundle Recommendations", subtitle="Discover frequent product pairings and cross-selling bundles using association rule mining")
+        self.header("🛍️ Bundle Recommendations", subtitle="Real pairings, ranked by the profit they already earn - not just how often they're bought together")
 
         top = ctk.CTkFrame(self, fg_color="transparent")
         top.pack(fill="x", padx=12)
         self.compute_btn = styled_button(top, "Compute Bundles", self.compute)
         self.compute_btn.pack(side="left")
-        self.status_label = ctk.CTkLabel(top, text="min support 2%, min confidence 30%, min lift 1.1",
-                                          text_color=theme.TEXT_MUTED)
+        self.status_label = ctk.CTkLabel(
+            top, text="min support 2%, min confidence 30%, min lift 1.1 — ranked by real profit potential",
+            text_color=theme.TEXT_MUTED)
         self.status_label.pack(side="left", padx=16)
 
         tree_frame = ctk.CTkFrame(self, fg_color="transparent")
         tree_frame.pack(fill="both", expand=True, padx=12, pady=10)
-        columns = ["Bundle", "Support", "Confidence", "Lift", "Sum Price", "Bundle Price", "Savings"]
-        widths = {"Bundle": 320, "Support": 80, "Confidence": 90, "Lift": 70,
-                  "Sum Price": 100, "Bundle Price": 100, "Savings": 90}
+        # Lift/confidence stay visible (they're why a pairing is trusted as
+        # real, not noise) but the list itself is ranked - and the columns
+        # most worth a glance - by real profit: Co-Purchases x margin per
+        # bundle is literally how Est. Profit is computed (association.py's
+        # bundle_profit_potential), so a cashier/owner can see the "why" of
+        # the ranking, not just trust a sorted list.
+        columns = ["Bundle", "Co-Purchases", "Confidence", "Lift", "Bundle Price", "Savings", "Est. Profit"]
+        widths = {"Bundle": 270, "Co-Purchases": 95, "Confidence": 90, "Lift": 65,
+                  "Bundle Price": 95, "Savings": 85, "Est. Profit": 110}
         self.tree = make_treeview(tree_frame, columns, widths)
         self.tree.master_frame.pack(fill="both", expand=True)
 
@@ -4440,10 +4454,11 @@ class BundlesScreen(BaseScreen):
             tree_clear(self.tree)
             for r in rows:
                 bundle_name = " + ".join(r["antecedent"] + r["consequent"])
-                tree_insert(self.tree, (bundle_name, r["support"], r["confidence"], r["lift"],
-                                         f"{r['sum_price_lkr']:.2f}", f"{r['bundle_price_lkr']:.2f}",
-                                         f"{r['savings_lkr']:.2f}"))
-            self.status_label.configure(text=f"{len(rows)} bundle recommendations")
+                tree_insert(self.tree, (bundle_name, r["co_occurrences"], r["confidence"], r["lift"],
+                                         f"{r['bundle_price_lkr']:.2f}", f"{r['savings_lkr']:.2f}",
+                                         f"{r['realized_profit_lkr']:,.2f}"))
+            self.status_label.configure(
+                text=f"{len(rows)} bundle recommendations, ranked by real profit potential (highest first)")
 
         def on_error(err):
             self.compute_btn.configure(state="normal")

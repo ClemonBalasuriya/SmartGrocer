@@ -30,10 +30,19 @@ holds Objectives 1-3 to):
   3. revenue_options()      - for a detected slow mover, what each
                                possible action (do nothing / discount it
                                standalone / bundle it with its matched
-                               partner) is projected to earn, so the shop
-                               (or an automated extension of the existing
-                               manual offers.py screen) could pick the one
-                               that maximises revenue.
+                               partner) is projected to earn in both
+                               revenue AND profit, so the shop (or an
+                               automated extension of the existing manual
+                               offers.py screen) can pick the one that
+                               maximises PROFIT - not just the one that
+                               moves the most revenue, which a discount or
+                               a thin-margin bundle can do while actually
+                               leaving the shop worse off once margin is
+                               accounted for. (Earlier revision of this
+                               module picked by revenue; fixed once that
+                               mismatch with the function's own stated
+                               goal was caught - see revenue_options()'s
+                               own docstring for the full reasoning.)
 
 Literature grounding (same standard as Objectives 1-3's cited methodology,
 not engineering built without a research basis). Verified against the
@@ -257,19 +266,28 @@ def discount_natural_experiment(conn: sqlite3.Connection, product_id: int, as_of
     since = (as_of - timedelta(days=window_days)).isoformat()
     until = (as_of + timedelta(days=1)).isoformat()
     rows = conn.execute(
-        """SELECT substr(i.datetime,1,10) d, SUM(ii.line_total) rev, SUM(ii.discount) disc
+        """SELECT substr(i.datetime,1,10) d, SUM(ii.line_total) rev, SUM(ii.discount) disc, SUM(ii.qty) qty
            FROM invoice_items ii JOIN invoices i ON i.id=ii.invoice_id
            WHERE ii.product_id=? AND i.voided=0 AND i.datetime>=? AND i.datetime<?
            GROUP BY d""",
         (product_id, since, until),
     ).fetchall()
-    discounted_days = [r["rev"] for r in rows if r["disc"] and r["disc"] > 1e-6]
-    full_price_days = [r["rev"] for r in rows if not r["disc"] or r["disc"] <= 1e-6]
+    discounted_days = [(r["rev"], r["qty"]) for r in rows if r["disc"] and r["disc"] > 1e-6]
+    full_price_days = [(r["rev"], r["qty"]) for r in rows if not r["disc"] or r["disc"] <= 1e-6]
     return {
         "n_discounted_days": len(discounted_days),
         "n_full_price_days": len(full_price_days),
-        "mean_daily_revenue_discounted": round(statistics.mean(discounted_days), 2) if discounted_days else None,
-        "mean_daily_revenue_full_price": round(statistics.mean(full_price_days), 2) if full_price_days else None,
+        "mean_daily_revenue_discounted": round(statistics.mean(r for r, _ in discounted_days), 2) if discounted_days else None,
+        "mean_daily_revenue_full_price": round(statistics.mean(r for r, _ in full_price_days), 2) if full_price_days else None,
+        # Real units sold per day in each group, alongside revenue - needed
+        # to turn revenue into PROFIT (revenue - qty*cost_price) in
+        # revenue_options() below. A discount can raise revenue through
+        # higher volume while still leaving less real profit behind, once
+        # the margin given up on every unit is accounted for - revenue
+        # alone can't tell the two apart, which is exactly the gap this
+        # field closes.
+        "mean_daily_qty_discounted": round(statistics.mean(q for _, q in discounted_days), 3) if discounted_days else None,
+        "mean_daily_qty_full_price": round(statistics.mean(q for _, q in full_price_days), 3) if full_price_days else None,
         # need a handful of real observations, not one fluke day, before trusting the comparison
         "has_real_discount_history": len(discounted_days) >= 3 and len(full_price_days) >= 3,
     }
@@ -277,42 +295,79 @@ def discount_natural_experiment(conn: sqlite3.Connection, product_id: int, as_of
 
 def revenue_options(slow_mover: dict, partner: dict | None, natural_exp: dict,
                      assumed_bundle_uplift: float = 0.0) -> dict:
-    """Projected daily revenue for one slow mover under up to three
-    actions: 'no_action' (real), 'discount' (real-observational where
-    history exists for this product, else a disclosed flat-markdown
+    """Projected daily revenue AND profit for one slow mover under up to
+    three actions: 'no_action' (real), 'discount' (real-observational
+    where history exists for this product, else a disclosed flat-markdown
     fallback with no assumed demand response), and 'bundle' (always a
-    disclosed projection - see module docstring). `natural_exp` comes
-    from discount_natural_experiment(); `assumed_bundle_uplift` must be
-    supplied explicitly by the caller on every call - evaluate_clearance.py
-    sweeps it across a disclosed range rather than this function ever
-    picking a value on its own."""
-    no_action_daily = round(slow_mover["recent_velocity"] * slow_mover["cash_price"], 2)
+    disclosed projection - see module docstring). `natural_exp` comes from
+    discount_natural_experiment(); `assumed_bundle_uplift` must be supplied
+    explicitly by the caller on every call - evaluate_clearance.py sweeps
+    it across a disclosed range rather than this function ever picking a
+    value on its own.
+
+    recommended_action is chosen by PROFIT, not revenue. A discount
+    reliably raises revenue (more units move) but gives up margin on every
+    one of them; a bundle's combined revenue can look attractive while
+    actually being two already-thin margins added together. Revenue alone
+    can make either look like the right call when it isn't - profit is the
+    number a small retailer actually wants to maximise, and it's also the
+    objective Netessine & Rudi (2006)'s own myopic heuristic optimises for
+    (see module docstring, Part B). Both figures are still returned on
+    every option so the revenue story stays visible, not hidden."""
+    cost_price = slow_mover["cost_price"]
+    cash_price = slow_mover["cash_price"]
+    unit_margin = cash_price - cost_price
+
+    no_action_daily_rev = round(slow_mover["recent_velocity"] * cash_price, 2)
+    no_action_daily_profit = round(slow_mover["recent_velocity"] * unit_margin, 2)
 
     if natural_exp["has_real_discount_history"]:
-        discount_daily = natural_exp["mean_daily_revenue_discounted"]
+        discount_daily_rev = natural_exp["mean_daily_revenue_discounted"]
+        discount_qty = natural_exp["mean_daily_qty_discounted"] or 0.0
+        # Profit = real revenue on those real discounted days minus the
+        # real COGS of the real units sold on them (qty * this product's
+        # own cost_price) - the discount's effect on per-unit margin is
+        # already baked into discount_daily_rev, so this is a direct,
+        # fully-real profit figure, not a second assumption stacked on
+        # the first.
+        discount_daily_profit = round(discount_daily_rev - discount_qty * cost_price, 2)
         discount_basis = "real_observational_historical_discount_days"
     else:
         # No real discounted-day history for THIS product - fall back to
         # the same flat markdown arithmetic the live urgency engine already
         # uses for its own suggested price, applied to the same real recent
         # velocity, rather than inventing a demand-response number that
-        # isn't known for this product.
-        discount_daily = round(no_action_daily * 0.85, 2)
+        # isn't known for this product. Profit falls by exactly the
+        # discount given on each unit still sold at the real, unchanged
+        # recent_velocity pace (no assumed volume lift either).
+        discount_daily_rev = round(no_action_daily_rev * 0.85, 2)
+        discount_daily_profit = round(slow_mover["recent_velocity"] * (cash_price * 0.85 - cost_price), 2)
         discount_basis = "assumed_flat_15pct_markdown_no_demand_response_data"
 
     options = {
-        "no_action": {"projected_daily_revenue": no_action_daily, "basis": "real"},
-        "discount": {"projected_daily_revenue": discount_daily, "basis": discount_basis, **natural_exp},
+        "no_action": {
+            "projected_daily_revenue": no_action_daily_rev,
+            "projected_daily_profit": no_action_daily_profit, "basis": "real",
+        },
+        "discount": {
+            "projected_daily_revenue": discount_daily_rev,
+            "projected_daily_profit": discount_daily_profit,
+            "basis": discount_basis, **natural_exp,
+        },
     }
 
     if partner is not None:
-        combined_standalone = no_action_daily + partner["partner_daily_revenue"]
+        partner_unit_margin = partner["partner_cash_price"] - partner["partner_cost_price"]
+        partner_daily_profit = partner["partner_recent_velocity"] * partner_unit_margin
+        combined_standalone_rev = no_action_daily_rev + partner["partner_daily_revenue"]
+        combined_standalone_profit = no_action_daily_profit + partner_daily_profit
         options["bundle"] = {
-            "projected_daily_revenue": round(combined_standalone * (1 + assumed_bundle_uplift), 2),
-            "basis": f"assumed_uplift_{assumed_bundle_uplift:.0%}_over_combined_standalone_revenue",
+            "projected_daily_revenue": round(combined_standalone_rev * (1 + assumed_bundle_uplift), 2),
+            "projected_daily_profit": round(combined_standalone_profit * (1 + assumed_bundle_uplift), 2),
+            "basis": f"assumed_uplift_{assumed_bundle_uplift:.0%}_over_combined_standalone_revenue_and_profit",
             "partner_product_id": partner["partner_product_id"], "partner_name": partner["partner_name"],
             "partner_lift": partner["lift"],
         }
 
-    best_action = max(options, key=lambda k: options[k]["projected_daily_revenue"])
+    best_action = max(options, key=lambda k: options[k]["projected_daily_profit"])
     return {"product_id": slow_mover["product_id"], "options": options, "recommended_action": best_action}

@@ -128,31 +128,81 @@ def bundle_price_suggestion(conn: sqlite3.Connection, item_ids: frozenset, lift:
     }
 
 
+def bundle_profit_potential(conn: sqlite3.Connection, item_ids: frozenset, support: float,
+                             n_baskets: int, lift: float,
+                             products: dict[int, sqlite3.Row] | None = None) -> dict:
+    """Real, historical profit opportunity behind one candidate bundle - this
+    is what turns "a statistically real pairing" (lift) into "a pairing
+    worth actually recommending" (profit). Lift only says two items sell
+    together more than chance would predict; it says nothing about whether
+    those items are cheap, low-margin staples or genuinely worth the
+    shop's shelf space and a staff member's time to push. A small shop's
+    sparse data regularly produces high-lift pairs on inexpensive items
+    (e.g. two spice packets) that move far less real money than a
+    moderate-lift pair of higher-margin products bought often.
+
+    co_occurrences: how many real past (non-voided) invoices contained
+    every item in this bundle together - support expressed as a raw count
+    rather than a ratio, since a ratio alone hides whether a pairing is
+    rare-but-real or common.
+
+    margin_per_bundle_lkr: the net margin the proposed bundle price (see
+    bundle_price_suggestion - already floored at 2% over cost, so this is
+    never negative) would earn per sale, after the pairing's own discount.
+
+    realized_profit_lkr: co_occurrences * margin_per_bundle_lkr - the real
+    gross profit this exact pairing has already generated in basket
+    history, had every one of those real co-purchases been rung up as this
+    priced bundle. 100% real data (no projected uplift, no assumption) -
+    this is what get_bundle_recommendations() ranks candidates by."""
+    products = products or _product_lookup(conn)
+    pricing = bundle_price_suggestion(conn, item_ids, lift, products)
+    sum_cost = sum(products[i]["cost_price"] for i in item_ids)
+    co_occurrences = round(support * n_baskets)
+    margin_per_bundle = round(pricing["bundle_price_lkr"] - sum_cost, 2)
+    realized_profit = round(margin_per_bundle * co_occurrences, 2)
+    return {
+        **pricing,
+        "co_occurrences": co_occurrences,
+        "margin_per_bundle_lkr": margin_per_bundle,
+        "realized_profit_lkr": realized_profit,
+    }
+
+
 def get_bundle_recommendations(conn: sqlite3.Connection, min_support: float = 0.02,
                                 min_confidence: float = 0.3, min_lift: float = 1.1,
                                 top_n: int = 20) -> list[dict]:
+    """Bundle candidates, gated by statistical significance (the
+    min_support/min_confidence/min_lift thresholds below decide which
+    pairings are REAL - the same Apriori mining as before, unchanged) but
+    RANKED by real profit potential, not by lift. Lift and profit answer
+    different questions: lift asks "is this pairing genuine, not noise?";
+    profit asks "is this pairing worth recommending?" A shop should see its
+    most valuable real bundles first, not merely its most statistically
+    surprising ones."""
     baskets = build_baskets(conn)
+    n_baskets = len(baskets)
     frequent = apriori(baskets, min_support=min_support)
     rules = generate_rules(frequent, min_confidence=min_confidence, min_lift=min_lift)
     products = _product_lookup(conn)
 
     seen_itemsets = set()
-    out = []
+    candidates = []
     for r in rules:
         itemset = r["antecedent"] | r["consequent"]
         if itemset in seen_itemsets:
             continue
         seen_itemsets.add(itemset)
-        pricing = bundle_price_suggestion(conn, itemset, r["lift"], products)
-        out.append({
+        profit = bundle_profit_potential(conn, itemset, r["support"], n_baskets, r["lift"], products)
+        candidates.append({
             "antecedent": [products[i]["name_en"] for i in r["antecedent"]],
             "consequent": [products[i]["name_en"] for i in r["consequent"]],
             "support": round(r["support"], 4), "confidence": round(r["confidence"], 3),
-            "lift": round(r["lift"], 3), **pricing,
+            "lift": round(r["lift"], 3), **profit,
         })
-        if len(out) >= top_n:
-            break
-    return out
+
+    candidates.sort(key=lambda c: -c["realized_profit_lkr"])
+    return candidates[:top_n]
 
 
 def export_adjacency_pairs(conn: sqlite3.Connection, min_support: float = 0.02,
